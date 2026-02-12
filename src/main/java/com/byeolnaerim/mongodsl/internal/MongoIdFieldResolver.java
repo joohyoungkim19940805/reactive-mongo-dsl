@@ -1,4 +1,4 @@
-package com.starbearing.mongodsl.internal;
+package com.byeolnaerim.mongodsl.internal;
 
 
 import java.lang.reflect.Field;
@@ -12,7 +12,7 @@ public final class MongoIdFieldResolver {
 	/**
 	 * 엔티티 클래스에서 식별자(@Id) 필드를 찾는 메서드.
 	 * 
-	 * @Id 어노테이션이 붙은 필드를 우선적으로 찾고, 없을 경우 이름이 "id"인 필드를 찾는다.
+	 * {@code @Id} 어노테이션이 붙은 필드를 우선적으로 찾고, 없을 경우 이름이 "id"인 필드를 찾는다.
 	 * 
 	 * @param entityClass
 	 *            대상 엔티티 클래스
@@ -30,7 +30,7 @@ public final class MongoIdFieldResolver {
 		Field idNamedField = null;
 		Class<?> currentClass = entityClass;
 
-		// 1. 클래스 계층을 순회하며 필드를 탐색합니다.
+		// 클래스 계층을 순회하며 필드를 탐색합니다.
 		while (currentClass != null && currentClass != Object.class) {
 
 			for (Field field : currentClass.getDeclaredFields()) {
@@ -56,14 +56,14 @@ public final class MongoIdFieldResolver {
 
 		}
 
-		// 2. @Id 어노테이션을 찾지 못한 경우, 순회 중 발견했던 "id" 필드가 있는지 확인합니다.
+		// @Id 어노테이션을 찾지 못한 경우, 순회 중 발견했던 "id" 필드가 있는지 확인합니다.
 		if (idNamedField != null) {
 			idNamedField.setAccessible( true );
 			return idNamedField;
 
 		}
 
-		// 3. @Id 어노테이션과 "id" 필드 모두 찾지 못한 경우 예외를 발생시킵니다.
+		// @Id 어노테이션과 "id" 필드 모두 찾지 못한 경우 예외를 발생시킵니다.
 		throw new IllegalArgumentException(
 			"No @Id annotation or 'id' field found in class hierarchy for " + entityClass.getName()
 		);

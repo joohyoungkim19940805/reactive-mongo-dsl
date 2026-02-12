@@ -1,4 +1,4 @@
-package com.starbearing.mongodsl.lookup;
+package com.byeolnaerim.mongodsl.lookup;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -7,61 +7,63 @@ import java.util.List;
 import org.bson.Document;
 import org.springframework.data.domain.Sort;
 
-import com.starbearing.mongodsl.criteria.FieldsPair;
-import com.starbearing.mongodsl.criteria.FieldsPair.Condition;
+import com.byeolnaerim.mongodsl.criteria.FieldsPair;
+import com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition;
 
 /**
- * Encapsulates $lookup specification (from, as, localField/foreignField or let+pipeline).
+ * Encapsulates lookup stage options such as {@code as}, join key mapping via
+ * {@code localField/foreignField} or {@code let + pipeline}, optional {@code $unwind},
+ * and post-lookup outer stages.
+ *
  * <p>Usage examples:</p>
  *
  * <pre>{@code
- * 
  * // 현재 계정 보유 여부 조인 (title ↔ accountTitle)
  * var spec = LookupSpec
- * 	.builder()
- * 	.from( "accountTitle" )
- * 	.as( "ownHit" )
- * 	// title._id == accountTitle.titleId
- * 	.bindConditionFields( "_id", Condition.eq, "titleId" )
- * 	// accountTitle.accountId == accountId
- * 	.bindConditionConst( accountId, Condition.eq, "accountId" )
- * 	.limit( 1 )
- * 	// .unwind(true) // 단건화 원하면
- * 	.build();
+ *   .builder()
+ *   .as("ownHit")
+ *   // title._id == accountTitle.titleId
+ *   .bindConditionFields("_id", Condition.eq, "titleId")
+ *   // accountTitle.accountId == accountId
+ *   .bindConditionConst(accountId, Condition.eq, "accountId")
+ *   .limit(1)
+ *   // .unwind(true) // 단건화 원하면
+ *   .build();
  *
  * // 이름 부분 일치 (대소문자 무시)
  * var spec2 = LookupSpec
- * 	.builder()
- * 	.from( "titles" )
- * 	.as( "matched" )
- * 	.bindConditionLike( ".*pro.*", "name", "i" )
- * 	.build();
+ *   .builder()
+ *   .as("matched")
+ *   .bindConditionLike(".*pro.*", "name", Condition.LikeOperator.i)
+ *   .build();
  *
  * // 카테고리 in (...)
  * var spec3 = LookupSpec
- * 	.builder()
- * 	.from( "titles" )
- * 	.as( "matched" )
- * 	.bindConditionConst( List.of( "rpg", "indie" ), Condition.in, "category" )
- * 	.build();
+ *   .builder()
+ *   .as("matched")
+ *   .bindConditionConst(List.of("rpg", "indie"), Condition.in, "category")
+ *   .build();
  *
  * // createdAt between
  * var spec4 = LookupSpec
- * 	.builder()
- * 	.from( "accountTitle" )
- * 	.as( "ownHit" )
- * 	.bindConditionBetween( startInstant, endInstant, "createdAt" )
- * 	.build();
+ *   .builder()
+ *   .as("ownHit")
+ *   .bindConditionBetween(startInstant, endInstant, "createdAt")
+ *   .build();
  * }</pre>
  *
  * @see LookupSpec.Builder
- * @see LookupSpec.Builder#from(String)
  * @see LookupSpec.Builder#as(String)
+ * @see LookupSpec.Builder#localField(String)
+ * @see LookupSpec.Builder#foreignField(String)
  * @see LookupSpec.Builder#bindConditionFields(String, Condition, String)
  * @see LookupSpec.Builder#bindConditionConst(Object, Condition, String)
  * @see LookupSpec.Builder#bindConditionBetween(Object, Object, String)
- * @see LookupSpec.Builder#bindConditionLike(String, String, String)
+ * @see LookupSpec.Builder#bindConditionLike(String, String, Condition.LikeOperator)
+ * @see LookupSpec.Builder#bindConditionExists(String, boolean)
  * @see LookupSpec.Builder#unwind(boolean)
+ * @see LookupSpec.Builder#outerStage(org.bson.Document)
+ * @see LookupSpec.Builder#outerStages(java.util.Collection)
  * @see LookupSpec.Builder#build()
  */
 public class LookupSpec {

@@ -1,4 +1,4 @@
-package com.starbearing.mongodsl;
+package com.byeolnaerim.mongodsl;
 
 
 import java.lang.reflect.Field;
@@ -51,23 +51,23 @@ import org.springframework.data.mongodb.core.query.UpdateDefinition;
 import org.springframework.data.repository.reactive.ReactiveCrudRepository;
 import org.springframework.transaction.reactive.TransactionalOperator;
 
-import com.starbearing.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.ExecuteBuilder;
-import com.starbearing.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.CountAggregation;
-import com.starbearing.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.CountExecute;
-import com.starbearing.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.ExistsAggregation;
-import com.starbearing.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.ExistsExecute;
-import com.starbearing.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAggregation;
-import com.starbearing.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllAggregation;
-import com.starbearing.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllExecute;
-import com.starbearing.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindExecute;
-import com.starbearing.mongodsl.criteria.FieldsPair;
-import com.starbearing.mongodsl.criteria.MongoCriteriaSupport;
-import com.starbearing.mongodsl.criteria.FieldsPair.Condition;
-import com.starbearing.mongodsl.internal.MongoIdFieldResolver;
-import com.starbearing.mongodsl.lookup.LookupSpec;
-import com.starbearing.mongodsl.result.PageResult;
-import com.starbearing.mongodsl.result.ResultTuple;
-import com.starbearing.mongodsl.spi.MongoTemplateResolver;
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.ExecuteBuilder;
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.CountAggregation;
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.CountExecute;
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.ExistsAggregation;
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.ExistsExecute;
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAggregation;
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllAggregation;
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllExecute;
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindExecute;
+import com.byeolnaerim.mongodsl.criteria.FieldsPair;
+import com.byeolnaerim.mongodsl.criteria.MongoCriteriaSupport;
+import com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition;
+import com.byeolnaerim.mongodsl.internal.MongoIdFieldResolver;
+import com.byeolnaerim.mongodsl.lookup.LookupSpec;
+import com.byeolnaerim.mongodsl.result.PageResult;
+import com.byeolnaerim.mongodsl.result.ResultTuple;
+import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
 import com.mongodb.ReadPreference;
 import com.mongodb.bulk.BulkWriteResult;
 import com.mongodb.client.result.DeleteResult;
@@ -432,7 +432,7 @@ public class ReactiveMongoDsl<K> {
 		/**
 		 * Flux<E> 스트림을 받아 대량 저장(Bulk Upsert)을 수행하는 핵심 메서드입니다.
 		 * 스트림의 모든 엔티티에 대해 'upsert' 연산을 준비하고 단일 DB 요청으로 실행합니다.
-		 * (주의: 이 메서드를 사용하려면 엔티티에 getId() 메서드가 있어야 합니다.)
+		 * (주의: 이 메서드를 사용하려면 엔티티에 @Id 어노테이션이 설정된 필드나 이름이 id인 필드가 있어야 합니다.)
 		 * 
 		 * @param entityFlux
 		 *            저장할 엔티티의 Flux

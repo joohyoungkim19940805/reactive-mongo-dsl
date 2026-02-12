@@ -1,8 +1,8 @@
-package com.starbearing.mongodsl.result;
+package com.byeolnaerim.mongodsl.result;
 
 import java.util.List;
 
-public  class ResultTuple<L, R> {
+public class ResultTuple<L, R> {
 
 	private String leftName; // 현재 쿼리 빌더의 executeClass 이름
 

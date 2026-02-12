@@ -1,4 +1,4 @@
-package com.starbearing.mongodsl.criteria;
+package com.byeolnaerim.mongodsl.criteria;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;

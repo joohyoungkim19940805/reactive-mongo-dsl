@@ -1,4 +1,4 @@
-package com.starbearing.mongodsl.criteria;
+package com.byeolnaerim.mongodsl.criteria;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -143,8 +143,10 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 	 * - from만 있으면 gte
 	 * - to만 있으면 lte
 	 * - 둘 다 없으면 null
-	 * ※ List<Instant>, List<LocalDate> 등은 제네릭 타입만 달라 오버로드가 불가능하므로
-	 * List<? extends T> 하나로 공통 처리한다.
+	 * {@code
+	 * 	List<Instant>, List<LocalDate> 등은 제네릭 타입만 달라 오버로드가 불가능하므로
+	 * 	List<? extends T> 하나로 공통 처리한다.
+	 * }
 	 */
 	public static <K, T> FieldsPair<K, Object> autoRangePair(
 		K field, List<? extends T> range

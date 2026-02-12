@@ -1,4 +1,4 @@
-package com.starbearing.mongodsl.result;
+package com.byeolnaerim.mongodsl.result;
 
 import java.util.Collections;
 import java.util.List;
@@ -10,7 +10,7 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 
-public  class PageResult<E> {
+public class PageResult<E> {
 
 	private final List<E> data;
 
