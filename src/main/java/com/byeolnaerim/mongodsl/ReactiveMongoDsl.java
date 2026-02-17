@@ -4201,7 +4201,7 @@ public class ReactiveMongoDsl<K> {
 	}
 
 
-	public class ExecuteEntityBuilder<E> extends AbstractQueryBuilder<E, ExecuteEntityBuilder<E>> implements ExecuteBuilder {
+	public abstract class ExecuteEntityBuilder<E> extends AbstractQueryBuilder<E, ExecuteEntityBuilder<E>> implements ExecuteBuilder {
 
 		@SuppressWarnings("unchecked")
 		ExecuteEntityBuilder(
@@ -4214,7 +4214,6 @@ public class ReactiveMongoDsl<K> {
 						.getGenericSuperclass()).getActualTypeArguments()[0]
 				);
 
-			// 🔥 핵심: applicationContext 대신 resolver를 통해 템플릿 획득
 			this.reactiveMongoTemplate = ReactiveMongoDsl.this.getMongoTemplate( key );
 			this.executeBuilder = this;
 
@@ -4234,7 +4233,7 @@ public class ReactiveMongoDsl<K> {
 	}
 
 
-	public class ExecuteCustomClassBuilder<E> extends AbstractQueryBuilder<E, ExecuteCustomClassBuilder<E>> implements ExecuteBuilder {
+	public abstract class ExecuteCustomClassBuilder<E> extends AbstractQueryBuilder<E, ExecuteCustomClassBuilder<E>> implements ExecuteBuilder {
 
 		@SuppressWarnings("unchecked")
 		ExecuteCustomClassBuilder(
@@ -4281,7 +4280,7 @@ public class ReactiveMongoDsl<K> {
 		K key
 	) {
 
-		return new ExecuteEntityBuilder<>( key );
+		return new ExecuteEntityBuilder<>( key ) {};
 
 	}
 
@@ -4289,7 +4288,7 @@ public class ReactiveMongoDsl<K> {
 		Class<E> executeEntity, K key
 	) {
 
-		return new ExecuteEntityBuilder<>( executeEntity, key );
+		return new ExecuteEntityBuilder<>( executeEntity, key ) {};
 
 	}
 
@@ -4297,7 +4296,7 @@ public class ReactiveMongoDsl<K> {
 		Class<E> executeCustomClass, K key, String collectionName
 	) {
 
-		return new ExecuteCustomClassBuilder<>( executeCustomClass, key, collectionName );
+		return new ExecuteCustomClassBuilder<>( executeCustomClass, key, collectionName ) {};
 
 	}
 
@@ -4305,7 +4304,7 @@ public class ReactiveMongoDsl<K> {
 		K key, String collectionName
 	) {
 
-		return new ExecuteCustomClassBuilder<>( key, collectionName );
+		return new ExecuteCustomClassBuilder<>( key, collectionName ) {};
 
 	}
 
