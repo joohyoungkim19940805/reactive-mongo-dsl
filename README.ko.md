@@ -44,6 +44,7 @@ import org.springframework.transaction.reactive.TransactionalOperator;
 
 public enum MongoKey { FRONT, BACK }
 
+@Component
 public class MyMongoTemplateResolver implements MongoTemplateResolver<MongoKey> {
   private final ReactiveMongoTemplate front;
   private final ReactiveMongoTemplate back;
@@ -75,7 +76,42 @@ public class MyMongoTemplateResolver implements MongoTemplateResolver<MongoKey> 
 ```
 
 ```java
-var dsl = new ReactiveMongoDsl<>(new MyMongoTemplateResolver(...));
+
+@Configuration
+public class ReactiveMongoDslConfig {
+
+	@Bean
+	public ReactiveMongoDsl<MongoTemplateName> mongoQueryBuilder(
+		MongoTemplateResolver<MongoTemplateName> resolver
+	) {
+
+		return new ReactiveMongoDsl<>( resolver );
+
+	}
+
+
+}
+
+	@Autowired
+	private ReactiveMongoDsl<MongoTemplateName> dsl;
+	
+
+	var testEntityDsl = dsl.executeEntity( TestEntity.class, MongoTemplateName.FRONT );
+	Mono<TestResponse> testResponse = testEntityDsl
+		.fields()
+		.and( (builder) -> builder.fields( FieldsPair.pair( "key", "helloWorld", Condition.eq ) ) )
+		.end()
+		.find()
+		.execute()
+		.map(
+			e -> TestResponse
+				.builder()
+				.id( e.getId() )
+				.key( e.getKey() )
+				.comment( e.getComment() )
+				.version( e.getVersion() )
+				.build()
+		);
 ```
 
 ---
