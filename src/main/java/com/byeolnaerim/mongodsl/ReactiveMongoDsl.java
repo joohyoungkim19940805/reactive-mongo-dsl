@@ -8,28 +8,23 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;  
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
-import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.bson.Document;
-import org.springframework.data.annotation.Id;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.domain.Sort.Order;
-import org.springframework.data.geo.Point;
 import org.springframework.data.mapping.PersistentPropertyAccessor;
 import org.springframework.data.mongodb.core.BulkOperations;
 import org.springframework.data.mongodb.core.ReactiveBulkOperations;
@@ -50,7 +45,6 @@ import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.data.mongodb.core.query.UpdateDefinition;
 import org.springframework.data.repository.reactive.ReactiveCrudRepository;
 import org.springframework.transaction.reactive.TransactionalOperator;
-
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.ExecuteBuilder;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.CountAggregation;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.CountExecute;
@@ -62,7 +56,6 @@ import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuild
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindExecute;
 import com.byeolnaerim.mongodsl.criteria.FieldsPair;
 import com.byeolnaerim.mongodsl.criteria.MongoCriteriaSupport;
-import com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition;
 import com.byeolnaerim.mongodsl.internal.MongoIdFieldResolver;
 import com.byeolnaerim.mongodsl.lookup.LookupSpec;
 import com.byeolnaerim.mongodsl.result.PageResult;
@@ -78,6 +71,17 @@ import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.json.JsonMapper;
 
 
+/**
+ * Fluent reactive MongoDB DSL built on top of {@link ReactiveMongoTemplate}.
+ * <p>This DSL helps compose dynamic criteria, aggregation pipelines, lookup joins,
+ * bulk operations, and atomic updates in a reactive style.</p>
+ * <p>Template and transaction resolution are delegated to {@link MongoTemplateResolver},
+ * which makes this DSL suitable for multi-template, multi-database, or multi-tenant use cases.</p>
+ *
+ * @param <K>
+ *            the logical key type used to resolve the target Mongo template and transaction
+ *            resources
+ */
 public class ReactiveMongoDsl<K> {
 
 	private final MongoTemplateResolver<K> resolver;
@@ -86,7 +90,12 @@ public class ReactiveMongoDsl<K> {
 
 	private final static ConcurrentHashMap<Class<? extends ReactiveCrudRepository<?, ?>>, Class<?>> entityClassCache = new ConcurrentHashMap<>();
 
-
+	/**
+	 * Creates a new DSL instance using the given resolver and a default {@link ObjectMapper}.
+	 *
+	 * @param resolver
+	 *            the template and transaction resolver
+	 */
 	public ReactiveMongoDsl(
 								MongoTemplateResolver<K> resolver
 	) {
@@ -95,6 +104,14 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
+	/**
+	 * Creates a new DSL instance using the given resolver and object mapper.
+	 *
+	 * @param resolver
+	 *            the template and transaction resolver
+	 * @param objectMapper
+	 *            the object mapper used by helper features such as history snapshot creation
+	 */
 	public ReactiveMongoDsl(
 								MongoTemplateResolver<K> resolver,
 								ObjectMapper objectMapper
@@ -106,7 +123,14 @@ public class ReactiveMongoDsl<K> {
 	}
 
 
-
+	/**
+	 * Returns the {@link ReactiveMongoTemplate} resolved for the given key.
+	 *
+	 * @param key
+	 *            the logical template key
+	 * 
+	 * @return the resolved reactive Mongo template
+	 */
 	public ReactiveMongoTemplate getMongoTemplate(
 		K key
 	) {
@@ -115,6 +139,15 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
+	/**
+	 * Returns the {@link TransactionalOperator} resolved for the given key.
+	 *
+	 * @param key
+	 *            the logical template key
+	 * 
+	 * @return the resolved transactional operator, or {@code null} if transactional execution is not
+	 *         configured
+	 */
 	public TransactionalOperator getTxOperator(
 		K key
 	) {
@@ -123,6 +156,20 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
+	/**
+	 * Executes the supplied reactive job within the transaction resolved for the given key.
+	 * <p>This method simply resolves the {@link TransactionalOperator} from the configured
+	 * {@link MongoTemplateResolver} and applies it to the deferred publisher.</p>
+	 *
+	 * @param <T>
+	 *            the result type
+	 * @param key
+	 *            the logical template key
+	 * @param supplier
+	 *            the deferred reactive job to execute
+	 * 
+	 * @return a transactional {@link Mono} wrapping the supplied job
+	 */
 	public <T> Mono<T> getTxJob(
 		K key, Supplier<? extends Mono<? extends T>> supplier
 	) {
@@ -180,8 +227,16 @@ public class ReactiveMongoDsl<K> {
 	//
 	// } )
 
+	/**
+	 * Logical operators used to combine criteria groups in the field builder.
+	 */
 	public enum LogicalOperator {
-		AND, OR, NOR
+		/** Matches only when all nested criteria are satisfied. */
+		AND, //
+		/** Matches when at least one nested criterion is satisfied. */
+		OR, //
+		/** Matches only when none of the nested criteria are satisfied. */
+		NOR
 	}
 
 	private static class CriteriaGroup {
@@ -201,7 +256,17 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
-
+	/**
+	 * Base class for execution-context-specific query builders.
+	 * <p>This class provides common persistence operations, criteria entry points,
+	 * and transitions to terminal query builders such as find, count, exists,
+	 * delete, and atomic update.</p>
+	 *
+	 * @param <E>
+	 *            the target entity or mapped result type
+	 * @param <T>
+	 *            the concrete builder type
+	 */
 	public abstract class AbstractQueryBuilder<E, T extends AbstractQueryBuilder<E, T>> {
 
 		protected Class<? extends ReactiveCrudRepository<?, ?>> repositoryClass;
@@ -218,6 +283,14 @@ public class ReactiveMongoDsl<K> {
 
 		protected AbstractQueryBuilder<E, T> executeBuilder;
 
+		/**
+		 * Saves a single entity using the resolved {@link ReactiveMongoTemplate}.
+		 *
+		 * @param e
+		 *            the entity to save
+		 * 
+		 * @return a {@link Mono} emitting the saved entity
+		 */
 		public Mono<E> save(
 			E e
 		) {
@@ -226,6 +299,14 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Saves a single entity emitted by the given publisher.
+		 *
+		 * @param e
+		 *            a publisher that emits the entity to save
+		 * 
+		 * @return a {@link Mono} emitting the saved entity
+		 */
 		public Mono<E> save(
 			Mono<E> e
 		) {
@@ -234,6 +315,15 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Saves all given entities one by one using regular save operations.
+		 * <p>This method does not use a bulk insert operation.</p>
+		 *
+		 * @param entities
+		 *            the entities to save
+		 * 
+		 * @return a {@link Flux} emitting the saved entities
+		 */
 		public Flux<E> saveAll(
 			Iterable<E> entities
 		) {
@@ -256,6 +346,15 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Saves all entities emitted by the given stream using regular save operations.
+		 * <p>This method saves each entity individually and does not use a bulk insert operation.</p>
+		 *
+		 * @param entityFlux
+		 *            the entities to save
+		 * 
+		 * @return a {@link Flux} emitting the saved entities
+		 */
 		public Flux<E> saveAll(
 			Flux<E> entityFlux
 		) {
@@ -266,12 +365,13 @@ public class ReactiveMongoDsl<K> {
 
 
 		/**
-		 * Iterable<E>를 받아 대량 삽입(Bulk Insert)을 수행합니다.
-		 * 
+		 * Performs a bulk insert for the given entities.
+		 * <p>This method collects the input and performs a single {@code insertAll} call.</p>
+		 *
 		 * @param entities
-		 *            저장할 엔티티 컬렉션
+		 *            the entities to insert
 		 * 
-		 * @return 저장된 엔티티의 Flux
+		 * @return a {@link Flux} emitting the inserted entities
 		 */
 		public Flux<E> saveAllBulk(
 			Iterable<E> entities
@@ -282,12 +382,13 @@ public class ReactiveMongoDsl<K> {
 		}
 
 		/**
-		 * Collection<E>를 받아 대량 삽입(Bulk Insert)을 수행합니다.
-		 * 
+		 * Performs a bulk insert for the given entities.
+		 * <p>This method collects the input and performs a single {@code insertAll} call.</p>
+		 *
 		 * @param entities
-		 *            저장할 엔티티 컬렉션
+		 *            the entities to insert
 		 * 
-		 * @return 저장된 엔티티의 Flux
+		 * @return a {@link Flux} emitting the inserted entities
 		 */
 		public Flux<E> saveAllBulk(
 			Collection<E> entities
@@ -298,13 +399,14 @@ public class ReactiveMongoDsl<K> {
 		}
 
 		/**
-		 * Flux<E> 스트림을 받아 대량 삽입(Bulk Insert)을 수행하는 핵심 메서드입니다.
-		 * 스트림의 모든 엔티티를 수집하여 단일 DB 요청으로 처리합니다.
-		 * 
+		 * Performs a bulk insert for the given entity stream.
+		 * <p>All emitted entities are collected first and then inserted using a single
+		 * {@code insertAll} call. If the source is empty, an empty {@link Flux} is returned.</p>
+		 *
 		 * @param entityFlux
-		 *            저장할 엔티티의 Flux
+		 *            the entities to insert
 		 * 
-		 * @return 저장된 엔티티의 Flux
+		 * @return a {@link Flux} emitting the inserted entities
 		 */
 		public Flux<E> saveAllBulk(
 			Flux<E> entityFlux
@@ -357,12 +459,15 @@ public class ReactiveMongoDsl<K> {
 		}
 
 		/**
-		 * Iterable<E>를 받아 대량 저장(Bulk Upsert)을 수행합니다.
-		 * 
+		 * Performs a bulk upsert using the entity identifier.
+		 * <p>The identifier field is resolved from an {@code @Id} field or, if none exists,
+		 * from a field named {@code id}.</p>
+		 * <p>Entities with a {@code null} identifier are inserted as new documents.</p>
+		 *
 		 * @param entities
-		 *            저장할 엔티티 컬렉션
+		 *            the entities to upsert
 		 * 
-		 * @return BulkWriteResult의 Mono
+		 * @return a {@link Mono} emitting the bulk write result
 		 */
 		public Mono<BulkWriteResult> saveAllBulkUpsert(
 			Iterable<E> entities
@@ -414,12 +519,15 @@ public class ReactiveMongoDsl<K> {
 		}
 
 		/**
-		 * Collection<E>를 받아 대량 저장(Bulk Upsert)을 수행합니다.
-		 * 
+		 * Performs a bulk upsert using the entity identifier.
+		 * <p>The identifier field is resolved from an {@code @Id} field or, if none exists,
+		 * from a field named {@code id}.</p>
+		 * <p>Entities with a {@code null} identifier are inserted as new documents.</p>
+		 *
 		 * @param entities
-		 *            저장할 엔티티 컬렉션
+		 *            the entities to upsert
 		 * 
-		 * @return BulkWriteResult의 Mono
+		 * @return a {@link Mono} emitting the bulk write result
 		 */
 		public Mono<BulkWriteResult> saveAllBulkUpsert(
 			Collection<E> entities
@@ -430,14 +538,14 @@ public class ReactiveMongoDsl<K> {
 		}
 
 		/**
-		 * Flux<E> 스트림을 받아 대량 저장(Bulk Upsert)을 수행하는 핵심 메서드입니다.
-		 * 스트림의 모든 엔티티에 대해 'upsert' 연산을 준비하고 단일 DB 요청으로 실행합니다.
-		 * (주의: 이 메서드를 사용하려면 엔티티에 @Id 어노테이션이 설정된 필드나 이름이 id인 필드가 있어야 합니다.)
-		 * 
+		 * Performs a bulk upsert for the given entity stream using the entity identifier.
+		 * <p>The identifier field is resolved lazily from the first emitted entity.
+		 * Entities with a {@code null} identifier are inserted as new documents.</p>
+		 *
 		 * @param entityFlux
-		 *            저장할 엔티티의 Flux
+		 *            the entities to upsert
 		 * 
-		 * @return BulkWriteResult의 Mono (처리 결과)
+		 * @return a {@link Mono} emitting the bulk write result
 		 */
 		public Mono<BulkWriteResult> saveAllBulkUpsert(
 			Flux<E> entityFlux
@@ -536,6 +644,19 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Performs a bulk upsert using one or more business key fields instead of the entity identifier.
+		 * <p>When multiple key fields are provided, they are combined as a composite key.</p>
+		 * <p>If any configured key field is missing or {@code null} for an entity,
+		 * that entity is inserted instead of being upserted.</p>
+		 *
+		 * @param entityFlux
+		 *            the entities to upsert
+		 * @param keyFieldName
+		 *            one or more business key field names
+		 * 
+		 * @return a {@link Mono} emitting the bulk write result
+		 */
 		public Mono<BulkWriteResult> saveAllBulkUpsertByKey(
 			Flux<E> entityFlux, String... keyFieldName // 예: "caseKey" 또는 "court","year","caseNo"
 		) {
@@ -684,7 +805,19 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-
+		/**
+		 * Performs a bulk upsert using one or more business key fields instead of the entity identifier.
+		 * <p>When multiple key fields are provided, they are combined as a composite key.</p>
+		 * <p>If any configured key field is missing or {@code null} for an entity,
+		 * that entity is inserted instead of being upserted.</p>
+		 *
+		 * @param entities
+		 *            the entities to upsert
+		 * @param keyFieldName
+		 *            one or more business key field names
+		 * 
+		 * @return a {@link Mono} emitting the bulk write result
+		 */
 		public Mono<BulkWriteResult> saveAllBulkUpsertByKey(
 			Collection<E> entities, String... keyFieldName // 예: "caseKey" 또는 "court", "year", "caseNo"
 		) {
@@ -816,6 +949,15 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Deletes the given entities in bulk by identifier.
+		 * <p>Entities without an identifier are ignored.</p>
+		 *
+		 * @param entities
+		 *            the entities to delete
+		 * 
+		 * @return a {@link Mono} emitting the bulk write result
+		 */
 		public Mono<BulkWriteResult> deleteBulk(
 			Iterable<E> entities
 		) {
@@ -824,14 +966,15 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		public Mono<BulkWriteResult> deleteBulk(
-			Iterable<E> entities, boolean isBackup
-		) {
-
-			return deleteBulk( Flux.fromIterable( entities ), isBackup );
-
-		}
-
+		/**
+		 * Deletes the given entities in bulk by identifier.
+		 * <p>Entities without an identifier are ignored.</p>
+		 *
+		 * @param entities
+		 *            the entities to delete
+		 * 
+		 * @return a {@link Mono} emitting the bulk write result
+		 */
 		public Mono<BulkWriteResult> deleteBulk(
 			Collection<E> entities
 		) {
@@ -840,14 +983,15 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		public Mono<BulkWriteResult> deleteBulk(
-			Collection<E> entities, boolean isBackup
-		) {
-
-			return deleteBulk( Flux.fromIterable( entities ), isBackup );
-
-		}
-
+		/**
+		 * Deletes the given entities in bulk by identifier.
+		 * <p>Entities without an identifier are ignored.</p>
+		 *
+		 * @param entities
+		 *            the entities to delete
+		 * 
+		 * @return a {@link Mono} emitting the bulk write result
+		 */
 		public Mono<BulkWriteResult> deleteBulk(
 			Flux<E> entityFlux
 		) {
@@ -856,6 +1000,61 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Deletes the given entities in bulk by identifier.
+		 * <p>When backup is enabled, the original entities are first inserted into a backup
+		 * collection named {@code {collection}_remove}, and are then deleted from the source
+		 * collection.</p>
+		 *
+		 * @param entities
+		 *            the entities to delete
+		 * @param isBackup
+		 *            whether a backup snapshot should be stored before deletion
+		 * 
+		 * @return a {@link Mono} emitting the bulk write result
+		 */
+		public Mono<BulkWriteResult> deleteBulk(
+			Iterable<E> entities, boolean isBackup
+		) {
+
+			return deleteBulk( Flux.fromIterable( entities ), isBackup );
+
+		}
+
+		/**
+		 * Deletes the given entities in bulk by identifier.
+		 * <p>When backup is enabled, the original entities are first inserted into a backup
+		 * collection named {@code {collection}_remove}, and are then deleted from the source
+		 * collection.</p>
+		 *
+		 * @param entities
+		 *            the entities to delete
+		 * @param isBackup
+		 *            whether a backup snapshot should be stored before deletion
+		 * 
+		 * @return a {@link Mono} emitting the bulk write result
+		 */
+		public Mono<BulkWriteResult> deleteBulk(
+			Collection<E> entities, boolean isBackup
+		) {
+
+			return deleteBulk( Flux.fromIterable( entities ), isBackup );
+
+		}
+
+		/**
+		 * Deletes the given entities in bulk by identifier.
+		 * <p>When backup is enabled, the original entities are first inserted into a backup
+		 * collection named {@code {collection}_remove}, and are then deleted from the source
+		 * collection.</p>
+		 *
+		 * @param entities
+		 *            the entities to delete
+		 * @param isBackup
+		 *            whether a backup snapshot should be stored before deletion
+		 * 
+		 * @return a {@link Mono} emitting the bulk write result
+		 */
 		public Mono<BulkWriteResult> deleteBulk(
 			Flux<E> entityFlux, boolean isBackup
 		) {
@@ -961,6 +1160,14 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Deletes the given entity.
+		 *
+		 * @param e
+		 *            the entity to delete
+		 * 
+		 * @return a {@link Mono} emitting the delete result
+		 */
 		public Mono<DeleteResult> delete(
 			E e
 		) {
@@ -969,6 +1176,14 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Deletes the given entity emitted by the publisher.
+		 *
+		 * @param e
+		 *            the publisher emitting the entity to delete
+		 * 
+		 * @return a {@link Mono} emitting the delete result
+		 */
 		public Mono<DeleteResult> delete(
 			Mono<E> e
 		) {
@@ -977,6 +1192,18 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Deletes the given entity.
+		 * <p>When backup is enabled, the deleted entity is copied into a backup collection
+		 * named {@code {collection}_remove}.</p>
+		 *
+		 * @param e
+		 *            the entity to delete
+		 * @param isBackup
+		 *            whether a backup snapshot should be stored before deletion
+		 * 
+		 * @return a {@link Mono} emitting the delete result
+		 */
 		public Mono<DeleteResult> delete(
 			E e, boolean isBackup
 		) {
@@ -1012,7 +1239,18 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-
+		/**
+		 * Deletes the given entity emitted by the publisher.
+		 * <p>When backup is enabled, the deleted entity is copied into a backup collection
+		 * named {@code {collection}_remove}.</p>
+		 *
+		 * @param eMono
+		 *            the publisher emitting the entity to delete
+		 * @param isBackup
+		 *            whether a backup snapshot should be stored before deletion
+		 * 
+		 * @return a {@link Mono} emitting the delete result
+		 */
 		public Mono<DeleteResult> delete(
 			Mono<E> eMono, boolean isBackup
 		) {
@@ -1063,6 +1301,14 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Creates a history snapshot of the given entity using the default prefix {@code history}.
+		 *
+		 * @param e
+		 *            the entity to snapshot
+		 * 
+		 * @return a {@link Mono} that completes when the snapshot has been inserted
+		 */
 		public Mono<Void> createHistory(
 			E e
 		) {
@@ -1071,6 +1317,16 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Creates a history snapshot of the given entity using the specified collection suffix.
+		 *
+		 * @param e
+		 *            the entity to snapshot
+		 * @param prefix
+		 *            the history collection suffix; blank values fall back to {@code history}
+		 * 
+		 * @return a {@link Mono} that completes when the snapshot has been inserted
+		 */
 		public Mono<Void> createHistory(
 			E e, String prefix
 		) {
@@ -1079,6 +1335,17 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Creates a history snapshot of the given entity using the provided object mapper.
+		 * <p>The snapshot is inserted into a collection using the default suffix {@code history}.</p>
+		 *
+		 * @param e
+		 *            the entity to snapshot
+		 * @param objectMapper
+		 *            the object mapper used for deep cloning
+		 * 
+		 * @return a {@link Mono} that completes when the snapshot has been inserted
+		 */
 		public Mono<Void> createHistory(
 			E e, ObjectMapper objectMapper
 		) {
@@ -1087,6 +1354,17 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Creates a history snapshot of the given entity using the provided object mapper.
+		 * <p>The snapshot is inserted into a collection using the default suffix {@code history}.</p>
+		 *
+		 * @param e
+		 *            the entity to snapshot
+		 * @param objectMapper
+		 *            the object mapper used for deep cloning
+		 * 
+		 * @return a {@link Mono} that completes when the snapshot has been inserted
+		 */
 		public Mono<Void> createHistory(
 			E e, String prefix, ObjectMapper objectMapper
 		) {
@@ -1151,6 +1429,42 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Starts criteria construction with a root {@link LogicalOperator#AND} group.
+		 *
+		 * @return the field builder for composing criteria
+		 */
+		public FieldBuilder<E> fields() {
+
+			return fields( LogicalOperator.AND );
+
+		}
+
+		/**
+		 * Starts criteria construction with the given root logical operator.
+		 *
+		 * @param logicalOperator
+		 *            the root logical operator
+		 * 
+		 * @return the field builder for composing criteria
+		 */
+		public FieldBuilder<E> fields(
+			LogicalOperator logicalOperator
+		) {
+
+			return createFirstOperator( logicalOperator );
+
+		}
+
+		/**
+		 * Starts criteria construction with a root {@link LogicalOperator#AND} group
+		 * and immediately adds the given field conditions.
+		 *
+		 * @param fieldsPairs
+		 *            the initial field conditions
+		 * 
+		 * @return the field builder for composing criteria
+		 */
 		public FieldBuilder<E> fields(
 			FieldsPair<?, ?>... fieldsPairs
 		) {
@@ -1159,6 +1473,15 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Starts criteria construction with a root {@link LogicalOperator#AND} group
+		 * and immediately adds the given field conditions.
+		 *
+		 * @param fieldsPairs
+		 *            the initial field conditions
+		 * 
+		 * @return the field builder for composing criteria
+		 */
 		public FieldBuilder<E> fields(
 			Collection<FieldsPair<?, ?>> fieldsPairs
 		) {
@@ -1167,13 +1490,14 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		public FieldBuilder<E> fields() {
-
-			return fields( LogicalOperator.AND );
-
-		}
-
-
+		/**
+		 * Starts criteria construction with the given root logical operator.
+		 *
+		 * @param logicalOperator
+		 *            the root logical operator
+		 * 
+		 * @return the field builder for composing criteria
+		 */
 		public FieldBuilder<E> fields(
 			LogicalOperator logicalOperator, FieldsPair<?, ?>... fieldsPairs
 		) {
@@ -1184,6 +1508,14 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Starts criteria construction with the given root logical operator.
+		 *
+		 * @param logicalOperator
+		 *            the root logical operator
+		 * 
+		 * @return the field builder for composing criteria
+		 */
 		public FieldBuilder<E> fields(
 			LogicalOperator logicalOperator, Collection<FieldsPair<?, ?>> fieldsPairs
 		) {
@@ -1194,13 +1526,7 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		public FieldBuilder<E> fields(
-			LogicalOperator logicalOperator
-		) {
 
-			return createFirstOperator( logicalOperator );
-
-		}
 
 		private FieldBuilder<E> createFirstOperator(
 			LogicalOperator logicalOperator
@@ -1271,6 +1597,16 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Builder for aggregation-based grouping queries.
+		 * <p>This builder supports group keys, common accumulator operations,
+		 * optional lookup joins, and custom key/value conversion.</p>
+		 *
+		 * @param <KK>
+		 *            the grouped key type
+		 * @param <V>
+		 *            the grouped value type
+		 */
 		public abstract class Grouping<KK, V> {
 
 			private final List<String> keyFields = new ArrayList<>();
@@ -1287,9 +1623,26 @@ public class ReactiveMongoDsl<K> {
 
 			private Function<Document, V> valueConverter;
 
+			@SuppressWarnings("rawtypes")
 			private final QueryBuilderAccesser accessor;
 
-			@SuppressWarnings("unchecked")
+			/**
+			 * Starts a grouping query on top of the current criteria and query options.
+			 *
+			 * @param <KK>
+			 *            the grouped key type
+			 * @param <V>
+			 *            the grouped value type
+			 * @param k
+			 *            the target key type
+			 * @param v
+			 *            the target value type
+			 * 
+			 * @return a grouping builder
+			 */
+			@SuppressWarnings({
+				"unchecked", "rawtypes"
+			})
 			public Grouping(
 							Class<KK> k,
 							Class<V> v,
@@ -1354,6 +1707,14 @@ public class ReactiveMongoDsl<K> {
 			//
 			// }
 
+			/**
+			 * Sets a custom converter for the aggregation group key document.
+			 *
+			 * @param fn
+			 *            the key converter
+			 * 
+			 * @return this builder
+			 */
 			public Grouping<KK, V> keyConverter(
 				Function<Document, KK> fn
 			) {
@@ -1367,6 +1728,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Sets a custom converter for the aggregation result value document.
+			 *
+			 * @param fn
+			 *            the value converter
+			 * 
+			 * @return this builder
+			 */
 			public Grouping<KK, V> valueConverter(
 				Function<Document, V> fn
 			) {
@@ -1380,7 +1749,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			/** 그룹 키 지정 (1개 이상) */
+			/**
+			 * Defines one or more fields to be used as the group key.
+			 *
+			 * @param keys
+			 *            the group key field names
+			 * 
+			 * @return this builder
+			 */
 			public Grouping<KK, V> by(
 				String... keys
 			) {
@@ -1400,13 +1776,25 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			/** 누적기들 */
+			/**
+			 * Adds a count accumulator using the default alias {@code count}.
+			 *
+			 * @return this builder
+			 */
 			public Grouping<KK, V> count() {
 
 				return countAs( "count" );
 
 			}
 
+			/**
+			 * Adds a count accumulator using the given alias.
+			 *
+			 * @param as
+			 *            the accumulator alias
+			 * 
+			 * @return this builder
+			 */
 			public Grouping<KK, V> countAs(
 				String as
 			) {
@@ -1417,6 +1805,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Adds a {@code $sum} accumulator for the given field.
+			 *
+			 * @param field
+			 *            the source field
+			 * @param as
+			 *            the accumulator alias
+			 * 
+			 * @return this builder
+			 */
 			public Grouping<KK, V> sum(
 				String field, String as
 			) {
@@ -1427,6 +1825,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Adds an {@code $avg} accumulator for the given field.
+			 *
+			 * @param field
+			 *            the source field
+			 * @param as
+			 *            the accumulator alias
+			 * 
+			 * @return this builder
+			 */
 			public Grouping<KK, V> avg(
 				String field, String as
 			) {
@@ -1437,6 +1845,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Adds a {@code $min} accumulator for the given field.
+			 *
+			 * @param field
+			 *            the source field
+			 * @param as
+			 *            the accumulator alias
+			 * 
+			 * @return this builder
+			 */
 			public Grouping<KK, V> min(
 				String field, String as
 			) {
@@ -1447,6 +1865,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Adds a {@code $max} accumulator for the given field.
+			 *
+			 * @param field
+			 *            the source field
+			 * @param as
+			 *            the accumulator alias
+			 * 
+			 * @return this builder
+			 */
 			public Grouping<KK, V> max(
 				String field, String as
 			) {
@@ -1457,6 +1885,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Adds an {@code $addToSet} accumulator for the given field.
+			 *
+			 * @param field
+			 *            the source field
+			 * @param as
+			 *            the accumulator alias
+			 * 
+			 * @return this builder
+			 */
 			public Grouping<KK, V> addToSet(
 				String field, String as
 			) {
@@ -1467,6 +1905,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Adds a {@code $push} accumulator for the given field.
+			 *
+			 * @param field
+			 *            the source field
+			 * @param as
+			 *            the accumulator alias
+			 * 
+			 * @return this builder
+			 */
 			public Grouping<KK, V> push(
 				String field, String as
 			) {
@@ -1477,14 +1925,29 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			/** lookup 없이 그룹 실행 */
+			/**
+			 * Executes the grouping query without a lookup join.
+			 *
+			 * @return a {@link Mono} emitting the grouped result map
+			 */
 			public Mono<Map<KK, V>> execute() {
 
 				return buildAndRun( null, null );
 
 			}
 
-			/** lookup 포함 그룹 실행 */
+			/**
+			 * Executes the grouping query with a lookup join.
+			 *
+			 * @param rightBuilder
+			 *            the right-side query builder used for the join target
+			 * @param spec
+			 *            the lookup specification
+			 * @param <R2>
+			 *            the right-side mapped type
+			 * 
+			 * @return a {@link Mono} emitting the grouped result map
+			 */
 			public <R2> Mono<Map<KK, V>> executeLookup(
 				ReactiveMongoDsl<K>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 			) {
@@ -1851,6 +2314,12 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Builder for composing nested criteria groups using AND, OR, and NOR-based negation.
+		 *
+		 * @param <S>
+		 *            the current entity type
+		 */
 		public class FieldBuilder<S extends E> {
 
 			private Deque<CriteriaGroup> criteriaStack = new ArrayDeque<>();
@@ -1878,7 +2347,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			// 필드를 현재 그룹에 추가
+			/**
+			 * Adds the given field conditions to the current criteria group.
+			 *
+			 * @param fieldsPairs
+			 *            the field conditions to add
+			 * 
+			 * @return this builder
+			 */
 			public FieldBuilder<S> fields(
 				FieldsPair<?, ?>... fieldsPairs
 			) {
@@ -1905,6 +2381,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Creates a nested AND group and appends it to the current criteria tree.
+			 *
+			 * @param block
+			 *            the nested criteria block
+			 * 
+			 * @return this builder
+			 */
 			public FieldBuilder<S> and(
 				Consumer<FieldBuilder<S>> block
 			) {
@@ -1923,7 +2407,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-
+			/**
+			 * Creates a nested OR group and appends it to the current criteria tree.
+			 *
+			 * @param block
+			 *            the nested criteria block
+			 * 
+			 * @return this builder
+			 */
 			public FieldBuilder<S> or(
 				Consumer<FieldBuilder<S>> block
 			) {
@@ -1942,6 +2433,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Creates a negated AND group by wrapping the nested conditions in a NOR expression.
+			 *
+			 * @param block
+			 *            the nested criteria block
+			 * 
+			 * @return this builder
+			 */
 			public FieldBuilder<S> not(
 				Consumer<FieldBuilder<S>> block
 			) {
@@ -1960,7 +2459,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			// NOT(OR(...))
+			/**
+			 * Creates a negated OR-style group that matches when none of the nested conditions are satisfied.
+			 *
+			 * @param block
+			 *            the nested criteria block
+			 * 
+			 * @return this builder
+			 */
 			public FieldBuilder<S> notAny(
 				Consumer<FieldBuilder<S>> block
 			) {
@@ -1979,7 +2485,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			// NOT(AND(...))
+			/**
+			 * Alias for {@link #not(Consumer)}.
+			 *
+			 * @param block
+			 *            the nested criteria block
+			 * 
+			 * @return this builder
+			 */
 			public FieldBuilder<S> notAll(
 				Consumer<FieldBuilder<S>> block
 			) {
@@ -2047,6 +2560,11 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Finalizes the current criteria tree and returns a factory for terminal query builders.
+			 *
+			 * @return the terminal query builder factory
+			 */
 			public AbstractQueryBuilder<E, T>.QueryBuilderFactory end() {
 
 				while (criteriaStack.size() > 1) {
@@ -2107,40 +2625,71 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Factory for creating terminal query builders after criteria composition has been completed.
+		 */
 		public class QueryBuilderFactory {
 
+			/**
+			 * Creates a query builder for multi-result reads.
+			 *
+			 * @return a multi-result query builder
+			 */
 			public FindAllQueryBuilder<E> findAll() {
 
 				return new FindAllQueryBuilder<E>();
 
 			}
 
+			/**
+			 * Creates a query builder for single-result reads.
+			 *
+			 * @return a single-result query builder
+			 */
 			public FindQueryBuilder<E> find() {
 
 				return new FindQueryBuilder<E>();
 
 			}
 
+			/**
+			 * Creates a query builder for count operations.
+			 *
+			 * @return a count query builder
+			 */
 			public CountQueryBuilder count() {
 
 				return new CountQueryBuilder();
 
 			}
 
-
+			/**
+			 * Creates a query builder for criteria-based delete operations.
+			 *
+			 * @return a delete query builder
+			 */
 			public DeleteQueryBuilder delete() {
 
 				return new DeleteQueryBuilder();
 
 			}
 
+			/**
+			 * Creates a query builder for existence checks.
+			 *
+			 * @return an exists query builder
+			 */
 			public ExistsQueryBuilder exists() {
 
 				return new ExistsQueryBuilder();
 
 			}
 
-			// 원자적 update 빌더
+			/**
+			 * Creates a query builder for atomic update operations.
+			 *
+			 * @return an atomic update query builder
+			 */
 			public AtomicUpdateQueryBuilder atomicUpdate() {
 
 				return new AtomicUpdateQueryBuilder();
@@ -2150,6 +2699,13 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Builder for multi-result queries with optional sorting, paging, field exclusion,
+		 * lookup joins, and aggregation-based page counting.
+		 *
+		 * @param <S>
+		 *            the current entity type
+		 */
 		public class FindAllQueryBuilder<S extends E> extends QueryBuilderAccesser<FindAllExecute<E>, FindAllAggregation<E>> implements FindAllExecute<E>, FindAllAggregation<E> {
 
 
@@ -2160,12 +2716,27 @@ public class ReactiveMongoDsl<K> {
 			private String[] excludes = null;
 
 
+			/**
+			 * Starts paging configuration for this query.
+			 *
+			 * @return a paging helper builder
+			 */
 			public PageBuilder paging() {
 
 				return new PageBuilder();
 
 			}
 
+			/**
+			 * Configures zero-based paging for this query.
+			 *
+			 * @param pageNumber
+			 *            the zero-based page index
+			 * @param pageSize
+			 *            the page size
+			 * 
+			 * @return this builder
+			 */
 			public FindAllQueryBuilder<S> paging(
 				Integer pageNumber, Integer pageSize
 			) {
@@ -2174,6 +2745,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Applies the given sort orders to the query.
+			 *
+			 * @param sorts
+			 *            the sort orders
+			 * 
+			 * @return this builder
+			 */
 			public FindAllQueryBuilder<S> sorts(
 				Order... sorts
 			) {
@@ -2183,7 +2762,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-
+			/**
+			 * Applies the given sort orders to the query.
+			 *
+			 * @param sorts
+			 *            the sort orders
+			 * 
+			 * @return this builder
+			 */
 			public FindAllQueryBuilder<S> sorts(
 				Collection<Order> sorts
 			) {
@@ -2193,6 +2779,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Excludes the given fields from the result projection.
+			 *
+			 * @param excludes
+			 *            the field names to exclude
+			 * 
+			 * @return this builder
+			 */
 			public FindAllQueryBuilder<S> excludes(
 				String... excludes
 			) {
@@ -2202,7 +2796,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-
+			/**
+			 * Excludes the given fields from the result projection.
+			 *
+			 * @param excludes
+			 *            the field names to exclude
+			 * 
+			 * @return this builder
+			 */
 			public FindAllQueryBuilder<S> excludes(
 				Collection<String> excludes
 			) {
@@ -2212,12 +2813,23 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Helper builder for configuring page number and page size.
+			 */
 			public class PageBuilder {
 
 				private Integer pageNumber;
 
 				private Integer pageSize;
 
+				/**
+				 * Sets the zero-based page number.
+				 *
+				 * @param pageNumber
+				 *            the zero-based page index
+				 * 
+				 * @return this builder
+				 */
 				public PageBuilder pageNumber(
 					int pageNumber
 				) {
@@ -2227,6 +2839,14 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
+				/**
+				 * Sets the page size.
+				 *
+				 * @param pageSize
+				 *            the page size
+				 * 
+				 * @return this builder
+				 */
 				public PageBuilder pageSize(
 					int pageSize
 				) {
@@ -2236,6 +2856,16 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
+				/**
+				 * Finalizes paging configuration using the given values and returns the parent query builder.
+				 *
+				 * @param pageNumber
+				 *            the zero-based page index
+				 * @param pageSize
+				 *            the page size
+				 * 
+				 * @return the parent query builder
+				 */
 				public FindAllQueryBuilder<S> and(
 					Integer pageNumber, Integer pageSize
 				) {
@@ -2249,6 +2879,11 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
+				/**
+				 * Finalizes paging configuration using the values previously set on this builder.
+				 *
+				 * @return the parent query builder
+				 */
 				public FindAllQueryBuilder<S> and() {
 
 					if (pageNumber == null || pageSize == null) { throw new IllegalArgumentException( "Both pageNumber and pageSize must be specified." ); }
@@ -2280,6 +2915,72 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Executes the current criteria as a regular find query and returns all matching entities.
+			 *
+			 * @return a {@link Flux} emitting all matching entities
+			 */
+			@Override
+			public Flux<E> execute() {
+
+				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
+					Query query = new Query();
+
+					if (criteriaOptional.isPresent()) {
+						query.addCriteria( criteriaOptional.get() );
+
+					}
+
+					if (paging != null) {
+						query.skip( (long) paging.pageNumber * paging.pageSize ).limit( paging.pageSize );
+
+					}
+
+					query.with( this.sort );
+
+					if (excludes != null && excludes.length != 0) {
+						query.fields().exclude( excludes );
+						// query.fields().slice( collectionName, 0 );
+
+					}
+
+					applyQueryOptions( query );
+
+					if (excludes != null && excludes.length > 0) {
+						var fields = query.fields();
+						Arrays
+							.stream( excludes )
+							.filter( s -> s != null && ! s.isBlank() )
+							.forEach( fields::exclude );
+
+					}
+
+					return query;
+
+				} );
+				Flux<E> result = Mono
+					.zip( executeClassMono, queryMono )
+					.flatMapMany( tuple -> {
+						var entityClass = tuple.getT1();
+						var query = tuple.getT2();
+						Flux<? extends E> queryResult = collectionName != null && ! collectionName.isBlank() ? reactiveMongoTemplate.find( query, entityClass, collectionName )
+							: reactiveMongoTemplate.find( query, entityClass );
+						return queryResult;
+
+					} );
+
+				return result;
+				// .onErrorMap( e -> new RuntimeException( "Failed to find with : " + e.getMessage(), e ) );
+
+			}
+
+			/**
+			 * Executes the current query as an aggregation pipeline.
+			 * <p>When paging is configured, this method builds a {@code $facet(data, totalCount)} pipeline
+			 * and returns a {@link PageResult} containing both page data and total count.</p>
+			 *
+			 * @return a {@link Mono} emitting the paged aggregation result
+			 */
 			@Override
 			public Mono<PageResult<E>> executeAggregation() {
 
@@ -2385,6 +3086,221 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Executes the current query with a {@code $lookup} join.
+			 *
+			 * @param rightBuilder
+			 *            the right-side query builder used as the join target
+			 * @param spec
+			 *            the lookup specification
+			 * @param <R2>
+			 *            the right-side mapped type
+			 * 
+			 * @return a {@link Flux} emitting lookup tuples for each matching left-side document
+			 */
+			@Override
+			public <R2> Flux<ResultTuple<E, List<R2>>> executeLookup(
+					ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+			) {
+
+				// 왼쪽/오른쪽 클래스, 컬렉션명 결정
+				Mono<Class<E>> leftClassMono = executeClassMono;
+				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
+
+
+				Mono<Aggregation> aggMono = Mono
+					.zip(
+						fieldBuilder.buildCriteria(), // 왼쪽 match
+						rightBuilder.getFieldBuilderCriteria(),
+						leftClassMono,
+						rightClassMono
+					)
+					.map( tuple -> {
+						Optional<Criteria> leftCriteriaOpt = tuple.getT1();
+						Optional<Criteria> rightCriteriaOpt = tuple.getT2();
+						Class<E> leftClass = tuple.getT3();
+						Class<R2> rightClass = tuple.getT4();
+
+						// String leftCollection = (collectionName != null && ! collectionName.isBlank())
+						// ? collectionName
+						// : resolveCollectionName( leftClass );
+
+						String rightCollection = (rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank())
+							? rightBuilder.getCollectionName()
+							: rightBuilder.resolveCollectionName( rightClass );
+
+						String leftKey = simpleName( leftClass );
+						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
+						String rightKey = simpleName( rightClass );
+
+						List<AggregationOperation> ops = new ArrayList<>();
+						leftCriteriaOpt.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+
+						// $lookup 구성
+						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
+
+						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
+						List<Document> userStages = Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of );
+						List<Document> nonLimitStages = new ArrayList<>();
+						List<Document> limitStages = new ArrayList<>();
+
+						for (Document st : userStages) {
+							if (st.containsKey( "$limit" ))
+								limitStages.add( st );
+							else
+								nonLimitStages.add( st );
+
+						}
+
+						boolean needPipeline = (spec.getLocalField() == null || spec.getForeignField() == null) // 원래 pipeline 모드
+							|| rightCriteriaOpt.isPresent() // 오른쪽 추가 필터 있음
+							|| ! nonLimitStages.isEmpty() || ! limitStages.isEmpty(); // 사용자가 넣은 stage 있음
+
+						if (! needPipeline) {
+							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
+							lookupBody
+								.append( "localField", spec.getLocalField() )
+								.append( "foreignField", spec.getForeignField() );
+
+						} else {
+							List<Document> pipe = new ArrayList<>();
+
+							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
+							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rc.getCriteriaObject() ) ) );
+
+							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
+							if (spec.getLocalField() != null && spec.getForeignField() != null) {
+								String lfVar = "vlf"; // 반드시 영문자로 시작
+								lookupBody.append( "let", new Document( lfVar, "$" + spec.getLocalField() ) );
+								pipe
+									.add(
+										new Document(
+											"$match",
+											new Document(
+												"$expr",
+												new Document( "$eq", Arrays.asList( "$" + spec.getForeignField(), "$$" + lfVar ) )
+											)
+										)
+									);
+
+							} else {
+								// let 그대로 유지 (없으면 빈 Document)
+								lookupBody.append( "let", Optional.ofNullable( spec.getLetDoc() ).orElseGet( Document::new ) );
+
+							}
+
+							boolean onlyProjects = ! nonLimitStages.isEmpty() && nonLimitStages.stream().allMatch( st -> st.containsKey( "$project" ) );
+
+							if (onlyProjects) {
+								// EXISTS 최적화: limit → project (후보를 1건으로 줄인 다음 project)
+								pipe.addAll( limitStages );
+								pipe.addAll( nonLimitStages );
+
+							} else {
+								// 일반 케이스: 기존 순서 유지
+								pipe.addAll( nonLimitStages );
+								pipe.addAll( limitStages );
+
+							}
+
+							lookupBody.append( "pipeline", pipe );
+
+						}
+
+						AggregationOperation lookupOp = (ctx) -> new Document( "$lookup", lookupBody );
+						ops.add( lookupOp );
+
+						if (spec.isUnwind()) {
+							Document unwind = new Document(
+								"$unwind",
+								new Document( "path", "$" + rightAs )
+									.append( "preserveNullAndEmptyArrays", spec.isPreserveNullAndEmptyArrays() )
+							);
+							ops.add( ctx -> unwind );
+
+						}
+
+						if (spec.getOuterStages() != null && ! spec.getOuterStages().isEmpty()) {
+
+							for (Document st : spec.getOuterStages()) {
+								ops.add( ctx -> st );
+
+							}
+
+						}
+
+						// 정렬/페이징(왼쪽 기준) 유지
+						ops.add( Aggregation.sort( (this.sort != null && this.sort.isSorted()) ? this.sort : Sort.by( Sort.Direction.DESC, "_id" ) ) );
+
+						if (this.paging != null) {
+							ops.add( Aggregation.skip( (long) this.paging.pageNumber * this.paging.pageSize ) );
+							ops.add( Aggregation.limit( this.paging.pageSize ) );
+
+						}
+
+						// 결과 모양: { LeftName: $$ROOT, RightName: $<rightAs> }
+						Document project = new Document(
+							"$project",
+							new Document()
+								.append( leftKey, "$$ROOT" )
+								.append( rightKey, "$" + rightAs )
+						);
+						ops.add( ctx -> project );
+
+						Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+
+						return agg;
+
+					} );
+
+				return Mono
+					.zip( leftClassMono, rightClassMono, aggMono )
+					.flatMapMany( tuple -> {
+						Class<E> leftClass = tuple.getT1();
+						Class<R2> rightClass = tuple.getT2();
+						Aggregation agg = tuple.getT3();
+
+						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
+							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
+							: reactiveMongoTemplate.aggregate( agg, leftClass, Document.class );
+
+						String leftKey = simpleName( leftClass );
+						String rightKey = simpleName( rightClass );
+
+						return docs.map( d -> {
+							@SuppressWarnings("unchecked")
+							S leftVal = (S) reactiveMongoTemplate.getConverter().read( leftClass, (Document) d.get( leftKey ) );
+
+							@SuppressWarnings("unchecked")
+							List<Document> rightArr = (List<Document>) d.get( rightKey );
+
+							List<R2> rightVal = (rightArr == null) ? List.of()
+								: rightArr
+									.stream()
+									.map( x -> reactiveMongoTemplate.getConverter().read( rightClass, x ) )
+									.collect( Collectors.toList() );
+
+							return new ResultTuple<>( leftKey, leftVal, rightKey, rightVal );
+
+						} );
+
+					} );
+
+			}
+
+			/**
+			 * Executes the current query with a {@code $lookup} join and returns paged results
+			 * together with the total number of matching left-side documents.
+			 *
+			 * @param rightBuilder
+			 *            the right-side query builder used as the join target
+			 * @param spec
+			 *            the lookup specification
+			 * @param <R2>
+			 *            the right-side mapped type
+			 * 
+			 * @return a {@link Mono} emitting a paged lookup result
+			 */
 			@Override
 			public <R2> Mono<PageResult<ResultTuple<E, List<R2>>>> executeLookupAndCount(
 					ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
@@ -2620,198 +3536,97 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			@Override
-			public <R2> Flux<ResultTuple<E, List<R2>>> executeLookup(
-					ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+		}
+
+		/**
+		 * Builder for single-result queries with optional sorting, field exclusion,
+		 * and lookup-based aggregation support.
+		 *
+		 * @param <S>
+		 *            the current entity type
+		 */
+		public class FindQueryBuilder<S extends E> extends QueryBuilderAccesser<FindExecute<E>, FindAggregation<E>> implements FindExecute<E>, FindAggregation<E> {
+
+			private Sort sort = Sort.unsorted();
+
+			private String[] excludes = null;
+
+
+			/**
+			 * Applies the given sort orders to the query.
+			 *
+			 * @param sorts
+			 *            the sort orders
+			 * 
+			 * @return this builder
+			 */
+			public FindQueryBuilder<S> sorts(
+				Order... sorts
 			) {
 
-				// 왼쪽/오른쪽 클래스, 컬렉션명 결정
-				Mono<Class<E>> leftClassMono = executeClassMono;
-				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
-
-
-				Mono<Aggregation> aggMono = Mono
-					.zip(
-						fieldBuilder.buildCriteria(), // 왼쪽 match
-						rightBuilder.getFieldBuilderCriteria(),
-						leftClassMono,
-						rightClassMono
-					)
-					.map( tuple -> {
-						Optional<Criteria> leftCriteriaOpt = tuple.getT1();
-						Optional<Criteria> rightCriteriaOpt = tuple.getT2();
-						Class<E> leftClass = tuple.getT3();
-						Class<R2> rightClass = tuple.getT4();
-
-						// String leftCollection = (collectionName != null && ! collectionName.isBlank())
-						// ? collectionName
-						// : resolveCollectionName( leftClass );
-
-						String rightCollection = (rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank())
-							? rightBuilder.getCollectionName()
-							: rightBuilder.resolveCollectionName( rightClass );
-
-						String leftKey = simpleName( leftClass );
-						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
-						String rightKey = simpleName( rightClass );
-
-						List<AggregationOperation> ops = new ArrayList<>();
-						leftCriteriaOpt.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
-
-						// $lookup 구성
-						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
-
-						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of );
-						List<Document> nonLimitStages = new ArrayList<>();
-						List<Document> limitStages = new ArrayList<>();
-
-						for (Document st : userStages) {
-							if (st.containsKey( "$limit" ))
-								limitStages.add( st );
-							else
-								nonLimitStages.add( st );
-
-						}
-
-						boolean needPipeline = (spec.getLocalField() == null || spec.getForeignField() == null) // 원래 pipeline 모드
-							|| rightCriteriaOpt.isPresent() // 오른쪽 추가 필터 있음
-							|| ! nonLimitStages.isEmpty() || ! limitStages.isEmpty(); // 사용자가 넣은 stage 있음
-
-						if (! needPipeline) {
-							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
-							lookupBody
-								.append( "localField", spec.getLocalField() )
-								.append( "foreignField", spec.getForeignField() );
-
-						} else {
-							List<Document> pipe = new ArrayList<>();
-
-							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rc.getCriteriaObject() ) ) );
-
-							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
-							if (spec.getLocalField() != null && spec.getForeignField() != null) {
-								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lookupBody.append( "let", new Document( lfVar, "$" + spec.getLocalField() ) );
-								pipe
-									.add(
-										new Document(
-											"$match",
-											new Document(
-												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + spec.getForeignField(), "$$" + lfVar ) )
-											)
-										)
-									);
-
-							} else {
-								// let 그대로 유지 (없으면 빈 Document)
-								lookupBody.append( "let", Optional.ofNullable( spec.getLetDoc() ).orElseGet( Document::new ) );
-
-							}
-
-							boolean onlyProjects = ! nonLimitStages.isEmpty() && nonLimitStages.stream().allMatch( st -> st.containsKey( "$project" ) );
-
-							if (onlyProjects) {
-								// EXISTS 최적화: limit → project (후보를 1건으로 줄인 다음 project)
-								pipe.addAll( limitStages );
-								pipe.addAll( nonLimitStages );
-
-							} else {
-								// 일반 케이스: 기존 순서 유지
-								pipe.addAll( nonLimitStages );
-								pipe.addAll( limitStages );
-
-							}
-
-							lookupBody.append( "pipeline", pipe );
-
-						}
-
-						AggregationOperation lookupOp = (ctx) -> new Document( "$lookup", lookupBody );
-						ops.add( lookupOp );
-
-						if (spec.isUnwind()) {
-							Document unwind = new Document(
-								"$unwind",
-								new Document( "path", "$" + rightAs )
-									.append( "preserveNullAndEmptyArrays", spec.isPreserveNullAndEmptyArrays() )
-							);
-							ops.add( ctx -> unwind );
-
-						}
-
-						if (spec.getOuterStages() != null && ! spec.getOuterStages().isEmpty()) {
-
-							for (Document st : spec.getOuterStages()) {
-								ops.add( ctx -> st );
-
-							}
-
-						}
-
-						// 정렬/페이징(왼쪽 기준) 유지
-						ops.add( Aggregation.sort( (this.sort != null && this.sort.isSorted()) ? this.sort : Sort.by( Sort.Direction.DESC, "_id" ) ) );
-
-						if (this.paging != null) {
-							ops.add( Aggregation.skip( (long) this.paging.pageNumber * this.paging.pageSize ) );
-							ops.add( Aggregation.limit( this.paging.pageSize ) );
-
-						}
-
-						// 결과 모양: { LeftName: $$ROOT, RightName: $<rightAs> }
-						Document project = new Document(
-							"$project",
-							new Document()
-								.append( leftKey, "$$ROOT" )
-								.append( rightKey, "$" + rightAs )
-						);
-						ops.add( ctx -> project );
-
-						Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
-
-						return agg;
-
-					} );
-
-				return Mono
-					.zip( leftClassMono, rightClassMono, aggMono )
-					.flatMapMany( tuple -> {
-						Class<E> leftClass = tuple.getT1();
-						Class<R2> rightClass = tuple.getT2();
-						Aggregation agg = tuple.getT3();
-
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( agg, leftClass, Document.class );
-
-						String leftKey = simpleName( leftClass );
-						String rightKey = simpleName( rightClass );
-
-						return docs.map( d -> {
-							@SuppressWarnings("unchecked")
-							S leftVal = (S) reactiveMongoTemplate.getConverter().read( leftClass, (Document) d.get( leftKey ) );
-
-							@SuppressWarnings("unchecked")
-							List<Document> rightArr = (List<Document>) d.get( rightKey );
-
-							List<R2> rightVal = (rightArr == null) ? List.of()
-								: rightArr
-									.stream()
-									.map( x -> reactiveMongoTemplate.getConverter().read( rightClass, x ) )
-									.collect( Collectors.toList() );
-
-							return new ResultTuple<>( leftKey, leftVal, rightKey, rightVal );
-
-						} );
-
-					} );
+				this.sort = Sort.by( sorts );
+				return this;
 
 			}
 
+			/**
+			 * Applies the given sort orders to the query.
+			 *
+			 * @param sorts
+			 *            the sort orders
+			 * 
+			 * @return this builder
+			 */
+			public FindQueryBuilder<S> sorts(
+				Collection<Order> sorts
+			) {
+
+				this.sort = Sort.by( sorts.toArray( Order[]::new ) );
+				return this;
+
+			}
+
+			/**
+			 * Excludes the given fields from the result projection.
+			 *
+			 * @param excludes
+			 *            the field names to exclude
+			 * 
+			 * @return this builder
+			 */
+			public FindQueryBuilder<S> excludes(
+				String... excludes
+			) {
+
+				this.excludes = excludes;
+				return this;
+
+			}
+
+			/**
+			 * Excludes the given fields from the result projection.
+			 *
+			 * @param excludes
+			 *            the field names to exclude
+			 * 
+			 * @return this builder
+			 */
+			public FindQueryBuilder<S> excludes(
+				Collection<String> excludes
+			) {
+
+				this.excludes = excludes.toArray( String[]::new );
+				return this;
+
+			}
+
+			/**
+			 * Executes the current criteria and returns at most one matching entity.
+			 *
+			 * @return a {@link Mono} emitting the matched entity, or empty if none exists
+			 */
 			@Override
-			public Flux<E> execute() {
+			public Mono<E> execute() {
 
 				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
 					Query query = new Query();
@@ -2821,18 +3636,58 @@ public class ReactiveMongoDsl<K> {
 
 					}
 
-					if (paging != null) {
-						query.skip( (long) paging.pageNumber * paging.pageSize ).limit( paging.pageSize );
-
-					}
-
 					query.with( this.sort );
 
-					if (excludes != null && excludes.length != 0) {
-						query.fields().exclude( excludes );
-						// query.fields().slice( collectionName, 0 );
+
+					applyQueryOptions( query );
+
+
+					if (excludes != null && excludes.length > 0) {
+						var fields = query.fields();
+						Arrays
+							.stream( excludes )
+							.filter( s -> s != null && ! s.isBlank() )
+							.forEach( fields::exclude );
 
 					}
+
+					return query;
+
+				} );
+				Mono<E> result = Mono
+					.zip( executeClassMono, queryMono )
+					.flatMap( tuple -> {
+						var entityClass = tuple.getT1();
+						var query = tuple.getT2();
+						if (collectionName != null && ! collectionName.isBlank())
+							return reactiveMongoTemplate.findOne( query, entityClass, collectionName );
+						else
+							return reactiveMongoTemplate.findOne( query, entityClass );
+
+
+					} );
+				return result;// .onErrorMap( e -> new RuntimeException( "Failed to find by fields: " + e.getMessage(), e ) );
+
+			}
+
+			/**
+			 * Executes the current criteria with sorting applied and returns the first matching entity.
+			 *
+			 * @return a {@link Mono} emitting the first matched entity, or empty if none exists
+			 */
+			@Override
+			public Mono<E> executeFirst() {
+
+				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
+					Query query = new Query();
+
+					if (criteriaOptional.isPresent()) {
+						query.addCriteria( criteriaOptional.get() );
+
+					}
+
+					query.limit( 1 );
+					query.with( sort );
 
 					applyQueryOptions( query );
 
@@ -2848,68 +3703,97 @@ public class ReactiveMongoDsl<K> {
 					return query;
 
 				} );
-				Flux<E> result = Mono
+
+				Mono<E> result = Mono
 					.zip( executeClassMono, queryMono )
-					.flatMapMany( tuple -> {
+					.flatMap( tuple -> {
 						var entityClass = tuple.getT1();
 						var query = tuple.getT2();
-						Flux<? extends E> queryResult = collectionName != null && ! collectionName.isBlank() ? reactiveMongoTemplate.find( query, entityClass, collectionName )
-							: reactiveMongoTemplate.find( query, entityClass );
-						return queryResult;
+						if (collectionName != null && ! collectionName.isBlank())
+							return reactiveMongoTemplate.findOne( query, entityClass, collectionName );
+						else
+							return reactiveMongoTemplate.findOne( query, entityClass );
+
+
+					} );
+				return result
+					.doOnError( e -> {
+						e.printStackTrace();
 
 					} );
 
-				return result;
-				// .onErrorMap( e -> new RuntimeException( "Failed to find with : " + e.getMessage(), e ) );
+			}
+
+			/**
+			 * Executes the current single-result query as an aggregation pipeline
+			 * and maps the first resulting document back to the target type.
+			 *
+			 * @return a {@link Mono} emitting the mapped result, or empty if none exists
+			 */
+			@Override
+			public Mono<E> executeAggregation() {
+
+				Mono<Aggregation> aggregationMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
+					List<AggregationOperation> ops = new ArrayList<>();
+
+					// where 절 ($match)
+					criteriaOptional.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+
+					// 정렬
+					ops
+						.add(
+							Aggregation
+								.sort(
+									(this.sort != null && this.sort.isSorted())
+										? this.sort
+										: Sort.by( Sort.Direction.DESC, "_id" )
+								)
+						);
+
+					// 단건만
+					ops.add( Aggregation.limit( 1 ) );
+
+					// 프로젝트 (exclude)
+					if (excludes != null && excludes.length > 0) {
+						ops.add( Aggregation.project().andExclude( excludes ) );
+
+					}
+
+					Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+
+					return agg;
+
+				} );
+
+				return Mono
+					.zip( executeClassMono, aggregationMono )
+					.flatMap( tuple -> {
+						Class<E> entityClass = tuple.getT1();
+						Aggregation aggregation = tuple.getT2();
+
+						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
+							? reactiveMongoTemplate.aggregate( aggregation, collectionName, Document.class )
+							: reactiveMongoTemplate.aggregate( aggregation, entityClass, Document.class );
+
+						// 첫 문서를 엔티티로 매핑 (없으면 empty Mono)
+						return docs.next().map( doc -> reactiveMongoTemplate.getConverter().read( entityClass, doc ) );
+
+					} );
 
 			}
 
-		}
-
-		public class FindQueryBuilder<S extends E> extends QueryBuilderAccesser<FindExecute<E>, FindAggregation<E>> implements FindExecute<E>, FindAggregation<E> {
-
-			private Sort sort = Sort.unsorted();
-
-			private String[] excludes = null;
-
-
-			public FindQueryBuilder<S> sorts(
-				Order... sorts
-			) {
-
-				this.sort = Sort.by( sorts );
-				return this;
-
-			}
-
-			public FindQueryBuilder<S> sorts(
-				Collection<Order> sorts
-			) {
-
-				this.sort = Sort.by( sorts.toArray( Order[]::new ) );
-				return this;
-
-			}
-
-			public FindQueryBuilder<S> excludes(
-				String... excludes
-			) {
-
-				this.excludes = excludes;
-				return this;
-
-			}
-
-
-			public FindQueryBuilder<S> excludes(
-				Collection<String> excludes
-			) {
-
-				this.excludes = excludes.toArray( String[]::new );
-				return this;
-
-			}
-
+			/**
+			 * Executes the current single-result query with a {@code $lookup} join.
+			 *
+			 * @param rightBuilder
+			 *            the right-side query builder used as the join target
+			 * @param spec
+			 *            the lookup specification
+			 * @param <R2>
+			 *            the right-side mapped type
+			 * 
+			 * @return a {@link Mono} emitting the joined tuple result
+			 */
 			@Override
 			public <R2> Mono<ResultTuple<E, R2>> executeLookup(
 				ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindQueryBuilder<R2> rightBuilder, LookupSpec spec
@@ -3097,8 +3981,21 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+
+		}
+
+		/**
+		 * Builder for count queries with optional aggregation and lookup support.
+		 */
+		public class CountQueryBuilder extends QueryBuilderAccesser<CountExecute<E>, CountAggregation<E>> implements CountExecute<E>, CountAggregation<E> {
+
+			/**
+			 * Returns the number of documents matching the current criteria.
+			 *
+			 * @return a {@link Mono} emitting the matching document count
+			 */
 			@Override
-			public Mono<E> execute() {
+			public Mono<Long> execute() {
 
 				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
 					Query query = new Query();
@@ -3108,117 +4005,44 @@ public class ReactiveMongoDsl<K> {
 
 					}
 
-					query.with( this.sort );
-
-
 					applyQueryOptions( query );
-
-
-					if (excludes != null && excludes.length > 0) {
-						var fields = query.fields();
-						Arrays
-							.stream( excludes )
-							.filter( s -> s != null && ! s.isBlank() )
-							.forEach( fields::exclude );
-
-					}
 
 					return query;
 
 				} );
-				Mono<E> result = Mono
+				return Mono
 					.zip( executeClassMono, queryMono )
 					.flatMap( tuple -> {
+
 						var entityClass = tuple.getT1();
 						var query = tuple.getT2();
 						if (collectionName != null && ! collectionName.isBlank())
-							return reactiveMongoTemplate.findOne( query, entityClass, collectionName );
+							return reactiveMongoTemplate.count( query, entityClass, collectionName );
 						else
-							return reactiveMongoTemplate.findOne( query, entityClass );
+							return reactiveMongoTemplate.count( query, entityClass );
 
-
-					} );
-				return result;// .onErrorMap( e -> new RuntimeException( "Failed to find by fields: " + e.getMessage(), e ) );
+					} )
+				// .onErrorMap( e -> new RuntimeException( "Failed to count documents: " + e.getMessage(), e ) )
+				;
 
 			}
 
+			/**
+			 * Returns the number of documents matching the current criteria using an aggregation pipeline.
+			 *
+			 * @return a {@link Mono} emitting the matching document count
+			 */
 			@Override
-			public Mono<E> executeFirst() {
+			public Mono<Long> executeAggregation() {
 
-				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					Query query = new Query();
-
-					if (criteriaOptional.isPresent()) {
-						query.addCriteria( criteriaOptional.get() );
-
-					}
-
-					query.limit( 1 );
-					query.with( sort );
-
-					applyQueryOptions( query );
-
-					if (excludes != null && excludes.length > 0) {
-						var fields = query.fields();
-						Arrays
-							.stream( excludes )
-							.filter( s -> s != null && ! s.isBlank() )
-							.forEach( fields::exclude );
-
-					}
-
-					return query;
-
-				} );
-
-				Mono<E> result = Mono
-					.zip( executeClassMono, queryMono )
-					.flatMap( tuple -> {
-						var entityClass = tuple.getT1();
-						var query = tuple.getT2();
-						if (collectionName != null && ! collectionName.isBlank())
-							return reactiveMongoTemplate.findOne( query, entityClass, collectionName );
-						else
-							return reactiveMongoTemplate.findOne( query, entityClass );
-
-
-					} );
-				return result
-					.doOnError( e -> {
-						e.printStackTrace();
-
-					} );
-
-			}
-
-			@Override
-			public Mono<E> executeAggregation() {
-
-				Mono<Aggregation> aggregationMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
+				Mono<Aggregation> aggMono = fieldBuilder.buildCriteria().map( criteriaOpt -> {
 					List<AggregationOperation> ops = new ArrayList<>();
 
-					// where 절 ($match)
-					criteriaOptional.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+					// where 절($match)
+					criteriaOpt.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
 
-					// 정렬
-					ops
-						.add(
-							Aggregation
-								.sort(
-									(this.sort != null && this.sort.isSorted())
-										? this.sort
-										: Sort.by( Sort.Direction.DESC, "_id" )
-								)
-						);
-
-					// 단건만
-					ops.add( Aggregation.limit( 1 ) );
-
-					// 프로젝트 (exclude)
-					if (excludes != null && excludes.length > 0) {
-						ops.add( Aggregation.project().andExclude( excludes ) );
-
-					}
+					// 카운트
+					ops.add( ctx -> new Document( "$count", "count" ) );
 
 					Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
 
@@ -3227,7 +4051,7 @@ public class ReactiveMongoDsl<K> {
 				} );
 
 				return Mono
-					.zip( executeClassMono, aggregationMono )
+					.zip( executeClassMono, aggMono )
 					.flatMap( tuple -> {
 						Class<E> entityClass = tuple.getT1();
 						Aggregation aggregation = tuple.getT2();
@@ -3236,18 +4060,31 @@ public class ReactiveMongoDsl<K> {
 							? reactiveMongoTemplate.aggregate( aggregation, collectionName, Document.class )
 							: reactiveMongoTemplate.aggregate( aggregation, entityClass, Document.class );
 
-						// 첫 문서를 엔티티로 매핑 (없으면 empty Mono)
-						return docs.next().map( doc -> reactiveMongoTemplate.getConverter().read( entityClass, doc ) );
+						return docs
+							.singleOrEmpty()
+							.map( d -> {
+								Number n = d.get( "count", Number.class );
+								return (n == null) ? 0L : n.longValue();
+
+							} )
+							.defaultIfEmpty( 0L );
 
 					} );
 
 			}
 
-		}
-
-		public class CountQueryBuilder extends QueryBuilderAccesser<CountExecute<E>, CountAggregation<E>> implements CountExecute<E>, CountAggregation<E> {
-
-
+			/**
+			 * Executes a count query that includes a {@code $lookup} stage.
+			 *
+			 * @param rightBuilder
+			 *            the right-side query builder used as the join target
+			 * @param spec
+			 *            the lookup specification
+			 * @param <R2>
+			 *            the right-side mapped type
+			 * 
+			 * @return a {@link Mono} emitting a tuple containing left and right count-related results
+			 */
 			@Override
 			public <R2> Mono<ResultTuple<Long, Long>> executeLookup(
 					ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
@@ -3454,84 +4291,19 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			@Override
-			public Mono<Long> execute() {
-
-				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					Query query = new Query();
-
-					if (criteriaOptional.isPresent()) {
-						query.addCriteria( criteriaOptional.get() );
-
-					}
-
-					applyQueryOptions( query );
-
-					return query;
-
-				} );
-				return Mono
-					.zip( executeClassMono, queryMono )
-					.flatMap( tuple -> {
-
-						var entityClass = tuple.getT1();
-						var query = tuple.getT2();
-						if (collectionName != null && ! collectionName.isBlank())
-							return reactiveMongoTemplate.count( query, entityClass, collectionName );
-						else
-							return reactiveMongoTemplate.count( query, entityClass );
-
-					} )
-				// .onErrorMap( e -> new RuntimeException( "Failed to count documents: " + e.getMessage(), e ) )
-				;
-
-			}
-
-			@Override
-			public Mono<Long> executeAggregation() {
-
-				Mono<Aggregation> aggMono = fieldBuilder.buildCriteria().map( criteriaOpt -> {
-					List<AggregationOperation> ops = new ArrayList<>();
-
-					// where 절($match)
-					criteriaOpt.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
-
-					// 카운트
-					ops.add( ctx -> new Document( "$count", "count" ) );
-
-					Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
-
-					return agg;
-
-				} );
-
-				return Mono
-					.zip( executeClassMono, aggMono )
-					.flatMap( tuple -> {
-						Class<E> entityClass = tuple.getT1();
-						Aggregation aggregation = tuple.getT2();
-
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( aggregation, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( aggregation, entityClass, Document.class );
-
-						return docs
-							.singleOrEmpty()
-							.map( d -> {
-								Number n = d.get( "count", Number.class );
-								return (n == null) ? 0L : n.longValue();
-
-							} )
-							.defaultIfEmpty( 0L );
-
-					} );
-
-			}
 
 		}
 
+		/**
+		 * Builder for criteria-based delete operations.
+		 */
 		public class DeleteQueryBuilder {
 
+			/**
+			 * Deletes all documents matching the current criteria.
+			 *
+			 * @return a {@link Mono} emitting the delete result
+			 */
 			public Mono<DeleteResult> execute() {
 
 				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
@@ -3563,8 +4335,94 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
+		/**
+		 * Builder for existence checks with optional aggregation and lookup support.
+		 */
 		public class ExistsQueryBuilder extends QueryBuilderAccesser<ExistsExecute<E>, ExistsAggregation<E>> implements ExistsExecute<E>, ExistsAggregation<E> {
 
+			/**
+			 * Returns whether at least one document matches the current criteria.
+			 *
+			 * @return a {@link Mono} emitting {@code true} if a matching document exists
+			 */
+			@Override
+			public Mono<Boolean> execute() {
+
+				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
+					Query query = new Query();
+
+					if (criteriaOptional.isPresent()) {
+						query.addCriteria( criteriaOptional.get() );
+
+					}
+
+					applyQueryOptions( query );
+
+					return query;
+
+				} );
+				return Mono
+					.zip( executeClassMono, queryMono )
+					.flatMap( tuple -> {
+						var entityClass = tuple.getT1();
+						var query = tuple.getT2();
+						if (collectionName != null && ! collectionName.isBlank())
+							return reactiveMongoTemplate.exists( query, entityClass, collectionName );
+						else
+							return reactiveMongoTemplate.exists( query, entityClass );
+
+					} )
+				// .onErrorMap( e -> new RuntimeException( "Failed to check existence: " + e.getMessage(), e ) )
+				;
+
+			}
+
+			/**
+			 * Returns whether at least one document matches the current criteria
+			 * when evaluated through an aggregation pipeline.
+			 *
+			 * @return a {@link Mono} emitting {@code true} if a matching document exists
+			 */
+			@Override
+			public Mono<Boolean> executeAggregation() {
+
+				Mono<Aggregation> aggMono = fieldBuilder.buildCriteria().map( criteriaOpt -> {
+					List<AggregationOperation> ops = new ArrayList<>();
+					criteriaOpt.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+					ops.add( Aggregation.limit( 1 ) ); // 한 건만 있으면 true
+					Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+					return agg;
+
+				} );
+
+				return Mono
+					.zip( executeClassMono, aggMono )
+					.flatMap( tp -> {
+						Class<E> entityClass = tp.getT1();
+						Aggregation agg = tp.getT2();
+
+						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
+							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
+							: reactiveMongoTemplate.aggregate( agg, entityClass, Document.class );
+
+						return docs.hasElements(); // 있으면 true
+
+					} );
+
+			}
+
+			/**
+			 * Executes an existence check that includes a {@code $lookup} stage.
+			 *
+			 * @param rightBuilder
+			 *            the right-side query builder used as the join target
+			 * @param spec
+			 *            the lookup specification
+			 * @param <R2>
+			 *            the right-side mapped type
+			 * 
+			 * @return a {@link Mono} emitting a tuple containing left and right existence flags
+			 */
 			@Override
 			public <R2> Mono<ResultTuple<Boolean, Boolean>> executeLookup(
 					ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
@@ -3746,68 +4604,15 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			@Override
-			public Mono<Boolean> execute() {
-
-				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					Query query = new Query();
-
-					if (criteriaOptional.isPresent()) {
-						query.addCriteria( criteriaOptional.get() );
-
-					}
-
-					applyQueryOptions( query );
-
-					return query;
-
-				} );
-				return Mono
-					.zip( executeClassMono, queryMono )
-					.flatMap( tuple -> {
-						var entityClass = tuple.getT1();
-						var query = tuple.getT2();
-						if (collectionName != null && ! collectionName.isBlank())
-							return reactiveMongoTemplate.exists( query, entityClass, collectionName );
-						else
-							return reactiveMongoTemplate.exists( query, entityClass );
-
-					} )
-				// .onErrorMap( e -> new RuntimeException( "Failed to check existence: " + e.getMessage(), e ) )
-				;
-
-			}
-
-			@Override
-			public Mono<Boolean> executeAggregation() {
-
-				Mono<Aggregation> aggMono = fieldBuilder.buildCriteria().map( criteriaOpt -> {
-					List<AggregationOperation> ops = new ArrayList<>();
-					criteriaOpt.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
-					ops.add( Aggregation.limit( 1 ) ); // 한 건만 있으면 true
-					Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
-					return agg;
-
-				} );
-
-				return Mono
-					.zip( executeClassMono, aggMono )
-					.flatMap( tp -> {
-						Class<E> entityClass = tp.getT1();
-						Aggregation agg = tp.getT2();
-
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( agg, entityClass, Document.class );
-
-						return docs.hasElements(); // 있으면 true
-
-					} );
-
-			}
-
 		}
 
+		/**
+		 * Builder for atomic update operations using either document-based updates
+		 * ({@link Update}) or pipeline-based updates ({@link AggregationUpdate}).
+		 * <p>Auditing annotations such as {@code @CreatedDate} and {@code @LastModifiedDate}
+		 * are not applied automatically during atomic update operations. Set auditing fields
+		 * explicitly when needed.</p>
+		 */
 		public class AtomicUpdateQueryBuilder {
 
 			private boolean multi = false;
@@ -3818,7 +4623,11 @@ public class ReactiveMongoDsl<K> {
 
 			private final PipelineSpec pipe = new PipelineSpec();
 
-			// 공통 옵션
+			/**
+			 * Configures the update to affect all matching documents.
+			 *
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder multi() {
 
 				this.multi = true;
@@ -3826,6 +4635,11 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Configures the update to affect only the first matching document.
+			 *
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder first() {
 
 				this.multi = false;
@@ -3833,6 +4647,11 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Enables upsert semantics for the update operation.
+			 *
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder upsert() {
 
 				this.upsert = true;
@@ -3843,6 +4662,17 @@ public class ReactiveMongoDsl<K> {
 			// -------------------------
 			// Document(Update) 연산들
 			// -------------------------
+
+			/**
+			 * Increments the given field by the specified delta.
+			 *
+			 * @param field
+			 *            the target field
+			 * @param delta
+			 *            the increment amount
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder inc(
 				String field, Number delta
 			) {
@@ -3852,6 +4682,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Sets the given field to the specified value.
+			 *
+			 * @param field
+			 *            the target field
+			 * @param value
+			 *            the value to assign
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder set(
 				String field, Object value
 			) {
@@ -3861,6 +4701,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Sets the given field only when an upsert results in an insert.
+			 *
+			 * @param field
+			 *            the target field
+			 * @param value
+			 *            the value to assign on insert
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder setOnInsert(
 				String field, Object value
 			) {
@@ -3870,6 +4720,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Removes the given field from the matched document.
+			 *
+			 * @param field
+			 *            the target field
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder unset(
 				String field
 			) {
@@ -3879,6 +4737,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Pushes the given value into the target array field.
+			 *
+			 * @param field
+			 *            the target array field
+			 * @param value
+			 *            the value to push
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder push(
 				String field, Object value
 			) {
@@ -3888,6 +4756,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Adds the given value to the target array field if it is not already present.
+			 *
+			 * @param field
+			 *            the target array field
+			 * @param value
+			 *            the value to add
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder addToSet(
 				String field, Object value
 			) {
@@ -3897,6 +4775,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Removes matching values from the target array field.
+			 *
+			 * @param field
+			 *            the target array field
+			 * @param value
+			 *            the value to remove
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder pull(
 				String field, Object value
 			) {
@@ -3910,6 +4798,17 @@ public class ReactiveMongoDsl<K> {
 			// Pipeline(AggregationUpdate) 연산들
 			// (이름을 구분하거나, pipelineXXX로 두는게 안전)
 			// -------------------------
+
+			/**
+			 * Adds a pipeline-based {@code $set} expression for the given field.
+			 *
+			 * @param field
+			 *            the target field
+			 * @param valueOrExpr
+			 *            the assigned value or aggregation expression
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder pipelineSet(
 				String field, Object valueOrExpr
 			) {
@@ -3919,6 +4818,16 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Adds a pipeline-based increment expression for the given field.
+			 *
+			 * @param field
+			 *            the target field
+			 * @param delta
+			 *            the increment amount
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder pipelineInc(
 				String field, Number delta
 			) {
@@ -3928,6 +4837,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Adds a pipeline-based {@code $unset} stage for the given fields.
+			 *
+			 * @param fields
+			 *            the fields to unset
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder pipelineUnset(
 				String... fields
 			) {
@@ -3937,6 +4854,14 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Appends a raw aggregation update stage.
+			 *
+			 * @param stage
+			 *            the raw stage document
+			 * 
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder stage(
 				Document stage
 			) {
@@ -3946,6 +4871,11 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Flushes the current pending pipeline stage and starts a new stage boundary.
+			 *
+			 * @return this builder
+			 */
 			public AtomicUpdateQueryBuilder nextStage() {
 
 				pipe.nextStage();
@@ -3956,6 +4886,11 @@ public class ReactiveMongoDsl<K> {
 			// -------------------------
 			// execute 분기
 			// -------------------------
+			/**
+			 * Executes the configured document-based atomic update.
+			 *
+			 * @return a {@link Mono} emitting the update result
+			 */
 			public Mono<UpdateResult> execute() {
 
 				UpdateDefinition ud = doc.build();
@@ -3965,6 +4900,11 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			/**
+			 * Executes the configured pipeline-based atomic update.
+			 *
+			 * @return a {@link Mono} emitting the update result
+			 */
 			public Mono<UpdateResult> executeAggregation() {
 
 				UpdateDefinition ud = pipe.build();
@@ -4181,7 +5121,12 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
-
+	/**
+	 * Execution-context builder that resolves the target entity type from a reactive repository class.
+	 *
+	 * @param <E>
+	 *            the resolved entity type
+	 */
 	public class ExecuteRepositoryBuilder<E> extends AbstractQueryBuilder<E, ExecuteRepositoryBuilder<E>> implements ExecuteBuilder {
 
 		// private final Class<? extends ReactiveCrudRepository<?, ?>> repositoryClass;
@@ -4200,7 +5145,12 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
-
+	/**
+	 * Execution-context builder for mapped Mongo entity classes.
+	 *
+	 * @param <E>
+	 *            the entity type
+	 */
 	public abstract class ExecuteEntityBuilder<E> extends AbstractQueryBuilder<E, ExecuteEntityBuilder<E>> implements ExecuteBuilder {
 
 		@SuppressWarnings("unchecked")
@@ -4232,7 +5182,12 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
-
+	/**
+	 * Execution-context builder for custom mapped result types backed by an explicit collection name.
+	 *
+	 * @param <E>
+	 *            the mapped result type
+	 */
 	public abstract class ExecuteCustomClassBuilder<E> extends AbstractQueryBuilder<E, ExecuteCustomClassBuilder<E>> implements ExecuteBuilder {
 
 		@SuppressWarnings("unchecked")
@@ -4268,6 +5223,19 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
+	/**
+	 * Creates an execution context by resolving the entity type from the given reactive repository
+	 * class.
+	 *
+	 * @param key
+	 *            the logical template key
+	 * @param repositoryClass
+	 *            the reactive repository class
+	 * @param <E>
+	 *            the resolved entity type
+	 * 
+	 * @return an execution builder bound to the resolved entity type
+	 */
 	public <E> ExecuteRepositoryBuilder<E> executeRepository(
 		K key, Class<? extends ReactiveCrudRepository<?, ?>> repositoryClass
 	) {
@@ -4276,6 +5244,16 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
+	/**
+	 * Creates an execution context for an entity type inferred from the anonymous builder subclass.
+	 *
+	 * @param key
+	 *            the logical template key
+	 * @param <E>
+	 *            the entity type
+	 * 
+	 * @return an execution builder bound to the inferred entity type
+	 */
 	public <E> ExecuteEntityBuilder<E> executeEntity(
 		K key
 	) {
@@ -4284,6 +5262,18 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
+	/**
+	 * Creates an execution context for the given mapped entity class.
+	 *
+	 * @param executeEntity
+	 *            the target entity class
+	 * @param key
+	 *            the logical template key
+	 * @param <E>
+	 *            the entity type
+	 * 
+	 * @return an execution builder bound to the given entity class
+	 */
 	public <E> ExecuteEntityBuilder<E> executeEntity(
 		Class<E> executeEntity, K key
 	) {
@@ -4292,6 +5282,21 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
+	/**
+	 * Creates an execution context for mapping results to the given class
+	 * while executing against the specified collection.
+	 *
+	 * @param executeCustomClass
+	 *            the mapped result class
+	 * @param key
+	 *            the logical template key
+	 * @param collectionName
+	 *            the target collection name
+	 * @param <E>
+	 *            the mapped result type
+	 * 
+	 * @return an execution builder bound to the given class and collection
+	 */
 	public <E> ExecuteCustomClassBuilder<E> executeCustomClass(
 		Class<E> executeCustomClass, K key, String collectionName
 	) {
@@ -4300,6 +5305,19 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
+	/**
+	 * Creates an execution context for a custom collection using a type
+	 * inferred from the anonymous builder subclass.
+	 *
+	 * @param key
+	 *            the logical template key
+	 * @param collectionName
+	 *            the target collection name
+	 * @param <E>
+	 *            the mapped result type
+	 * 
+	 * @return an execution builder bound to the inferred type and collection
+	 */
 	public <E> ExecuteCustomClassBuilder<E> executeCustomClass(
 		K key, String collectionName
 	) {

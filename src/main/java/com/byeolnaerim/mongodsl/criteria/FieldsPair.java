@@ -1,17 +1,25 @@
 package com.byeolnaerim.mongodsl.criteria;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
-import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
 
 
+/**
+ * Represents a field condition pair used by the DSL to build MongoDB query criteria.
+ *
+ * @param <K>
+ *            the field name type
+ * @param <V>
+ *            the field value type
+ */
 public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
+	/**
+	 * Supported query operators for {@link FieldsPair}.
+	 */
 	public static enum Condition {
 
 		eq, // Equal
@@ -33,6 +41,9 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 		nearSphere, // GeoJSON + 2dsphere
 		elemMatch;
 
+		/**
+		 * Regex option flags used by LIKE-style matching.
+		 */
 		public static enum LikeOperator {
 			i, m, s, x, l, u
 		}
@@ -45,8 +56,21 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	private Condition queryType;
 
+	/**
+	 * Returns the configured query condition.
+	 *
+	 * @return the query condition
+	 */
 	public Condition getQueryType() { return this.queryType; }
 
+	/**
+	 * Creates an equality-based field condition pair.
+	 *
+	 * @param fieldName
+	 *            the field name
+	 * @param fieldValue
+	 *            the field value
+	 */
 	public FieldsPair(
 						K fieldName,
 						V fieldValue
@@ -58,6 +82,16 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
+	/**
+	 * Creates a field condition pair with the given condition.
+	 *
+	 * @param fieldName
+	 *            the field name
+	 * @param fieldValue
+	 *            the field value
+	 * @param queryType
+	 *            the query condition
+	 */
 	public FieldsPair(
 						K fieldName,
 						V fieldValue,
@@ -70,6 +104,14 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
+	/**
+	 * Creates a field condition pair for conditions that do not require an explicit value.
+	 *
+	 * @param fieldName
+	 *            the field name
+	 * @param queryType
+	 *            the query condition
+	 */
 	public FieldsPair(
 						K fieldName,
 						Condition queryType
@@ -81,10 +123,25 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
+	/**
+	 * Returns the field name.
+	 *
+	 * @return the field name
+	 */
 	public K getFieldName() { return fieldName; }
 
+	/**
+	 * Returns the field value.
+	 *
+	 * @return the field value
+	 */
 	public V getFieldValue() { return fieldValue; }
 
+	/**
+	 * Returns the field name.
+	 *
+	 * @return the field name
+	 */
 	@Override
 	public K getKey() {
 
@@ -93,6 +150,11 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
+	/**
+	 * Returns the field value.
+	 *
+	 * @return the field value
+	 */
 	@Override
 	public V getValue() {
 
@@ -101,6 +163,14 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
+	/**
+	 * Replaces the current field value.
+	 *
+	 * @param value
+	 *            the new field value
+	 * 
+	 * @return the assigned value
+	 */
 	@Override
 	public V setValue(
 		V value
@@ -112,6 +182,20 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
+	/**
+	 * Creates an equality-based {@link FieldsPair}.
+	 *
+	 * @param k
+	 *            the field name
+	 * @param v
+	 *            the field value
+	 * @param <K>
+	 *            the field name type
+	 * @param <V>
+	 *            the field value type
+	 * 
+	 * @return a new field pair
+	 */
 	public static <K, V> FieldsPair<K, V> pair(
 		K k, V v
 	) {
@@ -120,6 +204,22 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
+	/**
+	 * Creates a {@link FieldsPair} with the given condition.
+	 *
+	 * @param k
+	 *            the field name
+	 * @param v
+	 *            the field value
+	 * @param queryType
+	 *            the query condition
+	 * @param <K>
+	 *            the field name type
+	 * @param <V>
+	 *            the field value type
+	 * 
+	 * @return a new field pair
+	 */
 	public static <K, V> FieldsPair<K, V> pair(
 		K k, V v, Condition queryType
 	) {
@@ -128,6 +228,20 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
+	/**
+	 * Creates a {@link FieldsPair} for a condition that does not require an explicit value.
+	 *
+	 * @param k
+	 *            the field name
+	 * @param queryType
+	 *            the query condition
+	 * @param <K>
+	 *            the field name type
+	 * @param <V>
+	 *            the field value type
+	 * 
+	 * @return a new field pair
+	 */
 	public static <K, V> FieldsPair<K, V> pair(
 		K k, Condition queryType
 	) {
@@ -148,6 +262,31 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 	 * 	List<? extends T> 하나로 공통 처리한다.
 	 * }
 	 */
+	/**
+	 * Creates a range-based {@link FieldsPair} from a two-value range list.
+	 * <p>This method automatically chooses {@code between}, {@code gte}, or {@code lte}
+	 * depending on which bounds are present. If both bounds are missing, {@code null} is returned.</p>
+	 * range 리스트([from, to])를 받아 between/gte/lte를 자동으로 선택.
+	 * - 둘 다 있으면 between
+	 * - from만 있으면 gte
+	 * - to만 있으면 lte
+	 * - 둘 다 없으면 null
+	 * {@code
+	 * 	List<Instant>, List<LocalDate> 등은 제네릭 타입만 달라 오버로드가 불가능하므로
+	 * 	List<? extends T> 하나로 공통 처리한다.
+	 * }
+	 * 
+	 * @param field
+	 *            the field name
+	 * @param range
+	 *            the range list in the form {@code [from, to]}
+	 * @param <K>
+	 *            the field name type
+	 * @param <T>
+	 *            the bound type
+	 * 
+	 * @return a generated range pair, or {@code null} if no bound is available
+	 */
 	public static <K, T> FieldsPair<K, Object> autoRangePair(
 		K field, List<? extends T> range
 	) {
@@ -162,7 +301,20 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
-	/** Instant 전용 오버로드 */
+	/**
+	 * Convenience overload for automatically creating a range-based {@link FieldsPair}.
+	 *
+	 * @param field
+	 *            the field name
+	 * @param from
+	 *            the lower bound
+	 * @param to
+	 *            the upper bound
+	 * @param <K>
+	 *            the field name type
+	 * 
+	 * @return a generated range pair, or {@code null} if both bounds are missing
+	 */
 	public static <K> FieldsPair<K, Object> autoRangePair(
 		K field, Instant from, Instant to
 	) {
@@ -171,7 +323,20 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
-	/** LocalDateTime 전용 오버로드 */
+	/**
+	 * Convenience overload for automatically creating a range-based {@link FieldsPair}.
+	 *
+	 * @param field
+	 *            the field name
+	 * @param from
+	 *            the lower bound
+	 * @param to
+	 *            the upper bound
+	 * @param <K>
+	 *            the field name type
+	 * 
+	 * @return a generated range pair, or {@code null} if both bounds are missing
+	 */
 	public static <K> FieldsPair<K, Object> autoRangePair(
 		K field, LocalDateTime from, LocalDateTime to
 	) {
@@ -180,7 +345,20 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 
 	}
 
-	/** LocalDate 전용 오버로드 */
+	/**
+	 * Convenience overload for automatically creating a range-based {@link FieldsPair}.
+	 *
+	 * @param field
+	 *            the field name
+	 * @param from
+	 *            the lower bound
+	 * @param to
+	 *            the upper bound
+	 * @param <K>
+	 *            the field name type
+	 * 
+	 * @return a generated range pair, or {@code null} if both bounds are missing
+	 */
 	public static <K> FieldsPair<K, Object> autoRangePair(
 		K field, LocalDate from, LocalDate to
 	) {
@@ -203,32 +381,6 @@ public class FieldsPair<K, V> implements Map.Entry<K, V> {
 		if (to != null)
 			return pair( field, to, Condition.lte );
 		return null;
-
-	}
-
-	public static void main(
-		String a[]
-	)
-		throws InterruptedException {
-
-		Mono<Integer> test = Mono.just( 4 );
-
-		Flux<Integer> flux = Flux.just( 4, 5, 6, 7 );
-
-		flux
-			.map( e -> e + 1 )
-			.mergeWith( test )
-			.map( e -> {
-
-				System.out.println( e );
-				return e;
-
-			} )
-			.subscribe();
-
-		Thread.sleep( Duration.ofHours( 9999 ) );
-
-
 
 	}
 

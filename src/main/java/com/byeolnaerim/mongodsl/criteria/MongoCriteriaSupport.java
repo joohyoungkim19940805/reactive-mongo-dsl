@@ -4,20 +4,35 @@ import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
-
 import org.springframework.data.geo.Point;
 import org.springframework.data.mongodb.core.query.Criteria;
-
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+
+/**
+ * Utility methods for converting {@link FieldsPair} definitions into Spring Data MongoDB
+ * {@link Criteria}.
+ */
 public class MongoCriteriaSupport {
 	private MongoCriteriaSupport() {}
 
 	// 지구 반지름 (meters)
 	static final double EARTH_RADIUS_M = 6_378_137.0;
 	
-
+	/**
+	 * Extracts field values from the given entity by reflection and returns them as {@link FieldsPair}
+	 * instances.
+	 *
+	 * @param entity
+	 *            the source entity
+	 * @param fieldNames
+	 *            the field names to extract
+	 * @param <T>
+	 *            the entity type
+	 * 
+	 * @return a {@link Flux} emitting extracted field pairs
+	 */
 	public static <T> Flux<FieldsPair<String, Object>> extractFieldsPairs(
 		T entity, String... fieldNames
 	) {
@@ -37,6 +52,15 @@ public class MongoCriteriaSupport {
 
 	}
 
+	/**
+	 * Converts a collection of {@link FieldsPair} definitions into a reactive stream of
+	 * {@link Criteria}.
+	 *
+	 * @param fieldsPairs
+	 *            the field condition pairs
+	 * 
+	 * @return a {@link Flux} emitting generated criteria
+	 */
 	public static Flux<Criteria> createQueryReactive(
 		Collection<FieldsPair<?, ?>> fieldsPairs
 	) {
@@ -188,6 +212,23 @@ public class MongoCriteriaSupport {
 
 	}
 
+	/**
+	 * Creates a single {@link Criteria} from the given {@link FieldsPair}.
+	 * <p>Supported value formats depend on the selected condition:</p>
+	 * <ul>
+	 * <li>{@code in}, {@code notIn}, and {@code all}: a {@link Collection}</li>
+	 * <li>{@code between}: a two-value {@link Collection}</li>
+	 * <li>{@code exists}: a {@link Boolean}</li>
+	 * <li>{@code near}: {@code Double[]{lon, lat, maxDistance[, minDistance]}}</li>
+	 * <li>{@code nearSphere}: {@code Double[]{lon, lat, maxMeters[, minMeters]}}</li>
+	 * <li>{@code elemMatch}: a collection of nested {@link FieldsPair} values</li>
+	 * </ul>
+	 *
+	 * @param pair
+	 *            the field condition pair
+	 * 
+	 * @return the generated criteria
+	 */
 	public static Criteria createSingleCriteria(
 		FieldsPair<?, ?> pair
 	) {

@@ -3,10 +3,8 @@ package com.byeolnaerim.mongodsl.lookup;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
-
 import org.bson.Document;
 import org.springframework.data.domain.Sort;
-
 import com.byeolnaerim.mongodsl.criteria.FieldsPair;
 import com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition;
 
@@ -72,8 +70,6 @@ public class LookupSpec {
 	// private String from;
 	private List<Document> outerStages = new ArrayList<>();
 
-	public List<Document> getOuterStages() { return outerStages; }
-
 	private String as;
 
 	private String localField;
@@ -93,20 +89,68 @@ public class LookupSpec {
 	// 게터 (executeLookup에서 접근)
 	// public String getFrom() { return from; }
 
+	/**
+	 * Returns post-lookup aggregation stages that are applied after {@code $lookup}
+	 * and optional {@code $unwind}.
+	 *
+	 * @return post-lookup outer stages
+	 */
+	public List<Document> getOuterStages() { return outerStages; }
+
+	/**
+	 * Returns the alias used for the lookup result.
+	 *
+	 * @return the lookup alias
+	 */
 	public String getAs() { return as; }
 
+	/**
+	 * Returns the local join field used in simple lookup mode.
+	 *
+	 * @return the local field name
+	 */
 	public String getLocalField() { return localField; }
 
+	/**
+	 * Returns the foreign join field used in simple lookup mode.
+	 *
+	 * @return the foreign field name
+	 */
 	public String getForeignField() { return foreignField; }
 
+	/**
+	 * Returns the {@code let} document used in pipeline-based lookup mode.
+	 *
+	 * @return the lookup {@code let} document
+	 */
 	public Document getLetDoc() { return letDoc; }
 
+	/**
+	 * Returns the lookup pipeline stages used in pipeline-based lookup mode.
+	 *
+	 * @return the lookup pipeline stages
+	 */
 	public List<Document> getPipelineDocs() { return pipelineDocs; }
 
+	/**
+	 * Returns whether the lookup result should be unwound.
+	 *
+	 * @return {@code true} if {@code $unwind} is enabled
+	 */
 	public boolean isUnwind() { return unwind; }
 
+	/**
+	 * Returns whether {@code $unwind} should preserve null and empty arrays.
+	 *
+	 * @return {@code true} if null and empty arrays should be preserved
+	 */
 	public boolean isPreserveNullAndEmptyArrays() { return preserveNullAndEmptyArrays; }
 
+	/**
+	 * Creates a new {@link Builder}.
+	 *
+	 * @return a new lookup specification builder
+	 */
 	public static Builder builder() {
 
 		return new Builder();
@@ -115,13 +159,12 @@ public class LookupSpec {
 
 	/**
 	 * Fluent builder for constructing {@link LookupSpec} instances.
-	 * <p>Provides chainable methods to define <code>from</code>, <code>as</code>, conditions,
-	 * pipeline stages, and finally {@link #build()}.</p>
-	 * <p>For detailed usage examples, see the Javadoc on {@link LookupSpec}.</p>
+	 * <p>This builder supports simple lookup mode using {@code localField}/{@code foreignField}
+	 * as well as advanced lookup mode using {@code let + pipeline + $expr} conditions.</p>
 	 */
 	public static class Builder {
 
-		private List<Document> outerStages = new ArrayList<>(); // ← 추가
+		private List<Document> outerStages = new ArrayList<>();
 
 		private final LookupSpec spec = new LookupSpec();
 
@@ -133,7 +176,15 @@ public class LookupSpec {
 
 		private int varSeq = 0;
 
-		/** $lookup(+optional $unwind) 이후에 적용될 스테이지 */
+		/**
+		 * Adds a post-lookup aggregation stage to be applied after {@code $lookup}
+		 * and optional {@code $unwind}.
+		 *
+		 * @param stage
+		 *            the outer stage to append
+		 * 
+		 * @return this builder
+		 */
 		public Builder outerStage(
 			Document stage
 		) {
@@ -144,7 +195,14 @@ public class LookupSpec {
 
 		}
 
-		/** 여러 외부 스테이지를 한 번에 추가합니다. */
+		/**
+		 * Adds multiple post-lookup aggregation stages.
+		 *
+		 * @param stages
+		 *            the outer stages to append
+		 * 
+		 * @return this builder
+		 */
 		public Builder outerStages(
 			Collection<Document> stages
 		) {
@@ -160,6 +218,14 @@ public class LookupSpec {
 
 		}
 
+		/**
+		 * Adds a post-lookup {@code $match} stage that wraps the given expression in {@code $expr}.
+		 *
+		 * @param expr
+		 *            the expression to wrap in {@code $expr}
+		 * 
+		 * @return this builder
+		 */
 		public Builder outerMatchExpr(
 			Document expr
 		) {
@@ -263,6 +329,12 @@ public class LookupSpec {
 		//
 		// }
 
+		/**
+		 * Sets the alias of the lookup result.
+		 *
+		 * @param as the lookup alias
+		 * @return this builder
+		 */
 		public Builder as(
 			String as
 		) {
@@ -272,7 +344,12 @@ public class LookupSpec {
 
 		}
 
-		// --- 간단 모드(local/foreign) 그대로 지원 ---
+		/**
+		 * Sets the local join field for simple lookup mode.
+		 *
+		 * @param localField the local field name
+		 * @return this builder
+		 */
 		public Builder localField(
 			String localField
 		) {
@@ -282,6 +359,12 @@ public class LookupSpec {
 
 		}
 
+		/**
+		 * Sets the foreign join field for simple lookup mode.
+		 *
+		 * @param foreignField the foreign field name
+		 * @return this builder
+		 */
 		public Builder foreignField(
 			String foreignField
 		) {
@@ -291,7 +374,19 @@ public class LookupSpec {
 
 		}
 
-		/** 왼쪽(현재 컬렉션)의 leftFieldPath 와 오른쪽 rightFieldPath 사이에 Condition 적용 */
+		/**
+		 * Binds a condition between a left-side field and a right-side field using {@code $expr}.
+		 * 왼쪽(현재 컬렉션)의 leftFieldPath 와 오른쪽 rightFieldPath 사이에 Condition 적용
+		 *
+		 * @param leftFieldPath
+		 *            the field path in the left collection
+		 * @param cond
+		 *            the comparison condition
+		 * @param rightFieldPath
+		 *            the field path in the right collection
+		 * 
+		 * @return this builder
+		 */
 		public Builder bindConditionFields(
 			String leftFieldPath, Condition cond, String rightFieldPath
 		) {
@@ -303,7 +398,19 @@ public class LookupSpec {
 
 		}
 
-		/** 상수 constValue 와 오른쪽 rightFieldPath 사이에 Condition 적용 */
+		/**
+		 * Binds a condition between a constant value and a right-side field using {@code $expr}.
+		 * 상수 constValue 와 오른쪽 rightFieldPath 사이에 Condition 적용
+		 *
+		 * @param constValue
+		 *            the constant value
+		 * @param cond
+		 *            the comparison condition
+		 * @param rightFieldPath
+		 *            the field path in the right collection
+		 * 
+		 * @return this builder
+		 */
 		public Builder bindConditionConst(
 			Object constValue, Condition cond, String rightFieldPath
 		) {
@@ -314,9 +421,22 @@ public class LookupSpec {
 		}
 
 		/**
-		 * 왼쪽 필드(String ObjectId hex)를 ObjectId로 변환해서 오른쪽 필드(ObjectId)와 비교하도록 바인딩
+		 * Converts the given left-side string field to {@code ObjectId}
+		 * and compares it with the specified right-side field.
+		 * <p>Conversion failures are treated as {@code null}, which results in no match
+		 * instead of a query failure.</p>
+		 * * 왼쪽 필드(String ObjectId hex)를 ObjectId로 변환해서 오른쪽 필드(ObjectId)와 비교하도록 바인딩
 		 * - 예: left.auctionId(String) == right._id(ObjectId)
 		 * - $convert 사용: 변환 실패 시 null로 처리되어 쿼리 에러 없이 매칭 0건 처리됨
+		 * 
+		 * @param leftFieldPath
+		 *            the left-side field path containing an ObjectId hex string
+		 * @param cond
+		 *            the comparison condition
+		 * @param rightFieldPath
+		 *            the right-side field path
+		 * 
+		 * @return this builder
 		 */
 		public Builder bindConditionFieldsLeftToObjectId(
 			String leftFieldPath, Condition cond, String rightFieldPath
@@ -341,7 +461,19 @@ public class LookupSpec {
 
 		}
 
-		/** between(low, high) 상수 범위 */
+		/**
+		 * Adds an inclusive range condition for the given right-side field.
+		 * between(low, high) 상수 범위
+		 *
+		 * @param lowInclusive
+		 *            the lower bound
+		 * @param highInclusive
+		 *            the upper bound
+		 * @param rightFieldPath
+		 *            the target field path in the right collection
+		 * 
+		 * @return this builder
+		 */
 		public Builder bindConditionBetween(
 			Object lowInclusive, Object highInclusive, String rightFieldPath
 		) {
@@ -351,7 +483,19 @@ public class LookupSpec {
 
 		}
 
-		/** like/regex 전용 옵션 (기본 i-case-insensitive) */
+		/**
+		 * Adds a regex-based match condition for the given right-side field.
+		 * like/regex 전용 옵션 (기본 i-case-insensitive)
+		 * 
+		 * @param pattern
+		 *            the regex pattern
+		 * @param rightFieldPath
+		 *            the target field path in the right collection
+		 * @param options
+		 *            the regex options; when {@code null}, case-insensitive matching is used
+		 * 
+		 * @return this builder
+		 */
 		public Builder bindConditionLike(
 			String pattern, String rightFieldPath, Condition.LikeOperator options /* nullable */
 		) {
@@ -361,7 +505,17 @@ public class LookupSpec {
 
 		}
 
-		/** exists / isNull / isNotNull 전용 */
+		/**
+		 * Adds a field-existence condition for the given right-side field.
+		 * exists / isNull / isNotNull 전용
+		 * 
+		 * @param rightFieldPath
+		 *            the target field path in the right collection
+		 * @param exists
+		 *            whether the field should exist
+		 * 
+		 * @return this builder
+		 */
 		public Builder bindConditionExists(
 			String rightFieldPath, boolean exists
 		) {
@@ -371,6 +525,14 @@ public class LookupSpec {
 
 		}
 
+		/**
+		 * Adds a null-check condition for the given right-side field.
+		 *
+		 * @param rightFieldPath
+		 *            the target field path in the right collection
+		 * 
+		 * @return this builder
+		 */
 		public Builder bindConditionIsNull(
 			String rightFieldPath
 		) {
@@ -380,6 +542,14 @@ public class LookupSpec {
 
 		}
 
+		/**
+		 * Adds a non-null condition for the given right-side field.
+		 *
+		 * @param rightFieldPath
+		 *            the target field path in the right collection
+		 * 
+		 * @return this builder
+		 */
 		public Builder bindConditionIsNotNull(
 			String rightFieldPath
 		) {
@@ -389,7 +559,15 @@ public class LookupSpec {
 
 		}
 
-		/** raw $match stage 추가(옵션) */
+		/**
+		 * Appends a raw pipeline stage to the lookup pipeline.
+		 * raw $match stage 추가(옵션)
+		 *
+		 * @param stage
+		 *            the raw stage document
+		 * 
+		 * @return this builder
+		 */
 		public Builder rawStage(
 			Document stage
 		) {
@@ -400,13 +578,14 @@ public class LookupSpec {
 		}
 
 		/**
-		 * $unwind 설정
+		 * Enables {@code $unwind} for the lookup result.
 		 *
 		 * @param preserveNullAndEmptyArrays
+		 *            whether null and empty arrays should be preserved
 		 *            - false → INNER JOIN처럼 동작 (매칭 없으면 row 제거)
 		 *            - true → LEFT OUTER JOIN처럼 동작 (매칭 없으면 null row 유지)
 		 * 
-		 * @return this
+		 * @return this builder
 		 */
 		public Builder unwind(
 			boolean preserveNullAndEmptyArrays
@@ -418,7 +597,14 @@ public class LookupSpec {
 
 		}
 
-		/** 파이프라인 보조 */
+		/**
+		 * Appends a {@code $limit} stage to the lookup pipeline.
+		 *
+		 * @param n
+		 *            the maximum number of joined documents to keep
+		 * 
+		 * @return this builder
+		 */
 		public Builder limit(
 			int n
 		) {
@@ -428,6 +614,14 @@ public class LookupSpec {
 
 		}
 
+		/**
+		 * Appends a {@code $sort} stage to the lookup pipeline.
+		 *
+		 * @param sort
+		 *            the sort definition
+		 * 
+		 * @return this builder
+		 */
 		public Builder sort(
 			Sort sort
 		) {
@@ -441,6 +635,12 @@ public class LookupSpec {
 
 		}
 
+		/**
+		 * Builds a {@link LookupSpec} from the configured join mapping, conditions,
+		 * pipeline stages, and outer stages.
+		 *
+		 * @return the built lookup specification
+		 */
 		public LookupSpec build() {
 
 			if (spec.localField == null || spec.foreignField == null) {

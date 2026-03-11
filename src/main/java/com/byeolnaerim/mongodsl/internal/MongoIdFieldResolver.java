@@ -4,22 +4,31 @@ package com.byeolnaerim.mongodsl.internal;
 import java.lang.reflect.Field;
 import org.springframework.data.annotation.Id;
 
+
+/**
+ * Utility class for resolving the identifier field of a Mongo entity.
+ */
 public final class MongoIdFieldResolver {
 
 	private MongoIdFieldResolver() {}
 
-
 	/**
+	 * Resolves the identifier field of the given entity class.
+	 * <p>This method first looks for a field annotated with {@link Id} and falls back
+	 * to a field named {@code id} if no annotated field is found.</p>
+	 * <p>The class hierarchy is searched from the concrete class upward.</p>
 	 * 엔티티 클래스에서 식별자(@Id) 필드를 찾는 메서드.
-	 * 
 	 * {@code @Id} 어노테이션이 붙은 필드를 우선적으로 찾고, 없을 경우 이름이 "id"인 필드를 찾는다.
 	 * 
 	 * @param entityClass
+	 *            the target entity class
 	 *            대상 엔티티 클래스
 	 * 
-	 * @return 식별자 필드
+	 * @return the resolved identifier field
+	 *         식별자 필드
 	 * 
 	 * @throws IllegalArgumentException
+	 *             if no {@code @Id} field or {@code id} field exists in the class hierarchy
 	 *             클래스 계층 내에서 @Id 필드나 이름이 "id"인 필드를 찾지 못한 경우
 	 */
 	public static Field findIdField(

@@ -5,17 +5,31 @@ import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
-
-
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+
+/**
+ * Reactive page wrapper that exposes page data as a {@link Flux}
+ * and the total count as a {@link Mono}.
+ *
+ * @param <T>
+ *            the element type
+ */
 public final class PageStream<T> {
 
 	private final Flux<T> data;
 
 	private final Mono<Long> totalCount;
 
+	/**
+	 * Creates a reactive page wrapper from the given data stream and total-count publisher.
+	 *
+	 * @param data
+	 *            the page data stream
+	 * @param totalCount
+	 *            the total-count publisher
+	 */
 	public PageStream(
 						Flux<T> data,
 						Mono<Long> totalCount
@@ -26,7 +40,15 @@ public final class PageStream<T> {
 
 	}
 
-	/** totalCount를 바로 알고 있을 때 편의 생성자 */
+	/**
+	 * Creates a reactive page wrapper from the given data stream and known total count.
+	 * totalCount를 바로 알고 있을 때 편의 생성자
+	 *
+	 * @param data
+	 *            the page data stream
+	 * @param totalCount
+	 *            the total number of matching items
+	 */
 	public PageStream(
 						Flux<T> data,
 						long totalCount
@@ -36,30 +58,46 @@ public final class PageStream<T> {
 
 	}
 
+	/**
+	 * Returns the current page data stream.
+	 *
+	 * @return the page data stream
+	 */
 	public Flux<T> data() {
 
 		return data;
 
 	}
 
+	/**
+	 * Returns the total number of matching items.
+	 *
+	 * @return the total-count publisher
+	 */
 	public Mono<Long> totalCount() {
 
 		return totalCount;
 
 	}
 
-	// ----------------------------------------------------------------------
-	// 헬퍼들 (PageResult 와 비슷한 역할, reactive 스타일로)
-	// ----------------------------------------------------------------------
 
-	/** totalCount 기준으로 비어있는지 여부 */
+	/**
+	 * Returns whether the page is empty based on {@code totalCount}.
+	 * totalCount 기준으로 비어있는지 여부
+	 * 
+	 * @return a {@link Mono} emitting {@code true} if no matching items exist
+	 */
 	public Mono<Boolean> isEmpty() { return totalCount
 		.defaultIfEmpty( 0L )
 		.map( tc -> tc == 0L ); }
 
 	/**
+	 * Counts the number of items emitted by the current page data stream.
+	 * <p>This is the current page size, not the overall total count.</p>
 	 * 현재 페이지(data Flux)가 몇 개를 내보내는지 카운트.
 	 * (PageResult의 size()에 대응, 전체 totalCount가 아니라 "현재 페이지 크기")
+	 *
+	 * @return a {@link Mono} emitting the current page size
 	 */
 	public Mono<Long> size() {
 
@@ -67,7 +105,17 @@ public final class PageStream<T> {
 
 	}
 
-	/** 각 요소를 다른 타입으로 매핑 (totalCount는 그대로 유지) */
+	/**
+	 * Maps each item in the page data stream while preserving the original total count.
+	 * 각 요소를 다른 타입으로 매핑 (totalCount는 그대로 유지)
+	 * 
+	 * @param mapper
+	 *            the mapping function
+	 * @param <R>
+	 *            the target element type
+	 * 
+	 * @return a mapped page stream
+	 */
 	public <R> PageStream<R> map(
 		Function<? super T, ? extends R> mapper
 	) {
@@ -77,7 +125,16 @@ public final class PageStream<T> {
 
 	}
 
-	/** null 결과는 제거하면서 매핑 */
+	/**
+	 * Maps each item in the page data stream and removes {@code null} mapping results.
+	 * 
+	 * @param mapper
+	 *            the mapping function
+	 * @param <R>
+	 *            the target element type
+	 * 
+	 * @return a mapped page stream without null values
+	 */
 	public <R> PageStream<R> mapNotNull(
 		Function<? super T, ? extends R> mapper
 	) {
@@ -93,7 +150,14 @@ public final class PageStream<T> {
 
 	}
 
-	/** data 스트림을 필터링 (totalCount는 원본 값을 그대로 유지) */
+	/**
+	 * Filters the page data stream while preserving the original total count.
+	 * 
+	 * @param predicate
+	 *            the filter predicate
+	 * 
+	 * @return a filtered page stream
+	 */
 	public PageStream<T> filter(
 		Predicate<? super T> predicate
 	) {
@@ -106,7 +170,11 @@ public final class PageStream<T> {
 
 	}
 
-	/** null 요소 제거 (totalCount는 원본 유지) */
+	/**
+	 * Removes {@code null} items from the page data stream.
+	 *
+	 * @return a filtered page stream without null values
+	 */
 	public PageStream<T> filterNotNull() {
 
 		return new PageStream<>(
@@ -116,7 +184,15 @@ public final class PageStream<T> {
 
 	}
 
-	/** 각 요소에 대해 부수효과를 수행하고, 다시 PageStream 으로 돌려줌 (체이닝용) */
+	/**
+	 * Performs a side effect for each emitted item and returns a new {@link PageStream}.
+	 * 각 요소에 대해 부수효과를 수행하고, 다시 PageStream 으로 돌려줌 (체이닝용)
+	 * 
+	 * @param action
+	 *            the side-effect action
+	 * 
+	 * @return a new page stream
+	 */
 	public PageStream<T> onEach(
 		Consumer<? super T> action
 	) {
@@ -129,7 +205,15 @@ public final class PageStream<T> {
 
 	}
 
-	/** 단순 소비용(forEach와 비슷) – subscribe는 호출하는 쪽에서 */
+	/**
+	 * Consumes each emitted item with the given action.
+	 * 단순 소비용(forEach와 비슷) – subscribe는 호출하는 쪽에서
+	 * 
+	 * @param action
+	 *            the action to apply
+	 * 
+	 * @return a {@link Mono} that completes when consumption finishes
+	 */
 	public Mono<Void> forEach(
 		Consumer<? super T> action
 	) {
@@ -141,7 +225,14 @@ public final class PageStream<T> {
 
 	}
 
-	/** 인덱스를 함께 쓰는 순회 (PageResult.forEachIndexed 대응) */
+	/**
+	 * Consumes each emitted item together with its zero-based index.
+	 *
+	 * @param action
+	 *            the indexed action to apply
+	 * 
+	 * @return a {@link Mono} that completes when consumption finishes
+	 */
 	public Mono<Void> forEachIndexed(
 		BiConsumer<Integer, ? super T> action
 	) {
@@ -154,7 +245,15 @@ public final class PageStream<T> {
 
 	}
 
-	/** totalCount 기준 총 페이지 수 계산 (pageSize > 0) */
+	/**
+	 * Calculates the total number of pages for the given page size.
+	 * totalCount 기준 총 페이지 수 계산 (pageSize > 0)
+	 * 
+	 * @param pageSize
+	 *            the page size
+	 * 
+	 * @return a {@link Mono} emitting the total number of pages
+	 */
 	public Mono<Integer> totalPages(
 		int pageSize
 	) {
@@ -172,7 +271,17 @@ public final class PageStream<T> {
 
 	}
 
-	/** 다음 페이지 존재 여부. page는 0-based */
+	/**
+	 * Returns whether another page exists after the given zero-based page index.
+	 * 다음 페이지 존재 여부. page는 0-based
+	 * 
+	 * @param page
+	 *            the current zero-based page index
+	 * @param pageSize
+	 *            the page size
+	 * 
+	 * @return a {@link Mono} emitting {@code true} if another page exists
+	 */
 	public Mono<Boolean> hasNext(
 		int page, int pageSize
 	) {
@@ -190,8 +299,11 @@ public final class PageStream<T> {
 	}
 
 	/**
+	 * Collects this reactive page into a {@link PageResult}.
 	 * 이 PageStream 을 한 번에 List로 모아서 PageResult로 변환.
-	 * (전통적인 PageResult API와 함께 쓰고 싶을 때)
+	 * (PageResult API와 함께 쓰고 싶을 때)
+	 * 
+	 * @return a {@link Mono} emitting the collected page result
 	 */
 	public Mono<PageResult<T>> collectToPageResult() {
 
