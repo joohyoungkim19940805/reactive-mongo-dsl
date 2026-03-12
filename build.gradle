@@ -1,6 +1,6 @@
 //build.gradle
 plugins {
-    id 'java-library'                               // ë¼ì´ë¸ŒëŸ¬ë¦¬ìš©
+    id 'java-library'                               // ¶óÀÌºê·¯¸®¿ë
     id 'io.spring.dependency-management' version '1.1.7'
     id "com.vanniktech.maven.publish" version "0.36.0"
 }
@@ -42,10 +42,6 @@ dependencies {
     
 }
 
-def isCentralPublish = gradle.startParameter.taskNames.any { t ->
-	t.toLowerCase().contains("mavencentral")
-}
-
 tasks.withType(JavaExec) {
     jvmArgs += '--add-exports'
     jvmArgs += 'jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED'
@@ -57,15 +53,15 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 tasks.withType(Javadoc).configureEach {
-  // ìœˆë„ìš°ì—ì„œ í•œê¸€/ì¸ì½”ë”© ê¹¨ì§ ë°©ì§€
+  // À©µµ¿ì¿¡¼­ ÇÑ±Û/ÀÎÄÚµù ±úÁü ¹æÁö
   options.encoding = 'UTF-8'
   options.charSet = 'UTF-8'
   options.docEncoding = 'UTF-8'
 
-  // DocLint(HTML/íƒœê·¸ ì—„ê²©ê²€ì‚¬) ì™„í™”
+  // DocLint(HTML/ÅÂ±× ¾ö°İ°Ë»ç) ¿ÏÈ­
   options.addStringOption('Xdoclint:none', '-quiet')
 
-  // Javadoc ì—ëŸ¬ë¡œ ë¹Œë“œ ì „ì²´ê°€ ì£½ì§€ ì•Šê²Œ
+  // Javadoc ¿¡·¯·Î ºôµå ÀüÃ¼°¡ Á×Áö ¾Ê°Ô
   failOnError = false
 }
 
@@ -79,19 +75,18 @@ mavenPublishing {
 		new SourcesJar.Sources()
 	)
   
-    // Central Portal ë°°í¬ íƒ€ê²Ÿ + ì„œëª… (Central ìš”êµ¬ì‚¬í•­)
-    publishToMavenCentral()     // ìë™ ë¦´ë¦¬ì¦ˆê¹Œì§€ í•˜ë ¤ë©´ publishToMavenCentral(true)
-	if (isCentralPublish) {
-		signAllPublications()
-	}
+    // Central Portal ¹èÆ÷ Å¸°Ù + ¼­¸í (Central ¿ä±¸»çÇ×)
+    publishToMavenCentral()     // ÀÚµ¿ ¸±¸®Áî±îÁö ÇÏ·Á¸é publishToMavenCentral(true)
 
-    // ì¢Œí‘œ(GAV)
+    signAllPublications()
+
+    // ÁÂÇ¥(GAV)
     coordinates(project.group, 'reactive-mongo-dsl', project.version)
 
-    // Central ìš”êµ¬ POM ë©”íƒ€ë°ì´í„°(ìµœì†Œì¹˜ë¼ë„ ì±„ìš°ëŠ” ê²Œ ì•ˆì „)
+    // Central ¿ä±¸ POM ¸ŞÅ¸µ¥ÀÌÅÍ(ÃÖ¼ÒÄ¡¶óµµ Ã¤¿ì´Â °Ô ¾ÈÀü)
     pom {
         name = 'Mongo DB Reactive DSL'
-        description = 'mongo db reactiveìš© query dsl'
+        description = 'mongo db reactive¿ë query dsl'
         url = 'https://github.com/joohyoungkim19940805/reactive-mongo-dsl'
 
         licenses {
@@ -103,7 +98,7 @@ mavenPublishing {
         developers {
             developer {
                 id = 'joohyoungkim19940805'
-                name = 'ê¹€ì£¼í˜•'
+                name = '±èÁÖÇü'
                 email = 'oozu1994@gmail.com'
                 url = 'https://github.com/joohyoungkim19940805'
             }
@@ -119,6 +114,6 @@ mavenPublishing {
 import org.gradle.api.publish.tasks.GenerateModuleMetadata
 
 tasks.withType(GenerateModuleMetadata).configureEach {
-    // publication ë©”íƒ€ë°ì´í„° ìƒì„± ì „ì— emptyJavadocJar ì‚°ì¶œë¬¼ì„ í™•ì‹¤íˆ ë§Œë“¤ê²Œ í•¨
+    // publication ¸ŞÅ¸µ¥ÀÌÅÍ »ı¼º Àü¿¡ emptyJavadocJar »êÃâ¹°À» È®½ÇÈ÷ ¸¸µé°Ô ÇÔ
     dependsOn(tasks.named("emptyJavadocJar"))
 }
