@@ -42,10 +42,10 @@ import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
 import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
 import org.springframework.transaction.reactive.TransactionalOperator;
 
-public enum MongoKey { FRONT, BACK }
+public enum MongoTemplateName { FRONT, BACK }
 
 @Component
-public class MyMongoTemplateResolver implements MongoTemplateResolver<MongoKey> {
+public class MyMongoTemplateResolver implements MongoTemplateResolver<MongoTemplateName> {
   private final ReactiveMongoTemplate front;
   private final ReactiveMongoTemplate back;
   private final TransactionalOperator frontTx;
@@ -64,13 +64,13 @@ public class MyMongoTemplateResolver implements MongoTemplateResolver<MongoKey> 
   }
 
   @Override
-  public ReactiveMongoTemplate getTemplate(MongoKey key) {
-    return (key == MongoKey.BACK) ? back : front;
+  public ReactiveMongoTemplate getTemplate(MongoTemplateName key) {
+    return (key == MongoTemplateName.BACK) ? back : front;
   }
 
   @Override
-  public TransactionalOperator getTxOperator(MongoKey key) {
-    return (key == MongoKey.BACK) ? backTx : frontTx;
+  public TransactionalOperator getTxOperator(MongoTemplateName key) {
+    return (key == MongoTemplateName.BACK) ? backTx : frontTx;
   }
 }
 ```
@@ -125,7 +125,7 @@ import static com.byeolnaerim.mongodsl.criteria.FieldsPair.pair;
 import static com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition.*;
 
 Flux<User> users =
-  dsl.executeEntity(User.class, MongoKey.FRONT)
+  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
      .fields(
         pair("status", "ACTIVE"),
         pair("age", 20, gte),
@@ -136,14 +136,14 @@ Flux<User> users =
      .execute();
 
 Mono<User> one =
-  dsl.executeEntity(User.class, MongoKey.FRONT)
+  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
      .fields(pair("_id", userId))
      .end()
      .find()
      .execute();      // 0~1건
 
 Mono<User> first =
-  dsl.executeEntity(User.class, MongoKey.FRONT)
+  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
      .fields(pair("status", "ACTIVE"))
      .end()
      .find()
@@ -159,7 +159,7 @@ import static com.byeolnaerim.mongodsl.criteria.FieldsPair.pair;
 import static com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition.*;
 
 Flux<User> users =
-  dsl.executeEntity(User.class, MongoKey.FRONT)
+  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
      .fields() // 루트 AND
        .and(f -> f.fields(
            pair("status", List.of("ACTIVE_1","ACTIVE_2"), in),
@@ -188,7 +188,7 @@ Flux<User> users =
 import org.springframework.data.domain.Sort.Order;
 
 Mono<PageResult<User>> page =
-  dsl.executeEntity(User.class, MongoKey.FRONT)
+  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
      .fields(pair("status", "ACTIVE"))
      .end()
      .findAll()
@@ -203,21 +203,21 @@ Mono<PageResult<User>> page =
 
 ```java
 Mono<Long> cnt =
-  dsl.executeEntity(User.class, MongoKey.FRONT)
+  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
      .fields(pair("status", "ACTIVE"))
      .end()
      .count()
      .execute();
 
 Mono<Boolean> exists =
-  dsl.executeEntity(User.class, MongoKey.FRONT)
+  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
      .fields(pair("_id", userId))
      .end()
      .exists()
      .execute();
 
 Mono<DeleteResult> del =
-  dsl.executeEntity(User.class, MongoKey.FRONT)
+  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
      .fields(pair("_id", userId))
      .end()
      .delete()
@@ -254,13 +254,13 @@ LookupSpec spec = LookupSpec.builder()
 - `FindAll + Count`: `Mono<PageResult<ResultTuple<Left, List<Right>>>>`
 
 ```java
-var left = dsl.executeEntity(User.class, MongoKey.FRONT)
+var left = dsl.executeEntity(User.class, MongoTemplateName.FRONT)
   .fields(pair("status", "ACTIVE"))
   .end()
   .findAll()
   .paging(0, 20);
 
-var right = dsl.executeEntity(Order.class, MongoKey.FRONT)
+var right = dsl.executeEntity(Order.class, MongoTemplateName.FRONT)
   .fields(pair("status", "DONE"))
   .end()
   .findAll();
@@ -282,7 +282,7 @@ Mono<PageResult<ResultTuple<User, List<Order>>>> joinedPage =
 import com.mongodb.client.result.UpdateResult;
 
 Mono<UpdateResult> updated =
-  dsl.executeEntity(User.class, MongoKey.FRONT)
+  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
      .fields(pair("_id", userId))
      .end()
      .atomicUpdate()
