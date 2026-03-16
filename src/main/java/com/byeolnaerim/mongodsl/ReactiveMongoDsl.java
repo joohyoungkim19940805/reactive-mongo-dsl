@@ -2248,11 +2248,11 @@ public class ReactiveMongoDsl<K> {
 				Mono<PageResult<E>> executeAggregation();
 
 				<R2> Flux<ResultTuple<E, List<R2>>> executeLookup(
-						ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 				);
 
 				<R2> Mono<PageResult<ResultTuple<E, List<R2>>>> executeLookupAndCount(
-						ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 				);
 
 			}
@@ -2270,7 +2270,7 @@ public class ReactiveMongoDsl<K> {
 				Mono<E> executeAggregation();
 
 				<R2> Mono<ResultTuple<E, R2>> executeLookup(
-					ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindQueryBuilder<R2> rightBuilder, LookupSpec spec
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindQueryBuilder<R2> rightBuilder, LookupSpec spec
 				);
 
 
@@ -2288,7 +2288,7 @@ public class ReactiveMongoDsl<K> {
 				Mono<Long> executeAggregation();
 
 				<R2> Mono<ResultTuple<Long, Long>> executeLookup(
-						ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 				);
 
 
@@ -2306,7 +2306,7 @@ public class ReactiveMongoDsl<K> {
 				Mono<Boolean> executeAggregation();
 
 				<R2> Mono<ResultTuple<Boolean, Boolean>> executeLookup(
-						ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 				);
 
 
@@ -3100,7 +3100,7 @@ public class ReactiveMongoDsl<K> {
 			 */
 			@Override
 			public <R2> Flux<ResultTuple<E, List<R2>>> executeLookup(
-					ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 			) {
 
 				// 왼쪽/오른쪽 클래스, 컬렉션명 결정
@@ -3303,7 +3303,7 @@ public class ReactiveMongoDsl<K> {
 			 */
 			@Override
 			public <R2> Mono<PageResult<ResultTuple<E, List<R2>>>> executeLookupAndCount(
-					ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 			) {
 
 				Mono<Class<E>> leftClassMono = executeClassMono;
@@ -3796,7 +3796,7 @@ public class ReactiveMongoDsl<K> {
 			 */
 			@Override
 			public <R2> Mono<ResultTuple<E, R2>> executeLookup(
-				ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindQueryBuilder<R2> rightBuilder, LookupSpec spec
+				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindQueryBuilder<R2> rightBuilder, LookupSpec spec
 			) {
 
 				// 내부적으로 FindAll과 거의 동일하되, limit(1) 보장
@@ -4087,7 +4087,7 @@ public class ReactiveMongoDsl<K> {
 			 */
 			@Override
 			public <R2> Mono<ResultTuple<Long, Long>> executeLookup(
-					ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 			) {
 
 				Mono<Class<E>> leftClassMono = executeClassMono;
@@ -4425,7 +4425,7 @@ public class ReactiveMongoDsl<K> {
 			 */
 			@Override
 			public <R2> Mono<ResultTuple<Boolean, Boolean>> executeLookup(
-					ReactiveMongoDsl<E>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 			) {
 
 				Mono<Class<E>> leftClassMono = executeClassMono;
