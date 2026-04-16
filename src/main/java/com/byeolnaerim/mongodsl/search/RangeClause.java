@@ -10,7 +10,7 @@ import org.bson.types.ObjectId;
  * @param <K>
  *            the logical path type
  */
-public final class RangeSearchOperator<K> extends AbstractSearchOperator {
+public final class RangeClause<K> extends AbstractSearchOperator {
 
 	private String path;
 
@@ -30,7 +30,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> path(
+	public RangeClause<K> path(
 		K path
 	) {
 		this.path = SearchPathResolver.resolve( path );
@@ -45,7 +45,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gt(
+	public RangeClause<K> gt(
 		int value
 	) { this.gt = value; return this; }
 
@@ -57,7 +57,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gt(
+	public RangeClause<K> gt(
 		long value
 	) { this.gt = value; return this; }
 
@@ -69,7 +69,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gt(
+	public RangeClause<K> gt(
 		double value
 	) { this.gt = value; return this; }
 
@@ -81,7 +81,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gt(
+	public RangeClause<K> gt(
 		String value
 	) { this.gt = value; return this; }
 
@@ -93,7 +93,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gt(
+	public RangeClause<K> gt(
 		Instant value
 	) { this.gt = value; return this; }
 
@@ -105,7 +105,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gt(
+	public RangeClause<K> gt(
 		ObjectId value
 	) { this.gt = value; return this; }
 
@@ -117,7 +117,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gte(
+	public RangeClause<K> gte(
 		int value
 	) { this.gte = value; return this; }
 
@@ -129,7 +129,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gte(
+	public RangeClause<K> gte(
 		long value
 	) { this.gte = value; return this; }
 
@@ -141,7 +141,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gte(
+	public RangeClause<K> gte(
 		double value
 	) { this.gte = value; return this; }
 
@@ -153,7 +153,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gte(
+	public RangeClause<K> gte(
 		String value
 	) { this.gte = value; return this; }
 
@@ -165,7 +165,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gte(
+	public RangeClause<K> gte(
 		Instant value
 	) { this.gte = value; return this; }
 
@@ -177,7 +177,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> gte(
+	public RangeClause<K> gte(
 		ObjectId value
 	) { this.gte = value; return this; }
 
@@ -189,7 +189,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lt(
+	public RangeClause<K> lt(
 		int value
 	) { this.lt = value; return this; }
 
@@ -201,7 +201,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lt(
+	public RangeClause<K> lt(
 		long value
 	) { this.lt = value; return this; }
 
@@ -213,7 +213,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lt(
+	public RangeClause<K> lt(
 		double value
 	) { this.lt = value; return this; }
 
@@ -225,7 +225,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lt(
+	public RangeClause<K> lt(
 		String value
 	) { this.lt = value; return this; }
 
@@ -237,7 +237,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lt(
+	public RangeClause<K> lt(
 		Instant value
 	) { this.lt = value; return this; }
 
@@ -249,7 +249,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lt(
+	public RangeClause<K> lt(
 		ObjectId value
 	) { this.lt = value; return this; }
 
@@ -261,7 +261,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lte(
+	public RangeClause<K> lte(
 		int value
 	) { this.lte = value; return this; }
 
@@ -273,7 +273,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lte(
+	public RangeClause<K> lte(
 		long value
 	) { this.lte = value; return this; }
 
@@ -285,7 +285,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lte(
+	public RangeClause<K> lte(
 		double value
 	) { this.lte = value; return this; }
 
@@ -297,7 +297,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lte(
+	public RangeClause<K> lte(
 		String value
 	) { this.lte = value; return this; }
 
@@ -309,7 +309,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lte(
+	public RangeClause<K> lte(
 		Instant value
 	) { this.lte = value; return this; }
 
@@ -321,7 +321,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> lte(
+	public RangeClause<K> lte(
 		ObjectId value
 	) { this.lte = value; return this; }
 
@@ -333,7 +333,7 @@ public final class RangeSearchOperator<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public RangeSearchOperator<K> score(
+	public RangeClause<K> score(
 		SearchScoreSpec score
 	) {
 		this.score = score;

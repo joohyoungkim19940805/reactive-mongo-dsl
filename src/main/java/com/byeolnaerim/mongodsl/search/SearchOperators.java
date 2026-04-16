@@ -15,8 +15,8 @@ public final class SearchOperators {
 	 *
 	 * @return a new {@code text} operator builder
 	 */
-	public static <K> TextSearchSpec<K> text() {
-		return new TextSearchSpec<>();
+	public static <K> TextClause<K> text() {
+		return new TextClause<>();
 	}
 
 	/**
@@ -27,8 +27,8 @@ public final class SearchOperators {
 	 *
 	 * @return a new {@code phrase} operator builder
 	 */
-	public static <K> PhraseSearchSpec<K> phrase() {
-		return new PhraseSearchSpec<>();
+	public static <K> PhraseClause<K> phrase() {
+		return new PhraseClause<>();
 	}
 
 	/**
@@ -39,8 +39,8 @@ public final class SearchOperators {
 	 *
 	 * @return a new {@code autocomplete} operator builder
 	 */
-	public static <K> AutocompleteSearchSpec<K> autocomplete() {
-		return new AutocompleteSearchSpec<>();
+	public static <K> AutocompleteClause<K> autocomplete() {
+		return new AutocompleteClause<>();
 	}
 
 	/**
@@ -87,7 +87,7 @@ public final class SearchOperators {
 	 *
 	 * @return a new {@code range} operator builder
 	 */
-	public static <K> RangeSearchOperator<K> range() {
-		return new RangeSearchOperator<>();
+	public static <K> RangeClause<K> range() {
+		return new RangeClause<>();
 	}
 }

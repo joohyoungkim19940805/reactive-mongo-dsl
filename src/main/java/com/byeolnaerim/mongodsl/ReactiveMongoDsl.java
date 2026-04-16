@@ -61,17 +61,17 @@ import com.byeolnaerim.mongodsl.lookup.LookupSpec;
 import com.byeolnaerim.mongodsl.result.PageResult;
 import com.byeolnaerim.mongodsl.result.ResultTuple;
 import com.byeolnaerim.mongodsl.search.AtlasSearchOperator;
-import com.byeolnaerim.mongodsl.search.AutocompleteSearchSpec;
+import com.byeolnaerim.mongodsl.search.AutocompleteClause;
 import com.byeolnaerim.mongodsl.search.EqualsClause;
 import com.byeolnaerim.mongodsl.search.ExistsClause;
 import com.byeolnaerim.mongodsl.search.InClause;
-import com.byeolnaerim.mongodsl.search.PhraseSearchSpec;
-import com.byeolnaerim.mongodsl.search.RangeSearchOperator;
+import com.byeolnaerim.mongodsl.search.PhraseClause;
+import com.byeolnaerim.mongodsl.search.RangeClause;
 import com.byeolnaerim.mongodsl.search.SearchCountType;
 import com.byeolnaerim.mongodsl.search.SearchOperators;
 import com.byeolnaerim.mongodsl.search.SearchScoreSpec;
 import com.byeolnaerim.mongodsl.search.SearchSortSpec;
-import com.byeolnaerim.mongodsl.search.TextSearchSpec;
+import com.byeolnaerim.mongodsl.search.TextClause;
 import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
 import com.mongodb.ReadPreference;
 import com.mongodb.bulk.BulkWriteResult;
@@ -3127,10 +3127,10 @@ public class ReactiveMongoDsl<K> {
 			 * @return this builder
 			 */
 			public <K2> SearchBuilder<S> text(
-				Consumer<TextSearchSpec<K2>> spec
+				Consumer<TextClause<K2>> spec
 			) {
 
-				TextSearchSpec<K2> op = SearchOperators.<K2>text();
+				TextClause<K2> op = SearchOperators.<K2>text();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -3148,10 +3148,10 @@ public class ReactiveMongoDsl<K> {
 			 * @return this builder
 			 */
 			public <K2> SearchBuilder<S> phrase(
-				Consumer<PhraseSearchSpec<K2>> spec
+				Consumer<PhraseClause<K2>> spec
 			) {
 
-				PhraseSearchSpec<K2> op = SearchOperators.<K2>phrase();
+				PhraseClause<K2> op = SearchOperators.<K2>phrase();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -3169,10 +3169,10 @@ public class ReactiveMongoDsl<K> {
 			 * @return this builder
 			 */
 			public <K2> SearchBuilder<S> autocomplete(
-				Consumer<AutocompleteSearchSpec<K2>> spec
+				Consumer<AutocompleteClause<K2>> spec
 			) {
 
-				AutocompleteSearchSpec<K2> op = SearchOperators.<K2>autocomplete();
+				AutocompleteClause<K2> op = SearchOperators.<K2>autocomplete();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -3253,10 +3253,10 @@ public class ReactiveMongoDsl<K> {
 			 * @return this builder
 			 */
 			public <K2> SearchBuilder<S> range(
-				Consumer<RangeSearchOperator<K2>> spec
+				Consumer<RangeClause<K2>> spec
 			) {
 
-				RangeSearchOperator<K2> op = SearchOperators.<K2>range();
+				RangeClause<K2> op = SearchOperators.<K2>range();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -3709,10 +3709,10 @@ public class ReactiveMongoDsl<K> {
 				 * @return this builder
 				 */
 				public <K2> SearchCompoundBuilder<T> mustText(
-					K2 path, Consumer<TextSearchSpec<K2>> spec
+					K2 path, Consumer<TextClause<K2>> spec
 				) {
 
-					TextSearchSpec<K2> op = SearchOperators.<K2>text().path( path );
+					TextClause<K2> op = SearchOperators.<K2>text().path( path );
 					spec.accept( op );
 					return must( op );
 
@@ -3731,10 +3731,10 @@ public class ReactiveMongoDsl<K> {
 				 * @return this builder
 				 */
 				public <K2> SearchCompoundBuilder<T> shouldText(
-					K2 path, Consumer<TextSearchSpec<K2>> spec
+					K2 path, Consumer<TextClause<K2>> spec
 				) {
 
-					TextSearchSpec<K2> op = SearchOperators.<K2>text().path( path );
+					TextClause<K2> op = SearchOperators.<K2>text().path( path );
 					spec.accept( op );
 					return should( op );
 
@@ -3753,10 +3753,10 @@ public class ReactiveMongoDsl<K> {
 				 * @return this builder
 				 */
 				public <K2> SearchCompoundBuilder<T> filterText(
-					K2 path, Consumer<TextSearchSpec<K2>> spec
+					K2 path, Consumer<TextClause<K2>> spec
 				) {
 
-					TextSearchSpec<K2> op = SearchOperators.<K2>text().path( path );
+					TextClause<K2> op = SearchOperators.<K2>text().path( path );
 					spec.accept( op );
 					return filter( op );
 
@@ -3775,10 +3775,10 @@ public class ReactiveMongoDsl<K> {
 				 * @return this builder
 				 */
 				public <K2> SearchCompoundBuilder<T> mustPhrase(
-					K2 path, Consumer<PhraseSearchSpec<K2>> spec
+					K2 path, Consumer<PhraseClause<K2>> spec
 				) {
 
-					PhraseSearchSpec<K2> op = SearchOperators.<K2>phrase().path( path );
+					PhraseClause<K2> op = SearchOperators.<K2>phrase().path( path );
 					spec.accept( op );
 					return must( op );
 
@@ -3797,10 +3797,10 @@ public class ReactiveMongoDsl<K> {
 				 * @return this builder
 				 */
 				public <K2> SearchCompoundBuilder<T> shouldAutocomplete(
-					K2 path, Consumer<AutocompleteSearchSpec<K2>> spec
+					K2 path, Consumer<AutocompleteClause<K2>> spec
 				) {
 
-					AutocompleteSearchSpec<K2> op = SearchOperators.<K2>autocomplete().path( path );
+					AutocompleteClause<K2> op = SearchOperators.<K2>autocomplete().path( path );
 					spec.accept( op );
 					return should( op );
 
@@ -3863,10 +3863,10 @@ public class ReactiveMongoDsl<K> {
 				 * @return this builder
 				 */
 				public <K2> SearchCompoundBuilder<T> filterRange(
-					K2 path, Consumer<RangeSearchOperator<K2>> spec
+					K2 path, Consumer<RangeClause<K2>> spec
 				) {
 
-					RangeSearchOperator<K2> op = SearchOperators.<K2>range().path( path );
+					RangeClause<K2> op = SearchOperators.<K2>range().path( path );
 					spec.accept( op );
 					return filter( op );
 

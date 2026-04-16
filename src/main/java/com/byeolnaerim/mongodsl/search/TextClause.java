@@ -11,7 +11,7 @@ import org.bson.Document;
  * @param <K>
  *            the logical path type
  */
-public final class TextSearchSpec<K> extends AbstractSearchOperator {
+public final class TextClause<K> extends AbstractSearchOperator {
 
 	private Object path;
 
@@ -31,7 +31,7 @@ public final class TextSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextSearchSpec<K> path(
+	public TextClause<K> path(
 		K path
 	) {
 		this.path = SearchPathResolver.resolve( path );
@@ -46,7 +46,7 @@ public final class TextSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextSearchSpec<K> paths(
+	public TextClause<K> paths(
 		Collection<K> paths
 	) {
 		this.path = SearchPathResolver.resolveAll( paths );
@@ -61,7 +61,7 @@ public final class TextSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextSearchSpec<K> query(
+	public TextClause<K> query(
 		String query
 	) {
 		this.query = Objects.requireNonNull( query, "query" );
@@ -76,7 +76,7 @@ public final class TextSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextSearchSpec<K> queries(
+	public TextClause<K> queries(
 		Collection<String> queries
 	) {
 
@@ -101,7 +101,7 @@ public final class TextSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextSearchSpec<K> fuzzy(
+	public TextClause<K> fuzzy(
 		int maxEdits,
 		int prefixLength,
 		int maxExpansions
@@ -118,7 +118,7 @@ public final class TextSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextSearchSpec<K> matchCriteria(
+	public TextClause<K> matchCriteria(
 		SearchMatchCriteria matchCriteria
 	) {
 		this.matchCriteria = matchCriteria;
@@ -133,7 +133,7 @@ public final class TextSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextSearchSpec<K> synonyms(
+	public TextClause<K> synonyms(
 		String synonyms
 	) {
 		this.synonyms = synonyms;
@@ -148,7 +148,7 @@ public final class TextSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextSearchSpec<K> score(
+	public TextClause<K> score(
 		SearchScoreSpec score
 	) {
 		this.score = score;

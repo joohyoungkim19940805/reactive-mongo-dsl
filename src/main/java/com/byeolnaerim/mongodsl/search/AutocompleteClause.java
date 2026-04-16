@@ -15,7 +15,7 @@ import org.bson.Document;
  * @param <K>
  *            the logical path type
  */
-public final class AutocompleteSearchSpec<K> extends AbstractSearchOperator {
+public final class AutocompleteClause<K> extends AbstractSearchOperator {
 
 	private String path;
 
@@ -33,7 +33,7 @@ public final class AutocompleteSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteSearchSpec<K> path(
+	public AutocompleteClause<K> path(
 		K path
 	) {
 		this.path = SearchPathResolver.resolve( path );
@@ -48,7 +48,7 @@ public final class AutocompleteSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteSearchSpec<K> query(
+	public AutocompleteClause<K> query(
 		String query
 	) {
 		this.query = Objects.requireNonNull( query, "query" );
@@ -63,7 +63,7 @@ public final class AutocompleteSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteSearchSpec<K> queries(
+	public AutocompleteClause<K> queries(
 		Collection<String> queries
 	) {
 
@@ -84,7 +84,7 @@ public final class AutocompleteSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteSearchSpec<K> tokenOrder(
+	public AutocompleteClause<K> tokenOrder(
 		SearchTokenOrder tokenOrder
 	) {
 		this.tokenOrder = tokenOrder;
@@ -103,7 +103,7 @@ public final class AutocompleteSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteSearchSpec<K> fuzzy(
+	public AutocompleteClause<K> fuzzy(
 		int maxEdits,
 		int prefixLength,
 		int maxExpansions
@@ -120,7 +120,7 @@ public final class AutocompleteSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteSearchSpec<K> score(
+	public AutocompleteClause<K> score(
 		SearchScoreSpec score
 	) {
 		this.score = score;

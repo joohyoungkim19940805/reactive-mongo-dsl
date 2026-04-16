@@ -11,7 +11,7 @@ import org.bson.Document;
  * @param <K>
  *            the logical path type
  */
-public final class PhraseSearchSpec<K> extends AbstractSearchOperator {
+public final class PhraseClause<K> extends AbstractSearchOperator {
 
 	private Object path;
 
@@ -29,7 +29,7 @@ public final class PhraseSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseSearchSpec<K> path(
+	public PhraseClause<K> path(
 		K path
 	) {
 		this.path = SearchPathResolver.resolve( path );
@@ -44,7 +44,7 @@ public final class PhraseSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseSearchSpec<K> paths(
+	public PhraseClause<K> paths(
 		Collection<K> paths
 	) {
 		this.path = SearchPathResolver.resolveAll( paths );
@@ -59,7 +59,7 @@ public final class PhraseSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseSearchSpec<K> query(
+	public PhraseClause<K> query(
 		String query
 	) {
 		this.query = Objects.requireNonNull( query, "query" );
@@ -74,7 +74,7 @@ public final class PhraseSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseSearchSpec<K> queries(
+	public PhraseClause<K> queries(
 		Collection<String> queries
 	) {
 
@@ -95,7 +95,7 @@ public final class PhraseSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseSearchSpec<K> slop(
+	public PhraseClause<K> slop(
 		int slop
 	) {
 
@@ -116,7 +116,7 @@ public final class PhraseSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseSearchSpec<K> synonyms(
+	public PhraseClause<K> synonyms(
 		String synonyms
 	) {
 		this.synonyms = synonyms;
@@ -131,7 +131,7 @@ public final class PhraseSearchSpec<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseSearchSpec<K> score(
+	public PhraseClause<K> score(
 		SearchScoreSpec score
 	) {
 		this.score = score;
