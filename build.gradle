@@ -1,12 +1,12 @@
 //build.gradle
 plugins {
-    id 'java-library'                               // ¶óÀÌºê·¯¸®¿ë
+    id 'java-library'                         
     id 'io.spring.dependency-management' version '1.1.7'
     id "com.vanniktech.maven.publish" version "0.36.0"
 }
 
 group = 'com.byeolnaerim'
-version = '0.0.1-alpha.2'
+version = '0.0.1-alpha.3'
 jar {
     archiveBaseName = 'reactive-mongo-dsl'
 }
@@ -53,15 +53,15 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 tasks.withType(Javadoc).configureEach {
-  // À©µµ¿ì¿¡¼­ ÇÑ±Û/ÀÎÄÚµù ±úÁü ¹æÁö
+  // ìœˆë„ìš°ì—ì„œ í•œê¸€/ì¸ì½”ë”© ê¹¨ì§ ë°©ì§€
   options.encoding = 'UTF-8'
   options.charSet = 'UTF-8'
   options.docEncoding = 'UTF-8'
 
-  // DocLint(HTML/ÅÂ±× ¾ö°İ°Ë»ç) ¿ÏÈ­
+  // DocLint(HTML/íƒœê·¸ ì—„ê²©ê²€ì‚¬) ì™„í™”
   options.addStringOption('Xdoclint:none', '-quiet')
 
-  // Javadoc ¿¡·¯·Î ºôµå ÀüÃ¼°¡ Á×Áö ¾Ê°Ô
+  // Javadoc ì—ëŸ¬ë¡œ ë¹Œë“œ ì „ì²´ê°€ ì£½ì§€ ì•Šê²Œ
   failOnError = false
 }
 
@@ -75,18 +75,18 @@ mavenPublishing {
 		new SourcesJar.Sources()
 	)
   
-    // Central Portal ¹èÆ÷ Å¸°Ù + ¼­¸í (Central ¿ä±¸»çÇ×)
-    publishToMavenCentral()     // ÀÚµ¿ ¸±¸®Áî±îÁö ÇÏ·Á¸é publishToMavenCentral(true)
+    // Central Portal ë°°í¬ íƒ€ê²Ÿ + ì„œëª… (Central ìš”êµ¬ì‚¬í•­)
+    publishToMavenCentral()     // ìë™ ë¦´ë¦¬ì¦ˆê¹Œì§€ í•˜ë ¤ë©´ publishToMavenCentral(true)
 
     signAllPublications()
 
-    // ÁÂÇ¥(GAV)
+    // ì¢Œí‘œ(GAV)
     coordinates(project.group, 'reactive-mongo-dsl', project.version)
 
-    // Central ¿ä±¸ POM ¸ŞÅ¸µ¥ÀÌÅÍ(ÃÖ¼ÒÄ¡¶óµµ Ã¤¿ì´Â °Ô ¾ÈÀü)
+    // Central ìš”êµ¬ POM ë©”íƒ€ë°ì´í„°(ìµœì†Œì¹˜ë¼ë„ ì±„ìš°ëŠ” ê²Œ ì•ˆì „)
     pom {
         name = 'Mongo DB Reactive DSL'
-        description = 'mongo db reactive¿ë query dsl'
+        description = 'mongo db reactiveìš© query dsl'
         url = 'https://github.com/joohyoungkim19940805/reactive-mongo-dsl'
 
         licenses {
@@ -98,7 +98,7 @@ mavenPublishing {
         developers {
             developer {
                 id = 'joohyoungkim19940805'
-                name = '±èÁÖÇü'
+                name = 'ê¹€ì£¼í˜•'
                 email = 'oozu1994@gmail.com'
                 url = 'https://byeolnaerim.com'
             }
@@ -114,6 +114,6 @@ mavenPublishing {
 import org.gradle.api.publish.tasks.GenerateModuleMetadata
 
 tasks.withType(GenerateModuleMetadata).configureEach {
-    // publication ¸ŞÅ¸µ¥ÀÌÅÍ »ı¼º Àü¿¡ emptyJavadocJar »êÃâ¹°À» È®½ÇÈ÷ ¸¸µé°Ô ÇÔ
+    // publication ë©”íƒ€ë°ì´í„° ìƒì„± ì „ì— emptyJavadocJar ì‚°ì¶œë¬¼ì„ í™•ì‹¤íˆ ë§Œë“¤ê²Œ í•¨
     dependsOn(tasks.named("emptyJavadocJar"))
 }

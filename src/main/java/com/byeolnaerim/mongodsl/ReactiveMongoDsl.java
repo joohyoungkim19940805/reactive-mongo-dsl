@@ -60,6 +60,18 @@ import com.byeolnaerim.mongodsl.internal.MongoIdFieldResolver;
 import com.byeolnaerim.mongodsl.lookup.LookupSpec;
 import com.byeolnaerim.mongodsl.result.PageResult;
 import com.byeolnaerim.mongodsl.result.ResultTuple;
+import com.byeolnaerim.mongodsl.search.AtlasSearchOperator;
+import com.byeolnaerim.mongodsl.search.AutocompleteSearchSpec;
+import com.byeolnaerim.mongodsl.search.EqualsClause;
+import com.byeolnaerim.mongodsl.search.ExistsClause;
+import com.byeolnaerim.mongodsl.search.InClause;
+import com.byeolnaerim.mongodsl.search.PhraseSearchSpec;
+import com.byeolnaerim.mongodsl.search.RangeSearchOperator;
+import com.byeolnaerim.mongodsl.search.SearchCountType;
+import com.byeolnaerim.mongodsl.search.SearchOperators;
+import com.byeolnaerim.mongodsl.search.SearchScoreSpec;
+import com.byeolnaerim.mongodsl.search.SearchSortSpec;
+import com.byeolnaerim.mongodsl.search.TextSearchSpec;
 import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
 import com.mongodb.ReadPreference;
 import com.mongodb.bulk.BulkWriteResult;
@@ -2698,6 +2710,1475 @@ public class ReactiveMongoDsl<K> {
 
 
 		}
+
+
+		/**
+		 * Starts an Atlas Search query using the default Atlas Search index.
+		 * <p>This entry point intentionally bypasses the regular {@link FieldBuilder}
+		 * terminal flow because Atlas Search requires {@code $search} or
+		 * {@code $searchMeta} to be the first stage in the aggregation pipeline.</p>
+		 *
+		 * @return an Atlas Search builder
+		 */
+		public SearchBuilder<E> search() {
+
+			return new SearchBuilder<>( null );
+
+		}
+
+		/**
+		 * Starts an Atlas Search query using the specified Atlas Search index.
+		 * <p>This entry point intentionally bypasses the regular {@link FieldBuilder}
+		 * terminal flow because Atlas Search requires {@code $search} or
+		 * {@code $searchMeta} to be the first stage in the aggregation pipeline.</p>
+		 *
+		 * @param index
+		 *            the Atlas Search index name; when blank, Atlas Search falls back to
+		 *            its default index selection behavior
+		 *
+		 * @return an Atlas Search builder
+		 */
+		public SearchBuilder<E> search(
+			String index
+		) {
+
+			return new SearchBuilder<>( index );
+
+		}
+
+		/**
+		 * Atlas Search-specific builder that renders strongly typed Atlas Search operators
+		 * into a {@code $search} or {@code $searchMeta} aggregation stage.
+		 * <p>This builder extends {@link QueryBuilderAccesser} on purpose so it can reuse
+		 * the same aggregation-option pipeline used by the rest of the DSL. This keeps
+		 * read preference, disk-use, and aggregation customization semantics aligned with
+		 * existing builders such as {@code findAll()}, {@code count()}, and
+		 * {@code exists()}.</p>
+		 * <p>Regular {@link FieldsPair}-based filtering is still supported through
+		 * {@link #fields(FieldsPair[])} and {@link #fields(Collection)}, but those
+		 * conditions are applied <strong>after</strong> {@code $search} as a normal
+		 * aggregation {@code $match}. Search relevance, score, and index-aware filtering
+		 * should therefore be expressed through Atlas Search operators such as
+		 * {@code compound.filter(...)} instead of post-search {@code fields(...)}.</p>
+		 *
+		 * @param <S>
+		 *            the current mapped entity type
+		 */
+		public class SearchBuilder<S extends E> extends QueryBuilderAccesser<SearchBuilder<S>, SearchBuilder<S>> {
+
+			private final String index;
+
+			private final FieldBuilder<E> postFilterBuilder = new FieldBuilder<>( LogicalOperator.AND );
+
+			private AtlasSearchOperator rootOperator;
+
+			private SearchCountType searchCountType;
+
+			private boolean scoreDetails;
+
+			private String searchAfterToken;
+
+			private String searchBeforeToken;
+
+			private final List<Document> addFieldsDocs = new ArrayList<>();
+
+			private final List<SearchSortSpec<?>> searchSortSpecs = new ArrayList<>();
+
+			private Integer pageNumber;
+
+			private Integer pageSize;
+
+			private String[] excludes;
+
+			SearchBuilder(
+							String index
+			) {
+
+				this.index = index;
+
+			}
+
+			/**
+			 * Returns this builder with the given read preference applied to the generated
+			 * aggregation query.
+			 *
+			 * @param rp
+			 *            the read preference
+			 *
+			 * @return this builder
+			 */
+			@Override
+			public SearchBuilder<S> readPreference(
+				ReadPreference rp
+			) {
+
+				super.readPreference( rp );
+				return this;
+
+			}
+
+			/**
+			 * Returns this builder with the given disk-use option applied to the generated
+			 * aggregation query.
+			 *
+			 * @param allow
+			 *            whether disk use should be allowed
+			 *
+			 * @return this builder
+			 */
+			@Override
+			public SearchBuilder<S> isAllowDiskUse(
+				Boolean allow
+			) {
+
+				super.isAllowDiskUse( allow );
+				return this;
+
+			}
+
+			/**
+			 * Configures the Atlas Search count mode to include inside {@code $search}.
+			 * <p>This affects the {@code count} section embedded in the
+			 * {@code $search} stage. If you need metadata-only count retrieval, use
+			 * {@link SearchCountQueryBuilder#executeSearchMeta()}.</p>
+			 *
+			 * @param searchCountType
+			 *            the count mode
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> countType(
+				SearchCountType searchCountType
+			) {
+
+				this.searchCountType = searchCountType;
+				return this;
+
+			}
+
+			/**
+			 * Enables or disables Atlas Search score-details retrieval.
+			 * <p>When enabled, callers can expose the returned metadata through
+			 * {@link #addFieldsScoreDetails()} or {@link #addFieldsScoreDetails(String)}.</p>
+			 *
+			 * @param scoreDetails
+			 *            whether score details should be returned by Atlas Search
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> scoreDetails(
+				boolean scoreDetails
+			) {
+
+				this.scoreDetails = scoreDetails;
+				return this;
+
+			}
+
+			/**
+			 * Adds a search-after token for Atlas Search cursor-style pagination.
+			 *
+			 * @param searchAfterToken
+			 *            the encoded Atlas Search sequence token
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> searchAfter(
+				String searchAfterToken
+			) {
+
+				this.searchAfterToken = searchAfterToken;
+				this.searchBeforeToken = null;
+				return this;
+
+			}
+
+			/**
+			 * Adds a search-before token for Atlas Search cursor-style reverse pagination.
+			 *
+			 * @param searchBeforeToken
+			 *            the encoded Atlas Search sequence token
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> searchBefore(
+				String searchBeforeToken
+			) {
+
+				this.searchBeforeToken = searchBeforeToken;
+				this.searchAfterToken = null;
+				return this;
+
+			}
+
+			/**
+			 * Excludes the given fields from the final mapped result projection.
+			 *
+			 * @param excludes
+			 *            the field names to exclude
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> excludes(
+				String... excludes
+			) {
+
+				this.excludes = excludes;
+				return this;
+
+			}
+
+			/**
+			 * Configures zero-based paging for the final post-search result set.
+			 * <p>This paging is applied <strong>after</strong> the {@code $search} stage
+			 * and after any post-search {@code fields(...)} filter.</p>
+			 *
+			 * @param pageNumber
+			 *            the zero-based page index
+			 * @param pageSize
+			 *            the page size
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> paging(
+				int pageNumber, int pageSize
+			) {
+
+				if (pageNumber < 0 || pageSize <= 0)
+					throw new IllegalArgumentException( "Invalid pageNumber or pageSize." );
+				this.pageNumber = pageNumber;
+				this.pageSize = pageSize;
+				return this;
+
+			}
+
+			/**
+			 * Appends one or more Atlas Search sort specifications.
+			 *
+			 * @param specs
+			 *            the sort specifications
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> sorts(
+				SearchSortSpec<?>... specs
+			) {
+
+				if (specs != null) {
+					this.searchSortSpecs.addAll( Arrays.asList( specs ) );
+
+				}
+
+				return this;
+
+			}
+
+			/**
+			 * Appends one or more Atlas Search sort specifications.
+			 *
+			 * @param specs
+			 *            the sort specifications
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> sorts(
+				Collection<SearchSortSpec<?>> specs
+			) {
+
+				if (specs != null) {
+					this.searchSortSpecs.addAll( specs );
+
+				}
+
+				return this;
+
+			}
+
+			/**
+			 * Inserts a score-descending sort as the first Atlas Search sort rule.
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> firstSortScore() {
+
+				this.searchSortSpecs.add( 0, SearchSortSpec.scoreDesc() );
+				return this;
+
+			}
+
+			/**
+			 * Adds a post-search field exposing the Atlas Search score using the default
+			 * alias {@code score}.
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> addFieldsScore() {
+
+				return addFieldsScore( "score" );
+
+			}
+
+			/**
+			 * Adds a post-search field exposing the Atlas Search score using the given
+			 * alias.
+			 *
+			 * @param alias
+			 *            the target field alias
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> addFieldsScore(
+				String alias
+			) {
+
+				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "searchScore" ) ) );
+				return this;
+
+			}
+
+			/**
+			 * Adds a post-search field exposing Atlas Search score details using the
+			 * default alias {@code scoreDetails}.
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> addFieldsScoreDetails() {
+
+				return addFieldsScoreDetails( "scoreDetails" );
+
+			}
+
+			/**
+			 * Adds a post-search field exposing Atlas Search score details using the
+			 * given alias.
+			 * <p>This method also enables {@code scoreDetails(true)} automatically because
+			 * Atlas Search only returns score-details metadata when explicitly requested.</p>
+			 *
+			 * @param alias
+			 *            the target field alias
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> addFieldsScoreDetails(
+				String alias
+			) {
+
+				this.scoreDetails = true;
+				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "searchScoreDetails" ) ) );
+				return this;
+
+			}
+
+			/**
+			 * Adds a post-search field exposing the Atlas Search sequence token using the
+			 * default alias {@code searchSequenceToken}.
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> addFieldsSequenceToken() {
+
+				return addFieldsSequenceToken( "searchSequenceToken" );
+
+			}
+
+			/**
+			 * Adds a post-search field exposing the Atlas Search sequence token using the
+			 * given alias.
+			 *
+			 * @param alias
+			 *            the target field alias
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> addFieldsSequenceToken(
+				String alias
+			) {
+
+				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "searchSequenceToken" ) ) );
+				return this;
+
+			}
+
+			/**
+			 * Sets the root Atlas Search operator explicitly.
+			 *
+			 * @param operator
+			 *            the root Atlas Search operator
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> operator(
+				AtlasSearchOperator operator
+			) {
+
+				this.rootOperator = Objects.requireNonNull( operator, "operator" );
+				return this;
+
+			}
+
+			/**
+			 * Builds the root operator as a {@code text} search operator.
+			 *
+			 * @param spec
+			 *            the operator configuration callback
+			 * @param <K2>
+			 *            the logical path type
+			 *
+			 * @return this builder
+			 */
+			public <K2> SearchBuilder<S> text(
+				Consumer<TextSearchSpec<K2>> spec
+			) {
+
+				TextSearchSpec<K2> op = SearchOperators.<K2>text();
+				spec.accept( op );
+				this.rootOperator = op;
+				return this;
+
+			}
+
+			/**
+			 * Builds the root operator as a {@code phrase} search operator.
+			 *
+			 * @param spec
+			 *            the operator configuration callback
+			 * @param <K2>
+			 *            the logical path type
+			 *
+			 * @return this builder
+			 */
+			public <K2> SearchBuilder<S> phrase(
+				Consumer<PhraseSearchSpec<K2>> spec
+			) {
+
+				PhraseSearchSpec<K2> op = SearchOperators.<K2>phrase();
+				spec.accept( op );
+				this.rootOperator = op;
+				return this;
+
+			}
+
+			/**
+			 * Builds the root operator as an {@code autocomplete} search operator.
+			 *
+			 * @param spec
+			 *            the operator configuration callback
+			 * @param <K2>
+			 *            the logical path type
+			 *
+			 * @return this builder
+			 */
+			public <K2> SearchBuilder<S> autocomplete(
+				Consumer<AutocompleteSearchSpec<K2>> spec
+			) {
+
+				AutocompleteSearchSpec<K2> op = SearchOperators.<K2>autocomplete();
+				spec.accept( op );
+				this.rootOperator = op;
+				return this;
+
+			}
+
+			/**
+			 * Builds the root operator as an {@code equals} search operator.
+			 *
+			 * @param spec
+			 *            the operator configuration callback
+			 * @param <K2>
+			 *            the logical path type
+			 *
+			 * @return this builder
+			 */
+			public <K2> SearchBuilder<S> equals(
+				Consumer<EqualsClause<K2>> spec
+			) {
+
+				EqualsClause<K2> op = SearchOperators.<K2>equals();
+				spec.accept( op );
+				this.rootOperator = op;
+				return this;
+
+			}
+
+			/**
+			 * Builds the root operator as an {@code exists} search operator.
+			 *
+			 * @param spec
+			 *            the operator configuration callback
+			 * @param <K2>
+			 *            the logical path type
+			 *
+			 * @return this builder
+			 */
+			public <K2> SearchBuilder<S> exists(
+				Consumer<ExistsClause<K2>> spec
+			) {
+
+				ExistsClause<K2> op = SearchOperators.<K2>exists();
+				spec.accept( op );
+				this.rootOperator = op;
+				return this;
+
+			}
+
+			/**
+			 * Builds the root operator as an {@code in} search operator.
+			 *
+			 * @param spec
+			 *            the operator configuration callback
+			 * @param <K2>
+			 *            the logical path type
+			 *
+			 * @return this builder
+			 */
+			public <K2> SearchBuilder<S> in(
+				Consumer<InClause<K2>> spec
+			) {
+
+				InClause<K2> op = SearchOperators.<K2>in();
+				spec.accept( op );
+				this.rootOperator = op;
+				return this;
+
+			}
+
+			/**
+			 * Builds the root operator as a {@code range} search operator.
+			 *
+			 * @param spec
+			 *            the operator configuration callback
+			 * @param <K2>
+			 *            the logical path type
+			 *
+			 * @return this builder
+			 */
+			public <K2> SearchBuilder<S> range(
+				Consumer<RangeSearchOperator<K2>> spec
+			) {
+
+				RangeSearchOperator<K2> op = SearchOperators.<K2>range();
+				spec.accept( op );
+				this.rootOperator = op;
+				return this;
+
+			}
+
+			/**
+			 * Builds the root operator as a {@code compound} search operator.
+			 *
+			 * @param spec
+			 *            the compound configuration callback
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> compound(
+				Consumer<SearchCompoundBuilder<S>> spec
+			) {
+
+				SearchCompoundBuilder<S> compound = new SearchCompoundBuilder<>();
+				spec.accept( compound );
+				this.rootOperator = compound.build();
+				return this;
+
+			}
+
+			/**
+			 * Adds post-search criteria expressed with the regular DSL
+			 * {@link FieldsPair} model.
+			 * <p>These conditions are converted into a normal aggregation
+			 * {@code $match} stage that runs <strong>after</strong> the
+			 * {@code $search} stage.</p>
+			 *
+			 * @param fieldsPairs
+			 *            the post-search field conditions
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> fields(
+				FieldsPair<?, ?>... fieldsPairs
+			) {
+
+				this.postFilterBuilder.fields( fieldsPairs );
+				return this;
+
+			}
+
+			/**
+			 * Adds post-search criteria expressed with the regular DSL
+			 * {@link FieldsPair} model.
+			 * <p>These conditions are converted into a normal aggregation
+			 * {@code $match} stage that runs <strong>after</strong> the
+			 * {@code $search} stage.</p>
+			 *
+			 * @param fieldsPairs
+			 *            the post-search field conditions
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> fields(
+				Collection<FieldsPair<?, ?>> fieldsPairs
+			) {
+
+				if (fieldsPairs == null || fieldsPairs.isEmpty())
+					return this;
+				this.postFilterBuilder.fields( fieldsPairs.stream().toArray( FieldsPair[]::new ) );
+				return this;
+
+			}
+
+			/**
+			 * Creates a terminal builder for multi-result Atlas Search reads.
+			 *
+			 * @return a multi-result Atlas Search terminal builder
+			 */
+			public SearchFindAllQueryBuilder<S> findAll() {
+
+				return new SearchFindAllQueryBuilder<>();
+
+			}
+
+			/**
+			 * Creates a terminal builder for single-result Atlas Search reads.
+			 *
+			 * @return a single-result Atlas Search terminal builder
+			 */
+			public SearchFindQueryBuilder<S> find() {
+
+				return new SearchFindQueryBuilder<>();
+
+			}
+
+			/**
+			 * Creates a terminal builder for Atlas Search count reads.
+			 *
+			 * @return a count terminal builder
+			 */
+			public SearchCountQueryBuilder count() {
+
+				return new SearchCountQueryBuilder();
+
+			}
+
+			/**
+			 * Creates a terminal builder for Atlas Search existence checks.
+			 *
+			 * @return an exists terminal builder
+			 */
+			public SearchExistsQueryBuilder existsQuery() {
+
+				return new SearchExistsQueryBuilder();
+
+			}
+
+			/**
+			 * Verifies that a root Atlas Search operator has been configured.
+			 */
+			private void validateRootOperator() {
+
+				if (this.rootOperator == null) {
+					throw new IllegalStateException( "search operator is required" );
+
+				}
+
+			}
+
+			/**
+			 * Builds the body for a {@code $search} stage.
+			 *
+			 * @param includeCount
+			 *            whether the stage should include an Atlas Search {@code count}
+			 *            clause
+			 *
+			 * @return the rendered {@code $search} body
+			 */
+			private Document buildSearchStageBody(
+				boolean includeCount
+			) {
+
+				validateRootOperator();
+
+				Document body = new Document();
+
+				if (this.index != null && ! this.index.isBlank()) {
+					body.append( "index", this.index );
+
+				}
+
+				Document root = this.rootOperator.toDocument();
+
+				for (Map.Entry<String, Object> entry : root.entrySet()) {
+					body.append( entry.getKey(), entry.getValue() );
+
+				}
+
+				if (includeCount && this.searchCountType != null) {
+					body.append( "count", new Document( "type", this.searchCountType.getValue() ) );
+
+				}
+
+				if (this.searchAfterToken != null && ! this.searchAfterToken.isBlank()) {
+					body.append( "searchAfter", this.searchAfterToken );
+
+				}
+
+				if (this.searchBeforeToken != null && ! this.searchBeforeToken.isBlank()) {
+					body.append( "searchBefore", this.searchBeforeToken );
+
+				}
+
+				if (this.scoreDetails) {
+					body.append( "scoreDetails", true );
+
+				}
+
+				Document sortDoc = new Document();
+
+				for (SearchSortSpec<?> spec : this.searchSortSpecs) {
+					if (spec == null)
+						continue;
+					Document d = spec.toDocument();
+
+					for (Map.Entry<String, Object> entry : d.entrySet()) {
+						sortDoc.append( entry.getKey(), entry.getValue() );
+
+					}
+
+				}
+
+				if (! sortDoc.isEmpty()) {
+					body.append( "sort", sortDoc );
+
+				}
+
+				return body;
+
+			}
+
+			/**
+			 * Builds the body for a {@code $searchMeta} stage.
+			 * <p>This intentionally omits options that are specific to {@code $search}
+			 * result streaming such as sort, scoreDetails, searchAfter, and
+			 * searchBefore.</p>
+			 *
+			 * @param countType
+			 *            the Atlas Search count mode
+			 *
+			 * @return the rendered {@code $searchMeta} body
+			 */
+			private Document buildSearchMetaStageBody(
+				SearchCountType countType
+			) {
+
+				validateRootOperator();
+
+				Document body = new Document();
+
+				if (this.index != null && ! this.index.isBlank()) {
+					body.append( "index", this.index );
+
+				}
+
+				Document root = this.rootOperator.toDocument();
+
+				for (Map.Entry<String, Object> entry : root.entrySet()) {
+					body.append( entry.getKey(), entry.getValue() );
+
+				}
+
+				body.append( "count", new Document( "type", countType.getValue() ) );
+				return body;
+
+			}
+
+			/**
+			 * Builds the aggregation operations that should run after the Atlas Search
+			 * stage.
+			 *
+			 * @param postCriteria
+			 *            the optional post-search match criteria
+			 * @param includePaging
+			 *            whether paging stages should be appended
+			 * @param includeProjection
+			 *            whether exclude-based projection should be appended
+			 * @param includeCount
+			 *            whether Atlas Search's native count clause should be added to
+			 *            {@code $search}
+			 * @param includeMetaAdds
+			 *            whether metadata-based {@code $addFields} stages should be
+			 *            appended
+			 *
+			 * @return the aggregation operations
+			 */
+			private List<AggregationOperation> buildAggregationOps(
+				Optional<Criteria> postCriteria, boolean includePaging, boolean includeProjection, boolean includeCount, boolean includeMetaAdds
+			) {
+
+				List<AggregationOperation> ops = new ArrayList<>();
+
+				ops.add( ctx -> new Document( "$search", buildSearchStageBody( includeCount ) ) );
+
+				postCriteria.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+
+				if (includeMetaAdds && ! this.addFieldsDocs.isEmpty()) {
+					Document addFields = new Document();
+
+					for (Document d : this.addFieldsDocs) {
+						for (Map.Entry<String, Object> entry : d.entrySet()) {
+							addFields.append( entry.getKey(), entry.getValue() );
+
+						}
+
+					}
+
+					ops.add( ctx -> new Document( "$addFields", addFields ) );
+
+				}
+
+				if (includePaging && this.pageNumber != null && this.pageSize != null) {
+					ops.add( Aggregation.skip( (long) this.pageNumber * this.pageSize ) );
+					ops.add( Aggregation.limit( this.pageSize ) );
+
+				}
+
+				if (includeProjection && this.excludes != null && this.excludes.length > 0) {
+					ops.add( Aggregation.project().andExclude( this.excludes ) );
+
+				}
+
+				return ops;
+
+			}
+
+			/**
+			 * Executes the given aggregation operations and returns raw {@link Document}
+			 * results.
+			 *
+			 * @param entityClass
+			 *            the mapped entity type
+			 * @param ops
+			 *            the aggregation operations
+			 *
+			 * @return the raw aggregation result stream
+			 */
+			private Flux<Document> aggregateDocuments(
+				Class<?> entityClass, List<AggregationOperation> ops
+			) {
+
+				Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+
+				return (collectionName != null && ! collectionName.isBlank())
+					? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
+					: reactiveMongoTemplate.aggregate( agg, entityClass, Document.class );
+
+			}
+
+			/**
+			 * Strongly typed builder for the Atlas Search {@code compound} operator.
+			 *
+			 * @param <T>
+			 *            the current mapped entity type
+			 */
+			public class SearchCompoundBuilder<T extends E> {
+
+				private final List<AtlasSearchOperator> must = new ArrayList<>();
+
+				private final List<AtlasSearchOperator> mustNot = new ArrayList<>();
+
+				private final List<AtlasSearchOperator> should = new ArrayList<>();
+
+				private final List<AtlasSearchOperator> filter = new ArrayList<>();
+
+				private Integer minimumShouldMatch;
+
+				private SearchScoreSpec score;
+
+				/**
+				 * Sets the minimum number of {@code should} clauses that must match.
+				 *
+				 * @param minimumShouldMatch
+				 *            the minimum number of {@code should} clauses that must match
+				 *
+				 * @return this builder
+				 */
+				public SearchCompoundBuilder<T> minimumShouldMatch(
+					int minimumShouldMatch
+				) {
+
+					if (minimumShouldMatch < 0)
+						throw new IllegalArgumentException( "minimumShouldMatch must be >= 0" );
+					this.minimumShouldMatch = minimumShouldMatch;
+					return this;
+
+				}
+
+				/**
+				 * Sets the compound-level score specification.
+				 *
+				 * @param score
+				 *            the score specification
+				 *
+				 * @return this builder
+				 */
+				public SearchCompoundBuilder<T> score(
+					SearchScoreSpec score
+				) {
+
+					this.score = score;
+					return this;
+
+				}
+
+				/**
+				 * Adds a raw operator to the {@code must} clause.
+				 *
+				 * @param operator
+				 *            the operator
+				 *
+				 * @return this builder
+				 */
+				public SearchCompoundBuilder<T> must(
+					AtlasSearchOperator operator
+				) {
+
+					this.must.add( operator );
+					return this;
+
+				}
+
+				/**
+				 * Adds a raw operator to the {@code mustNot} clause.
+				 *
+				 * @param operator
+				 *            the operator
+				 *
+				 * @return this builder
+				 */
+				public SearchCompoundBuilder<T> mustNot(
+					AtlasSearchOperator operator
+				) {
+
+					this.mustNot.add( operator );
+					return this;
+
+				}
+
+				/**
+				 * Adds a raw operator to the {@code should} clause.
+				 *
+				 * @param operator
+				 *            the operator
+				 *
+				 * @return this builder
+				 */
+				public SearchCompoundBuilder<T> should(
+					AtlasSearchOperator operator
+				) {
+
+					this.should.add( operator );
+					return this;
+
+				}
+
+				/**
+				 * Adds a raw operator to the {@code filter} clause.
+				 *
+				 * @param operator
+				 *            the operator
+				 *
+				 * @return this builder
+				 */
+				public SearchCompoundBuilder<T> filter(
+					AtlasSearchOperator operator
+				) {
+
+					this.filter.add( operator );
+					return this;
+
+				}
+
+				/**
+				 * Adds a typed {@code text} operator to {@code must}.
+				 *
+				 * @param path
+				 *            the search path
+				 * @param spec
+				 *            the operator configuration callback
+				 * @param <K2>
+				 *            the logical path type
+				 *
+				 * @return this builder
+				 */
+				public <K2> SearchCompoundBuilder<T> mustText(
+					K2 path, Consumer<TextSearchSpec<K2>> spec
+				) {
+
+					TextSearchSpec<K2> op = SearchOperators.<K2>text().path( path );
+					spec.accept( op );
+					return must( op );
+
+				}
+
+				/**
+				 * Adds a typed {@code text} operator to {@code should}.
+				 *
+				 * @param path
+				 *            the search path
+				 * @param spec
+				 *            the operator configuration callback
+				 * @param <K2>
+				 *            the logical path type
+				 *
+				 * @return this builder
+				 */
+				public <K2> SearchCompoundBuilder<T> shouldText(
+					K2 path, Consumer<TextSearchSpec<K2>> spec
+				) {
+
+					TextSearchSpec<K2> op = SearchOperators.<K2>text().path( path );
+					spec.accept( op );
+					return should( op );
+
+				}
+
+				/**
+				 * Adds a typed {@code text} operator to {@code filter}.
+				 *
+				 * @param path
+				 *            the search path
+				 * @param spec
+				 *            the operator configuration callback
+				 * @param <K2>
+				 *            the logical path type
+				 *
+				 * @return this builder
+				 */
+				public <K2> SearchCompoundBuilder<T> filterText(
+					K2 path, Consumer<TextSearchSpec<K2>> spec
+				) {
+
+					TextSearchSpec<K2> op = SearchOperators.<K2>text().path( path );
+					spec.accept( op );
+					return filter( op );
+
+				}
+
+				/**
+				 * Adds a typed {@code phrase} operator to {@code must}.
+				 *
+				 * @param path
+				 *            the search path
+				 * @param spec
+				 *            the operator configuration callback
+				 * @param <K2>
+				 *            the logical path type
+				 *
+				 * @return this builder
+				 */
+				public <K2> SearchCompoundBuilder<T> mustPhrase(
+					K2 path, Consumer<PhraseSearchSpec<K2>> spec
+				) {
+
+					PhraseSearchSpec<K2> op = SearchOperators.<K2>phrase().path( path );
+					spec.accept( op );
+					return must( op );
+
+				}
+
+				/**
+				 * Adds a typed {@code autocomplete} operator to {@code should}.
+				 *
+				 * @param path
+				 *            the search path
+				 * @param spec
+				 *            the operator configuration callback
+				 * @param <K2>
+				 *            the logical path type
+				 *
+				 * @return this builder
+				 */
+				public <K2> SearchCompoundBuilder<T> shouldAutocomplete(
+					K2 path, Consumer<AutocompleteSearchSpec<K2>> spec
+				) {
+
+					AutocompleteSearchSpec<K2> op = SearchOperators.<K2>autocomplete().path( path );
+					spec.accept( op );
+					return should( op );
+
+				}
+
+				/**
+				 * Adds a typed {@code equals} operator to {@code filter}.
+				 *
+				 * @param path
+				 *            the search path
+				 * @param spec
+				 *            the operator configuration callback
+				 * @param <K2>
+				 *            the logical path type
+				 *
+				 * @return this builder
+				 */
+				public <K2> SearchCompoundBuilder<T> filterEquals(
+					K2 path, Consumer<EqualsClause<K2>> spec
+				) {
+
+					EqualsClause<K2> op = SearchOperators.<K2>equals().path( path );
+					spec.accept( op );
+					return filter( op );
+
+				}
+
+				/**
+				 * Adds a typed {@code in} operator to {@code filter}.
+				 *
+				 * @param path
+				 *            the search path
+				 * @param spec
+				 *            the operator configuration callback
+				 * @param <K2>
+				 *            the logical path type
+				 *
+				 * @return this builder
+				 */
+				public <K2> SearchCompoundBuilder<T> filterIn(
+					K2 path, Consumer<InClause<K2>> spec
+				) {
+
+					InClause<K2> op = SearchOperators.<K2>in().path( path );
+					spec.accept( op );
+					return filter( op );
+
+				}
+
+				/**
+				 * Adds a typed {@code range} operator to {@code filter}.
+				 *
+				 * @param path
+				 *            the search path
+				 * @param spec
+				 *            the operator configuration callback
+				 * @param <K2>
+				 *            the logical path type
+				 *
+				 * @return this builder
+				 */
+				public <K2> SearchCompoundBuilder<T> filterRange(
+					K2 path, Consumer<RangeSearchOperator<K2>> spec
+				) {
+
+					RangeSearchOperator<K2> op = SearchOperators.<K2>range().path( path );
+					spec.accept( op );
+					return filter( op );
+
+				}
+
+				/**
+				 * Adds an {@code exists} operator to {@code mustNot}.
+				 *
+				 * @param path
+				 *            the search path
+				 * @param <K2>
+				 *            the logical path type
+				 *
+				 * @return this builder
+				 */
+				public <K2> SearchCompoundBuilder<T> mustNotExists(
+					K2 path
+				) {
+
+					return mustNot( SearchOperators.<K2>exists().path( path ) );
+
+				}
+
+				/**
+				 * Builds the final {@code compound} operator.
+				 *
+				 * @return the rendered root operator
+				 */
+				AtlasSearchOperator build() {
+
+					Document body = new Document();
+
+					appendOperators( body, "must", this.must );
+					appendOperators( body, "mustNot", this.mustNot );
+					appendOperators( body, "should", this.should );
+					appendOperators( body, "filter", this.filter );
+
+					if (this.minimumShouldMatch != null) {
+						body.append( "minimumShouldMatch", this.minimumShouldMatch );
+
+					}
+
+					if (this.score != null) {
+						body.append( "score", this.score.toDocument() );
+
+					}
+
+					if (body.isEmpty()) {
+						throw new IllegalStateException( "compound requires at least one clause" );
+
+					}
+
+					return new AtlasSearchOperator() {
+
+						@Override
+						public String operatorName() {
+
+							return "compound";
+
+						}
+
+						@Override
+						public Document toDocument() {
+
+							return new Document( "compound", new Document( body ) );
+
+						}
+
+					};
+
+				}
+
+				/**
+				 * Appends Atlas Search operators to a compound clause array.
+				 *
+				 * @param target
+				 *            the compound body
+				 * @param key
+				 *            the clause key
+				 * @param operators
+				 *            the operators to append
+				 */
+				private void appendOperators(
+					Document target, String key, List<AtlasSearchOperator> operators
+				) {
+
+					if (operators == null || operators.isEmpty())
+						return;
+
+					List<Document> docs = operators
+						.stream()
+						.filter( Objects::nonNull )
+						.map( AtlasSearchOperator::toDocument )
+						.collect( Collectors.toList() );
+
+					if (! docs.isEmpty()) {
+						target.append( key, docs );
+
+					}
+
+				}
+
+			}
+
+			/**
+			 * Terminal builder for multi-result Atlas Search reads.
+			 *
+			 * @param <T>
+			 *            the current mapped entity type
+			 */
+			public class SearchFindAllQueryBuilder<T extends E> {
+
+				/**
+				 * Executes the Atlas Search query and maps all matching documents to the
+				 * current entity type.
+				 *
+				 * @return a {@link Flux} emitting the mapped search results
+				 */
+				public Flux<E> execute() {
+
+					return Mono
+						.zip( executeClassMono, postFilterBuilder.buildCriteria() )
+						.flatMapMany( tuple -> {
+							Class<E> entityClass = tuple.getT1();
+							Optional<Criteria> criteriaOpt = tuple.getT2();
+							List<AggregationOperation> ops = buildAggregationOps(
+								criteriaOpt,
+								true,
+								true,
+								searchCountType != null,
+								true
+							);
+							return aggregateDocuments( entityClass, ops )
+								.map( doc -> reactiveMongoTemplate.getConverter().read( entityClass, doc ) );
+
+						} );
+
+				}
+
+				/**
+				 * Executes the Atlas Search query and collects both the current page data and
+				 * the total pipeline result count.
+				 *
+				 * @return a {@link Mono} emitting the paged result
+				 */
+				public Mono<PageResult<E>> executePage() {
+
+					Mono<List<E>> dataMono = execute().collectList();
+					Mono<Long> totalMono = count().execute();
+					return Mono.zip( dataMono, totalMono ).map( tuple -> new PageResult<>( tuple.getT1(), tuple.getT2() ) );
+
+				}
+
+			}
+
+			/**
+			 * Terminal builder for single-result Atlas Search reads.
+			 *
+			 * @param <T>
+			 *            the current mapped entity type
+			 */
+			public class SearchFindQueryBuilder<T extends E> {
+
+				/**
+				 * Executes the Atlas Search query and returns at most one mapped entity.
+				 *
+				 * @return a {@link Mono} emitting the mapped search result
+				 */
+				public Mono<E> execute() {
+
+					return executeFirst();
+
+				}
+
+				/**
+				 * Executes the Atlas Search query and returns the first mapped entity.
+				 *
+				 * @return a {@link Mono} emitting the first mapped search result
+				 */
+				public Mono<E> executeFirst() {
+
+					Integer oldPageNumber = pageNumber;
+					Integer oldPageSize = pageSize;
+
+					pageNumber = 0;
+					pageSize = 1;
+
+					return new SearchFindAllQueryBuilder<T>()
+						.execute()
+						.next()
+						.doFinally( st -> {
+							pageNumber = oldPageNumber;
+							pageSize = oldPageSize;
+
+						} );
+
+				}
+
+			}
+
+			/**
+			 * Terminal builder for Atlas Search count reads.
+			 */
+			public class SearchCountQueryBuilder {
+
+				/**
+				 * Counts the final pipeline results produced by {@code $search} followed by
+				 * post-search filtering.
+				 * <p>This is intentionally different from
+				 * {@link #executeSearchMeta()}, which asks Atlas Search itself to return the
+				 * search metadata count.</p>
+				 *
+				 * @return a {@link Mono} emitting the final pipeline result count
+				 */
+				public Mono<Long> execute() {
+
+					return Mono
+						.zip( executeClassMono, postFilterBuilder.buildCriteria() )
+						.flatMap( tuple -> {
+							Class<E> entityClass = tuple.getT1();
+							Optional<Criteria> criteriaOpt = tuple.getT2();
+
+							List<AggregationOperation> ops = buildAggregationOps(
+								criteriaOpt,
+								false,
+								false,
+								searchCountType != null,
+								false
+							);
+
+							ops.add( ctx -> new Document( "$count", "count" ) );
+
+							return aggregateDocuments( entityClass, ops )
+								.next()
+								.map( d -> Optional.ofNullable( d.get( "count", Number.class ) ).map( Number::longValue ).orElse( 0L ) )
+								.defaultIfEmpty( 0L );
+
+						} );
+
+				}
+
+				/**
+				 * Requests the Atlas Search metadata count using {@code $searchMeta}.
+				 * <p>This count is produced by Atlas Search itself and therefore does not run
+				 * post-search {@code fields(...)} as a normal aggregation {@code $match}.</p>
+				 *
+				 * @return a {@link Mono} emitting the Atlas Search metadata count
+				 */
+				public Mono<Long> executeSearchMeta() {
+
+					validateRootOperator();
+
+					SearchCountType countType = (searchCountType == null)
+						? SearchCountType.TOTAL
+						: searchCountType;
+
+					return executeClassMono.flatMap( entityClass -> {
+						Document body = buildSearchMetaStageBody( countType );
+						Aggregation agg = applyAggOptions(
+							Aggregation.newAggregation( ctx -> new Document( "$searchMeta", body ) )
+						);
+
+						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
+							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
+							: reactiveMongoTemplate.aggregate( agg, entityClass, Document.class );
+
+						return docs
+							.next()
+							.map( d -> {
+								Document count = d.get( "count", Document.class );
+
+								if (count == null)
+									return 0L;
+
+								Number total = count.get( "total", Number.class );
+
+								if (total != null)
+									return total.longValue();
+
+								Number lowerBound = count.get( "lowerBound", Number.class );
+								return lowerBound == null ? 0L : lowerBound.longValue();
+
+							} )
+							.defaultIfEmpty( 0L );
+
+					} );
+
+				}
+
+			}
+
+			/**
+			 * Terminal builder for Atlas Search existence checks.
+			 */
+			public class SearchExistsQueryBuilder {
+
+				/**
+				 * Returns whether the Atlas Search query yields at least one final pipeline
+				 * result.
+				 *
+				 * @return a {@link Mono} emitting {@code true} when at least one result exists
+				 */
+				public Mono<Boolean> execute() {
+
+					return count().execute().map( count -> count > 0L );
+
+				}
+
+			}
+
+		}
+
 
 		/**
 		 * Builder for multi-result queries with optional sorting, paging, field exclusion,
