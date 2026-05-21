@@ -23,225 +23,11 @@ There are now **two distinct entry flows**:
 3. Switch to terminal query builders with `end()`
 4. Execute with `find()`, `findAll()`, `count()`, `delete()`, `exists()`, `atomicUpdate()`
 
-#### Atlas Search flow
-
-`execute* -> search([index]) -> <search clauses + post-filter> -> find/findAll/count/existsQuery`
-
-Atlas Search is intentionally separated because `$search` / `$searchMeta` must be the **first stage** in the pipeline, and `$search` cannot be placed inside `$facet`. That makes Atlas Search a different execution path from ordinary `fields(...).end()` style queries.
-
-### 3) Conditions and clause naming
-
-- Ordinary Mongo filtering is expressed with `FieldsPair` (+ `Condition`)
-- Atlas Search filtering is expressed with **strongly typed search clauses**
-
-The Atlas Search types use the following names:
-
-- `TextClause`
-- `PhraseClause`
-- `AutocompleteClause`
-- `EqualsClause`
-- `ExistsClause`
-- `InClause`
-- `RangeClause`
-- `SearchScoreSpec`
-
-The term **Clause** is used intentionally: these types represent **search-query clauses** that become part of the final `$search` body. They are not generic config bags, and they intentionally avoid a raw `Object`-centric public API.
-
----
-
-## Requirements
-
-- Java 17+
-- Spring Data MongoDB Reactive / Project Reactor
-- MongoDB Atlas Search index (or MongoDB Search-compatible deployment for supported environments)
-
----
-
-## Quick start
-
-### 1) Implement `MongoTemplateResolver`
-
-```java
-import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
-import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
-import org.springframework.transaction.reactive.TransactionalOperator;
-
-public enum MongoTemplateName { FRONT, BACK }
-
-public class MyMongoTemplateResolver implements MongoTemplateResolver<MongoTemplateName> {
-  private final ReactiveMongoTemplate front;
-  private final ReactiveMongoTemplate back;
-  private final TransactionalOperator frontTx;
-  private final TransactionalOperator backTx;
-
-  public MyMongoTemplateResolver(
-      ReactiveMongoTemplate front,
-      ReactiveMongoTemplate back,
-      TransactionalOperator frontTx,
-      TransactionalOperator backTx
-  ) {
-    this.front = front;
-    this.back = back;
-    this.frontTx = frontTx;
-    this.backTx = backTx;
-  }
-
-  @Override
-  public ReactiveMongoTemplate getTemplate(MongoTemplateName key) {
-    return (key == MongoTemplateName.BACK) ? back : front;
-  }
-
-  @Override
-  public TransactionalOperator getTxOperator(MongoTemplateName key) {
-    return (key == MongoTemplateName.BACK) ? backTx : frontTx;
-  }
-}
-```
-
-```java
-@Configuration
-public class ReactiveMongoDslConfig {
-
-  @Bean
-  public ReactiveMongoDsl<MongoTemplateName> mongoQueryBuilder(
-      MongoTemplateResolver<MongoTemplateName> resolver
-  ) {
-    return new ReactiveMongoDsl<>(resolver);
-  }
-}
-```
-
----
-
-## Basic Mongo queries
-
-### findAll / find
-
-```java
-import static com.byeolnaerim.mongodsl.criteria.FieldsPair.pair;
-import static com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition.*;
-
-Flux<User> users =
-  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-     .fields(
-        pair("status", "ACTIVE"),
-        pair("age", 20, gte),
-        pair("name", "kim", like)
-     )
-     .end()
-     .findAll()
-     .execute();
-
-Mono<User> one =
-  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-     .fields(pair("_id", userId))
-     .end()
-     .find()
-     .execute();
-```
-
-### Grouping AND / OR / NOT
-
-```java
-Flux<User> users =
-  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-     .fields()
-       .and(f -> f.fields(
-           pair("status", List.of("ACTIVE_1", "ACTIVE_2"), in),
-           pair("age", 20, gte)
-       ))
-       .or(f -> f.fields(
-           pair("name", "kim", like),
-           pair("name", "lee", like)
-       ))
-       .notAny(f -> f.fields(
-           pair("banned", true)
-       ))
-     .end()
-     .findAll()
-     .execute();
-```
-
-### Paging + total count via aggregation
-
-```java
-import org.springframework.data.domain.Sort.Order;
-
-Mono<PageResult<User>> page =
-  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-     .fields(pair("status", "ACTIVE"))
-     .end()
-     .findAll()
-       .paging(0, 20)
-       .sorts(Order.desc("_id"))
-     .executeAggregation();
-```
-
----
-
-## `$lookup` joins
-
-### Build join conditions with `LookupSpec`
-
-```java
-import com.byeolnaerim.mongodsl.lookup.LookupSpec;
-import static com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition.*;
-
-LookupSpec spec = LookupSpec.builder()
-  .as("orders")
-  .bindConditionFields("_id", eq, "userId")
-  .bindConditionConst("DONE", eq, "status")
-  .limit(10)
-  .build();
-```
-
-### Execute lookup
-
-```java
-var left = dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-  .fields(pair("status", "ACTIVE"))
-  .end()
-  .findAll()
-  .paging(0, 20);
-
-var right = dsl.executeEntity(Order.class, MongoTemplateName.FRONT)
-  .fields(pair("status", "DONE"))
-  .end()
-  .findAll();
-
-Flux<ResultTuple<User, List<Order>>> joined =
-  left.executeLookup(right, spec);
-```
-
----
-
-## Atomic updates
-
-`atomicUpdate()` supports both classic **document updates** (`Update`) and **pipeline updates** (`AggregationUpdate`).
-
-```java
-Mono<UpdateResult> updated =
-  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-     .fields(pair("_id", userId))
-     .end()
-     .atomicUpdate()
-       .first()
-       .inc("loginCount", 1)
-       .set("lastLoginAt", Instant.now())
-     .execute();
-```
-
-### Auditing note
-
-Spring Data auditing annotations such as `@CreatedDate` / `@LastModifiedDate` are not automatically applied when you use `atomicUpdate()` because this path performs update operations directly instead of save/insert entity flows.
-
-Set audit fields explicitly when needed.
-
----
+###
 
 # Atlas Search
 
-## Search builder overview
+## SearchBuilder overview
 
 Entry points:
 
@@ -265,6 +51,9 @@ Root search styles:
 Post-search features:
 
 - `fields(...)` for **post-search ordinary Mongo `$match`**
+- `highlight(SearchHighlightSpec)`
+- `highlight(spec -> ... )`
+- `addFieldsHighlights()`
 - `addFieldsScore()`
 - `addFieldsScoreDetails()`
 - `addFieldsSequenceToken()`
@@ -333,32 +122,6 @@ Flux<Article> results =
      .findAll()
      .execute();
 ```
-
----
-
-## Search path philosophy
-
-Atlas Search paths use the same philosophy as the rest of the DSL: callers can provide **enum paths or string paths**, and the DSL resolves them internally.
-
-That is what `SearchPathResolver` does.
-
-```java
-public enum ArticleField {
-  title,
-  titleAutocomplete,
-  status,
-  publishedAt,
-  scoreWeight
-}
-```
-
-```java
-TextClause<ArticleField> clause = SearchOperators.<ArticleField>text()
-    .path(ArticleField.title)
-    .query("mongodb");
-```
-
-This mirrors the same idea already used by `FieldsPair`: keep the public API strongly typed and expressive, and only convert to `Document` at render time.
 
 ---
 
@@ -489,7 +252,7 @@ Flux<Article> suggest =
 
 ### Important note
 
-This DSL intentionally exposes only **single-path** `path(...)` for `AutocompleteClause`, because the implementation treats autocomplete as a single-path operator.
+This DSL intentionally exposes only **single-path** `path(...)` for `AutocompleteClause`, because the current implementation treats autocomplete as a single-path operator.
 
 ---
 
@@ -661,7 +424,7 @@ SearchScoreSpec score = SearchScoreSpec.function(fn -> fn
     .add(expr -> expr
         .scoreRelevance()
         .expression(nested -> nested.gauss(
-            ArticleField.recencyWeight,
+            ArticleField.scoreWeight,
             0.0,
             7.0,
             0.0,
@@ -747,6 +510,64 @@ Flux<Article> results =
 
 Use `compound.filter(...)` when the condition should stay **inside the Atlas Search clause model**.
 Use `search().fields(...)` when you intentionally want a **plain Mongo `$match` after `$search`**.
+
+---
+
+## Highlighting
+
+Highlighting is modeled as a **stage-level option** on `SearchBuilder`, not as part of a specific clause.
+That matches how Atlas Search defines `highlight`: it lives directly under `$search`, and you later expose the result with `$meta: "searchHighlights"`.
+
+### Available API
+
+- `highlight(SearchHighlightSpec)`
+- `highlight(spec -> ...)`
+- `addFieldsHighlights()`
+- `addFieldsHighlights(String alias)`
+
+### `SearchHighlightSpec`
+
+`SearchHighlightSpec` currently supports:
+
+- `builder().path(path)`
+- `builder().paths(path1, path2, ...)`
+- `builder().paths(Collection<K>)`
+- `builder().maxCharsToExamine(int)`
+- `builder().maxNumPassages(int)`
+
+### Example
+
+```java
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .search("articles_default")
+     .text(t -> t
+         .path(ArticleField.title)
+         .query("atlas search")
+     )
+     .highlight(h -> h
+         .paths(ArticleField.title, ArticleField.summary)
+         .maxCharsToExamine(200_000)
+         .maxNumPassages(3)
+     )
+     .addFieldsHighlights()
+     .addFieldsScore()
+     .findAll()
+     .execute();
+```
+
+### Result shape note
+
+`addFieldsHighlights()` simply exposes Atlas Search metadata as a normal field on the output document.
+If your mapped entity doesn't have a matching property, either:
+
+- add a property to the mapped type,
+- map to a projection/custom class, or
+- omit `addFieldsHighlights()` and keep the entity mapping clean.
+
+### Design note
+
+`count().executeSearchMeta()` uses `$searchMeta` and does **not** include stage-level highlight output. Highlighting is only part of the `$search` stage path.
 
 ---
 
@@ -883,7 +704,300 @@ This is intentionally named `existsQuery()` to distinguish it from the ordinary 
 
 ---
 
+# Vector Search
+
+## VectorSearchBuilder overview
+
+Entry point:
+
+```java
+vectorSearch("indexName")
+```
+
+This flow is intentionally separated from both the classic Mongo flow and the Atlas Search flow because `$vectorSearch` is a distinct pipeline stage with its own constraints and options.
+
+### Available builder methods
+
+Core vector-search options:
+
+- `path(K path)`
+- `queryVector(VectorQueryVector)`
+- `queryVector(float[] values)`
+- `queryVector(double[] values)`
+- `queryVector(Collection<Double> values)`
+- `queryText(String queryText)`
+- `limit(long limit)`
+- `numCandidates(long numCandidates)`
+- `exact(boolean)`
+- `exact()`
+- `approximate(long numCandidates)`
+
+Filtering / shaping:
+
+- `filterFields(...)` for **pre-filtering inside `$vectorSearch.filter`**
+- `filter(block -> ...)` for nested pre-filter composition with the normal `FieldBuilder`
+- `fields(...)` for **post-stage ordinary Mongo `$match`**
+- `addFieldsVectorSearchScore()`
+- `addFieldsVectorSearchScore(String alias)`
+- `excludes(...)`
+
+Terminal builders:
+
+- `findAll().execute()`
+- `find().execute()` / `find().executeFirst()`
+- `count().execute()`
+- `existsQuery().execute()`
+
+### Important difference from `search()`
+
+`vectorSearch()` does **not** currently expose:
+
+- `executePage()`
+- metadata count like `$searchMeta`
+- sequence-token paging
+- built-in sort customization
+
+The current vector path is intentionally minimal and aligned with the actual code in `VectorSearchBuilder`.
+
+---
+
+## `VectorQueryVector`
+
+`VectorQueryVector` is the DSL wrapper for the query embedding.
+
+Available factories:
+
+- `VectorQueryVector.ofFloatArray(float[])`
+- `VectorQueryVector.ofDoubleArray(double[])`
+- `VectorQueryVector.ofDoubleList(Collection<Double>)`
+
+The public API intentionally stays independent from driver-specific vector classes.
+The builder currently renders a BSON-ready `List<Double>` at stage-build time.
+
+### Example
+
+```java
+float[] embedding = embeddingService.embed("reactive mongo dsl");
+
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .addFieldsVectorSearchScore()
+     .findAll()
+     .execute();
+```
+
+---
+
+## Query by text for auto-embedding indexes
+
+When your vector index/query path is designed to accept text input, the current DSL also supports:
+
+```java
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryText("reactive mongo dsl")
+     .limit(10)
+     .approximate(200)
+     .addFieldsVectorSearchScore()
+     .findAll()
+     .execute();
+```
+
+`queryVector(...)` and `queryText(...)` are mutually exclusive in the current implementation.
+
+---
+
+## ANN vs ENN
+
+The current DSL models vector-search mode like this:
+
+### ANN
+
+```java
+Flux<Article> ann =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .numCandidates(200)
+     .findAll()
+     .execute();
+```
+
+Or equivalently:
+
+```java
+.approximate(200)
+```
+
+### ENN
+
+```java
+Flux<Article> enn =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .exact()
+     .findAll()
+     .execute();
+```
+
+Validation rules in the current code:
+
+- `index` is required
+- `path` is required
+- `limit` is required
+- either `queryVector(...)` or `queryText(...)` is required
+- for ANN mode, `numCandidates(...)` is required
+
+---
+
+## Pre-filter vs post-filter in vector search
+
+This distinction matters just as much as in Atlas Search.
+
+### Pre-filter: `$vectorSearch.filter`
+
+Use `filterFields(...)` or `filter(...)` when you want the condition rendered into the vector-search stage itself.
+
+```java
+Flux<Article> filtered =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .filterFields(
+         pair("status", "PUBLISHED"),
+         pair("deleted", false)
+     )
+     .findAll()
+     .execute();
+```
+
+Nested pre-filter composition is also supported:
+
+```java
+Flux<Article> filtered =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .filter(f -> f
+         .and(x -> x.fields(
+             pair("status", "PUBLISHED"),
+             pair("deleted", false)
+         ))
+         .or(x -> x.fields(
+             pair("category", "JAVA"),
+             pair("category", "MONGODB")
+         ))
+     )
+     .findAll()
+     .execute();
+```
+
+### Post-filter: ordinary aggregation `$match`
+
+Use `fields(...)` on `VectorSearchBuilder` when you intentionally want a normal Mongo `$match` **after** `$vectorSearch`.
+
+```java
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .fields(
+         pair("visible", true)
+     )
+     .findAll()
+     .execute();
+```
+
+---
+
+## Vector score metadata
+
+Expose the vector-search similarity score with:
+
+- `addFieldsVectorSearchScore()`
+- `addFieldsVectorSearchScore(String alias)`
+
+### Example
+
+```java
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .addFieldsVectorSearchScore("score")
+     .findAll()
+     .execute();
+```
+
+As with `addFieldsHighlights()`, make sure your mapped result type can actually accept the additional field if you expect it to be populated after mapping.
+
+---
+
+## Vector count semantics
+
+Vector count is intentionally narrower than Atlas Search metadata count.
+
+```java
+Mono<Long> count =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .count()
+     .execute();
+```
+
+This counts the documents returned by the **current pipeline output** after `$vectorSearch`, so it is effectively bounded by your configured `limit` and any post-stage `fields(...)` filtering.
+
+It is **not** a corpus-wide metadata count.
+
+---
+
+## Vector exists terminal
+
+```java
+Mono<Boolean> exists =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(1)
+     .exact()
+     .existsQuery()
+     .execute();
+```
+
+---
+
 ## Notes and limitations
+
+### Atlas Search
 
 - Atlas Search requires a matching Search index for the fields you query.
 - `$search` and `$searchMeta` must be the first stage in their pipelines.
@@ -892,6 +1006,17 @@ This is intentionally named `existsQuery()` to distinguish it from the ordinary 
 - `TextClause` currently rejects `fuzzy + synonyms` together.
 - `count().execute()` and `count().executeSearchMeta()` serve different purposes; choose carefully.
 - If you need deterministic ordering, do not rely on score alone.
+- Highlighting is stage-level and only participates in the `$search` path, not the `$searchMeta` count path.
+
+### Vector Search
+
+- `vectorSearch("indexName")` currently requires an explicit index name.
+- `$vectorSearch` must be the first stage of the pipeline.
+- `$vectorSearch` can't be used inside `$facet` or inside a `$lookup` sub-pipeline.
+- ANN mode requires `numCandidates(...)`.
+- `count()` only counts the limited pipeline output; there is no metadata count terminal today.
+- There is no built-in page token, `executePage()`, or sort DSL for vector search in the current implementation.
+- For advanced analyzed text filtering together with vectors, this DSL currently keeps that concern separate rather than trying to blend it into a single stage.
 
 ---
 
@@ -910,3 +1035,6 @@ When in doubt, keep this rule in mind:
 - use `FieldsPair` / `fields(...).end()` for ordinary Mongo querying
 - use `search(...)` for Atlas Search querying
 - use `search().fields(...)` only when you intentionally want a **post-search** ordinary `$match`
+- use `vectorSearch(...)` for MongoDB Vector Search querying
+- use `vectorSearch().filter(...)` / `filterFields(...)` for stage-level vector pre-filters
+- use `vectorSearch().fields(...)` only when you intentionally want a **post-vector-search** ordinary `$match`

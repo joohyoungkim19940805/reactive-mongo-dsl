@@ -22,223 +22,7 @@ Spring Data **ReactiveMongoTemplate** 기반으로, **동적 Criteria / Aggregat
 3. `end()`로 terminal query builder 전환
 4. `find()`, `findAll()`, `count()`, `delete()`, `exists()`, `atomicUpdate()` 실행
 
-#### Atlas Search 흐름
-
-`execute* -> search([index]) -> <search clause + post-filter> -> find/findAll/count/existsQuery`
-
-Atlas Search는 일반 `fields(...).end()` 흐름과 분리되어 있습니다.
-그 이유는 `$search` / `$searchMeta`가 **반드시 파이프라인 첫 stage**여야 하고, `$search`는 `$facet` 내부에 들어갈 수 없기 때문입니다.
-
-### 3) 조건 표현 방식
-
-- 일반 Mongo 조건은 `FieldsPair` (+ `Condition`) 로 표현합니다.
-- Atlas Search 조건은 **강타입 search clause**로 표현합니다.
-
-Atlas Search 관련 타입 이름은 다음과 같습니다.
-
-- `TextClause`
-- `PhraseClause`
-- `AutocompleteClause`
-- `EqualsClause`
-- `ExistsClause`
-- `InClause`
-- `RangeClause`
-- `SearchScoreSpec`
-
-여기서 **Clause** 라는 이름을 쓴 이유는, 이 타입들이 단순 설정 객체가 아니라 **최종 `$search` 본문을 구성하는 검색 절**이기 때문입니다.
-
----
-
-## 요구사항
-
-- Java 17+
-- Spring Data MongoDB Reactive / Project Reactor
-- Atlas Search 인덱스(또는 MongoDB Search 호환 환경)
-
----
-
-## 빠른 시작
-
-### 1) `MongoTemplateResolver` 구현 예시
-
-```java
-import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
-import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
-import org.springframework.transaction.reactive.TransactionalOperator;
-
-public enum MongoTemplateName { FRONT, BACK }
-
-public class MyMongoTemplateResolver implements MongoTemplateResolver<MongoTemplateName> {
-  private final ReactiveMongoTemplate front;
-  private final ReactiveMongoTemplate back;
-  private final TransactionalOperator frontTx;
-  private final TransactionalOperator backTx;
-
-  public MyMongoTemplateResolver(
-      ReactiveMongoTemplate front,
-      ReactiveMongoTemplate back,
-      TransactionalOperator frontTx,
-      TransactionalOperator backTx
-  ) {
-    this.front = front;
-    this.back = back;
-    this.frontTx = frontTx;
-    this.backTx = backTx;
-  }
-
-  @Override
-  public ReactiveMongoTemplate getTemplate(MongoTemplateName key) {
-    return (key == MongoTemplateName.BACK) ? back : front;
-  }
-
-  @Override
-  public TransactionalOperator getTxOperator(MongoTemplateName key) {
-    return (key == MongoTemplateName.BACK) ? backTx : frontTx;
-  }
-}
-```
-
-```java
-@Configuration
-public class ReactiveMongoDslConfig {
-
-  @Bean
-  public ReactiveMongoDsl<MongoTemplateName> mongoQueryBuilder(
-      MongoTemplateResolver<MongoTemplateName> resolver
-  ) {
-    return new ReactiveMongoDsl<>(resolver);
-  }
-}
-```
-
----
-
-## 기본 Mongo 조회
-
-### findAll / find
-
-```java
-import static com.byeolnaerim.mongodsl.criteria.FieldsPair.pair;
-import static com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition.*;
-
-Flux<User> users =
-  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-     .fields(
-        pair("status", "ACTIVE"),
-        pair("age", 20, gte),
-        pair("name", "kim", like)
-     )
-     .end()
-     .findAll()
-     .execute();
-
-Mono<User> one =
-  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-     .fields(pair("_id", userId))
-     .end()
-     .find()
-     .execute();
-```
-
-### AND / OR / NOT 그룹핑
-
-```java
-Flux<User> users =
-  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-     .fields()
-       .and(f -> f.fields(
-           pair("status", List.of("ACTIVE_1", "ACTIVE_2"), in),
-           pair("age", 20, gte)
-       ))
-       .or(f -> f.fields(
-           pair("name", "kim", like),
-           pair("name", "lee", like)
-       ))
-       .notAny(f -> f.fields(
-           pair("banned", true)
-       ))
-     .end()
-     .findAll()
-     .execute();
-```
-
-### 페이징 + total count
-
-```java
-import org.springframework.data.domain.Sort.Order;
-
-Mono<PageResult<User>> page =
-  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-     .fields(pair("status", "ACTIVE"))
-     .end()
-     .findAll()
-       .paging(0, 20)
-       .sorts(Order.desc("_id"))
-     .executeAggregation();
-```
-
----
-
-## `$lookup` 조인
-
-### `LookupSpec` 구성
-
-```java
-import com.byeolnaerim.mongodsl.lookup.LookupSpec;
-import static com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition.*;
-
-LookupSpec spec = LookupSpec.builder()
-  .as("orders")
-  .bindConditionFields("_id", eq, "userId")
-  .bindConditionConst("DONE", eq, "status")
-  .limit(10)
-  .build();
-```
-
-### 실행
-
-```java
-var left = dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-  .fields(pair("status", "ACTIVE"))
-  .end()
-  .findAll()
-  .paging(0, 20);
-
-var right = dsl.executeEntity(Order.class, MongoTemplateName.FRONT)
-  .fields(pair("status", "DONE"))
-  .end()
-  .findAll();
-
-Flux<ResultTuple<User, List<Order>>> joined =
-  left.executeLookup(right, spec);
-```
-
----
-
-## 원자적 업데이트
-
-`atomicUpdate()`는 일반 **document update** (`Update`) 와 **pipeline update** (`AggregationUpdate`) 를 둘 다 지원합니다.
-
-```java
-Mono<UpdateResult> updated =
-  dsl.executeEntity(User.class, MongoTemplateName.FRONT)
-     .fields(pair("_id", userId))
-     .end()
-     .atomicUpdate()
-       .first()
-       .inc("loginCount", 1)
-       .set("lastLoginAt", Instant.now())
-     .execute();
-```
-
-### Auditing 주의사항
-
-`atomicUpdate()`는 엔티티 save/insert 흐름이 아니라 Mongo update 연산을 직접 사용하므로,
-`@CreatedDate`, `@LastModifiedDate` 같은 Spring Data Auditing 이 자동 반영되지 않을 수 있습니다.
-
-필요하면 `updatedAt`, `createdAt` 등을 직접 세팅하세요.
-
----
+###
 
 # Atlas Search
 
@@ -266,6 +50,9 @@ search("indexName")
 검색 후 기능:
 
 - `fields(...)` : **post-search 일반 Mongo `$match`**
+- `highlight(SearchHighlightSpec)`
+- `highlight(spec -> ...)`
+- `addFieldsHighlights()`
 - `addFieldsScore()`
 - `addFieldsScoreDetails()`
 - `addFieldsSequenceToken()`
@@ -334,33 +121,6 @@ Flux<Article> results =
      .findAll()
      .execute();
 ```
-
----
-
-## Search path 철학
-
-Atlas Search path 도 이 라이브러리의 기존 철학을 그대로 따릅니다.
-즉, **enum path / string path** 둘 다 받을 수 있고, 내부에서 문자열 path 로 해석합니다.
-
-이 역할을 하는 것이 `SearchPathResolver` 입니다.
-
-```java
-public enum ArticleField {
-  title,
-  titleAutocomplete,
-  status,
-  publishedAt,
-  scoreWeight
-}
-```
-
-```java
-TextClause<ArticleField> clause = SearchOperators.<ArticleField>text()
-    .path(ArticleField.title)
-    .query("mongodb");
-```
-
-즉 public API 는 강타입으로 유지하고, 실제 `Document` 렌더링은 마지막 경계에서만 수행합니다.
 
 ---
 
@@ -665,7 +425,7 @@ SearchScoreSpec score = SearchScoreSpec.function(fn -> fn
     .add(expr -> expr
         .scoreRelevance()
         .expression(nested -> nested.gauss(
-            ArticleField.recencyWeight,
+            ArticleField.scoreWeight,
             0.0,
             7.0,
             0.0,
@@ -753,6 +513,65 @@ Flux<Article> results =
 - `search().fields(...)` : `$search` 뒤에 붙는 일반 Mongo `$match`
 
 즉, search engine clause 와 일반 Mongo 조건을 의도적으로 분리하고 싶을 때 `search().fields(...)` 를 사용하면 됩니다.
+
+---
+
+## 하이라이트(Highlighting)
+
+하이라이트는 특정 clause 의 옵션이 아니라 **`SearchBuilder` 레벨 stage 옵션**입니다.
+즉 Atlas Search 정의와 동일하게 `$search` 바로 아래에 들어가고, 결과는 `$meta: "searchHighlights"` 로 꺼냅니다.
+
+### 제공 API
+
+- `highlight(SearchHighlightSpec)`
+- `highlight(spec -> ...)`
+- `addFieldsHighlights()`
+- `addFieldsHighlights(String alias)`
+
+### `SearchHighlightSpec`
+
+현재 `SearchHighlightSpec` 는 다음을 지원합니다.
+
+- `builder().path(path)`
+- `builder().paths(path1, path2, ...)`
+- `builder().paths(Collection<K>)`
+- `builder().maxCharsToExamine(int)`
+- `builder().maxNumPassages(int)`
+
+### 예시
+
+```java
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .search("articles_default")
+     .text(t -> t
+         .path(ArticleField.title)
+         .query("atlas search")
+     )
+     .highlight(h -> h
+         .paths(ArticleField.title, ArticleField.summary)
+         .maxCharsToExamine(200_000)
+         .maxNumPassages(3)
+     )
+     .addFieldsHighlights()
+     .addFieldsScore()
+     .findAll()
+     .execute();
+```
+
+### 결과 shape 주의
+
+`addFieldsHighlights()` 는 Atlas Search metadata 를 결과 문서 필드로 노출하는 helper 입니다.
+즉 매핑 대상 엔티티에 해당 필드가 없으면:
+
+- 엔티티에 필드를 추가하거나
+- projection/custom class 로 매핑하거나
+- 필요 없으면 `addFieldsHighlights()` 를 생략해야 합니다.
+
+### 설계상 참고
+
+`count().executeSearchMeta()` 는 `$searchMeta` 경로를 사용하므로 하이라이트 결과를 포함하지 않습니다.
+하이라이트는 `$search` 경로에서만 의미가 있습니다.
 
 ---
 
@@ -891,7 +710,301 @@ Mono<Boolean> exists =
 
 ---
 
+# Vector Search
+
+## VectorSearchBuilder 개요
+
+진입점:
+
+```java
+vectorSearch("indexName")
+```
+
+이 흐름은 일반 Mongo query 흐름, Atlas Search 흐름과 별도로 분리되어 있습니다.
+그 이유는 `$vectorSearch` 가 독립적인 stage 이고, 자체 제약과 옵션을 가지기 때문입니다.
+
+### 제공되는 builder 메서드
+
+핵심 vector-search 옵션:
+
+- `path(K path)`
+- `queryVector(VectorQueryVector)`
+- `queryVector(float[] values)`
+- `queryVector(double[] values)`
+- `queryVector(Collection<Double> values)`
+- `queryText(String queryText)`
+- `limit(long limit)`
+- `numCandidates(long numCandidates)`
+- `exact(boolean)`
+- `exact()`
+- `approximate(long numCandidates)`
+
+필터 / 결과 shaping:
+
+- `filterFields(...)` : **`$vectorSearch.filter` 안의 pre-filter**
+- `filter(block -> ...)` : 일반 `FieldBuilder` 로 중첩 pre-filter 구성
+- `fields(...)` : **stage 이후 일반 Mongo `$match`**
+- `addFieldsVectorSearchScore()`
+- `addFieldsVectorSearchScore(String alias)`
+- `excludes(...)`
+
+터미널 빌더:
+
+- `findAll().execute()`
+- `find().execute()` / `find().executeFirst()`
+- `count().execute()`
+- `existsQuery().execute()`
+
+### `search()` 와의 중요한 차이
+
+현재 `vectorSearch()` 는 다음을 제공하지 않습니다.
+
+- `executePage()`
+- `$searchMeta` 같은 metadata count
+- sequence token paging
+- built-in sort DSL
+
+즉 현재 vector 경로는 실제 `VectorSearchBuilder` 구현 범위에 맞춰 의도적으로 더 단순하게 유지되어 있습니다.
+
+---
+
+## `VectorQueryVector`
+
+`VectorQueryVector` 는 query embedding 을 감싸는 DSL wrapper 입니다.
+
+제공 factory:
+
+- `VectorQueryVector.ofFloatArray(float[])`
+- `VectorQueryVector.ofDoubleArray(double[])`
+- `VectorQueryVector.ofDoubleList(Collection<Double>)`
+
+public API 는 driver-specific vector 타입에 직접 묶이지 않도록 유지하고,
+현재 구현은 stage 빌드 시점에 BSON-ready `List<Double>` 로 렌더링합니다.
+
+### 예시
+
+```java
+float[] embedding = embeddingService.embed("reactive mongo dsl");
+
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .addFieldsVectorSearchScore()
+     .findAll()
+     .execute();
+```
+
+---
+
+## auto-embedding index 용 text query
+
+현재 DSL 은 query embedding 대신 text 입력도 지원합니다.
+
+```java
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryText("reactive mongo dsl")
+     .limit(10)
+     .approximate(200)
+     .addFieldsVectorSearchScore()
+     .findAll()
+     .execute();
+```
+
+현재 구현에서는 `queryVector(...)` 와 `queryText(...)` 를 동시에 사용할 수 없습니다.
+
+---
+
+## ANN vs ENN
+
+현재 DSL 에서 vector-search mode 는 다음처럼 표현됩니다.
+
+### ANN
+
+```java
+Flux<Article> ann =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .numCandidates(200)
+     .findAll()
+     .execute();
+```
+
+또는 shorthand 로:
+
+```java
+.approximate(200)
+```
+
+### ENN
+
+```java
+Flux<Article> enn =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .exact()
+     .findAll()
+     .execute();
+```
+
+현재 구현의 검증 규칙:
+
+- `index` 필수
+- `path` 필수
+- `limit` 필수
+- `queryVector(...)` 또는 `queryText(...)` 중 하나 필수
+- ANN 모드에서는 `numCandidates(...)` 필수
+
+---
+
+## pre-filter 와 post-filter 의 차이
+
+이 구분은 벡터 검색에서도 중요합니다.
+
+### Pre-filter: `$vectorSearch.filter`
+
+`filterFields(...)` 또는 `filter(...)` 를 사용하면 조건이 vector-search stage 내부의 `filter` 로 들어갑니다.
+
+```java
+Flux<Article> filtered =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .filterFields(
+         pair("status", "PUBLISHED"),
+         pair("deleted", false)
+     )
+     .findAll()
+     .execute();
+```
+
+중첩 pre-filter 도 지원합니다.
+
+```java
+Flux<Article> filtered =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .filter(f -> f
+         .and(x -> x.fields(
+             pair("status", "PUBLISHED"),
+             pair("deleted", false)
+         ))
+         .or(x -> x.fields(
+             pair("category", "JAVA"),
+             pair("category", "MONGODB")
+         ))
+     )
+     .findAll()
+     .execute();
+```
+
+### Post-filter: 일반 aggregation `$match`
+
+`VectorSearchBuilder.fields(...)` 는 `$vectorSearch` 뒤에 붙는 일반 Mongo `$match` 입니다.
+
+```java
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .fields(
+         pair("visible", true)
+     )
+     .findAll()
+     .execute();
+```
+
+---
+
+## Vector score metadata
+
+벡터 검색 점수는 다음 helper 로 노출할 수 있습니다.
+
+- `addFieldsVectorSearchScore()`
+- `addFieldsVectorSearchScore(String alias)`
+
+### 예시
+
+```java
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .addFieldsVectorSearchScore("score")
+     .findAll()
+     .execute();
+```
+
+`addFieldsHighlights()` 와 마찬가지로, 매핑 대상 타입이 해당 추가 필드를 실제로 받을 수 있는지 확인해야 합니다.
+
+---
+
+## Vector count 의미
+
+벡터 count 는 Atlas Search metadata count 보다 범위가 좁습니다.
+
+```java
+Mono<Long> count =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(10)
+     .approximate(200)
+     .count()
+     .execute();
+```
+
+이 값은 **현재 파이프라인 결과 수** 입니다.
+즉 `$vectorSearch` 의 `limit` 과 post-stage `fields(...)` 결과에 의해 제한된 값이며,
+corpus 전체 metadata count 는 아닙니다.
+
+---
+
+## Vector exists terminal
+
+```java
+Mono<Boolean> exists =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(embedding)
+     .limit(1)
+     .exact()
+     .existsQuery()
+     .execute();
+```
+
+---
+
 ## 주의사항 / 제한
+
+### Atlas Search
 
 - Atlas Search 는 질의 대상 필드에 맞는 Search index 가 필요합니다.
 - `$search`, `$searchMeta` 는 각각 파이프라인 첫 stage 여야 합니다.
@@ -900,6 +1013,17 @@ Mono<Boolean> exists =
 - `TextClause` 는 현재 `fuzzy + synonyms` 동시 사용을 막습니다.
 - `count().execute()` 와 `count().executeSearchMeta()` 는 의미가 다르므로 구분해서 써야 합니다.
 - 안정적인 ordering 이 필요하면 score 만 믿지 말고 unique field 정렬을 추가하세요.
+- Highlight 는 stage-level 옵션이며 `$searchMeta` 경로에는 포함되지 않습니다.
+
+### Vector Search
+
+- `vectorSearch("indexName")` 는 현재 explicit index 이름이 필요합니다.
+- `$vectorSearch` 는 파이프라인 첫 stage 여야 합니다.
+- `$vectorSearch` 는 `$facet` 내부나 `$lookup` sub-pipeline 안에서 사용할 수 없습니다.
+- ANN 모드에서는 `numCandidates(...)` 가 필요합니다.
+- `count()` 는 제한된 pipeline output 만 셉니다. metadata count terminal 은 아직 없습니다.
+- 현재 구현에는 page token, `executePage()`, sort DSL 이 없습니다.
+- analyzed text 와 vector 를 한 stage 에 혼합하는 고급 하이브리드 검색은 현재 DSL 에서 별도 경로로 풀지 않고 분리해서 두고 있습니다.
 
 ---
 
@@ -918,3 +1042,6 @@ Mono<Boolean> exists =
 - 일반 Mongo 조회/필터링이면 `FieldsPair` + `fields(...).end()`
 - Atlas Search 기반 검색이면 `search(...)`
 - Atlas Search 뒤에 일반 Mongo `$match` 를 의도적으로 넣고 싶을 때만 `search().fields(...)`
+- 벡터 검색이면 `vectorSearch(...)`
+- vector stage 내부 pre-filter 가 필요하면 `vectorSearch().filter(...)` / `filterFields(...)`
+- vector stage 뒤에 일반 Mongo `$match` 를 의도적으로 넣고 싶을 때만 `vectorSearch().fields(...)`

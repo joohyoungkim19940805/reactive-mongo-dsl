@@ -68,11 +68,14 @@ import com.byeolnaerim.mongodsl.search.InClause;
 import com.byeolnaerim.mongodsl.search.PhraseClause;
 import com.byeolnaerim.mongodsl.search.RangeClause;
 import com.byeolnaerim.mongodsl.search.SearchCountType;
+import com.byeolnaerim.mongodsl.search.SearchHighlightSpec;
 import com.byeolnaerim.mongodsl.search.SearchOperators;
 import com.byeolnaerim.mongodsl.search.SearchScoreSpec;
 import com.byeolnaerim.mongodsl.search.SearchSortSpec;
 import com.byeolnaerim.mongodsl.search.TextClause;
 import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
+import com.byeolnaerim.mongodsl.vector.VectorPathResolver;
+import com.byeolnaerim.mongodsl.vector.VectorQueryVector;
 import com.mongodb.ReadPreference;
 import com.mongodb.bulk.BulkWriteResult;
 import com.mongodb.client.result.DeleteResult;
@@ -2747,6 +2750,25 @@ public class ReactiveMongoDsl<K> {
 		}
 
 		/**
+		 * Starts a MongoDB {@code $vectorSearch} query using the specified vector index.
+		 * <p>This entry point intentionally bypasses the regular {@link FieldBuilder}
+		 * terminal flow because {@code $vectorSearch} must be the first stage in the
+		 * aggregation pipeline.</p>
+		 *
+		 * @param index
+		 *            the MongoDB Vector Search index name
+		 *
+		 * @return a vector-search builder
+		 */
+		public VectorSearchBuilder<E> vectorSearch(
+			String index
+		) {
+
+			return new VectorSearchBuilder<>( index );
+
+		}
+
+		/**
 		 * Atlas Search-specific builder that renders strongly typed Atlas Search operators
 		 * into a {@code $search} or {@code $searchMeta} aggregation stage.
 		 * <p>This builder extends {@link QueryBuilderAccesser} on purpose so it can reuse
@@ -2790,6 +2812,8 @@ public class ReactiveMongoDsl<K> {
 
 			private String[] excludes;
 
+			private SearchHighlightSpec highlightSpec;
+			
 			SearchBuilder(
 							String index
 			) {
@@ -3327,6 +3351,70 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
+			 * Sets Atlas Search stage-level highlight options.
+			 *
+			 * @param highlightSpec
+			 *            the highlight specification
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> highlight(
+				SearchHighlightSpec highlightSpec
+			) {
+
+				this.highlightSpec = Objects.requireNonNull( highlightSpec, "highlightSpec" );
+				return this;
+
+			}
+
+			/**
+			 * Builds Atlas Search stage-level highlight options through a fluent callback.
+			 *
+			 * @param spec
+			 *            the highlight builder callback
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> highlight(
+				Consumer<SearchHighlightSpec.Builder> spec
+			) {
+
+				SearchHighlightSpec.Builder builder = SearchHighlightSpec.builder();
+				spec.accept( builder );
+				this.highlightSpec = builder.build();
+				return this;
+
+			}
+
+			/**
+			 * Extracts Atlas Search highlight metadata into the default alias {@code highlights}.
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> addFieldsHighlights() {
+
+				return addFieldsHighlights( "highlights" );
+
+			}
+
+			/**
+			 * Extracts Atlas Search highlight metadata into the given alias.
+			 *
+			 * @param alias
+			 *            the target alias
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> addFieldsHighlights(
+				String alias
+			) {
+
+				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "searchHighlights" ) ) );
+				return this;
+
+			}
+
+			/**
 			 * Creates a terminal builder for multi-result Atlas Search reads.
 			 *
 			 * @return a multi-result Atlas Search terminal builder
@@ -3411,6 +3499,11 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
+				if (this.highlightSpec != null) {
+					body.append( "highlight", this.highlightSpec.toDocument() );
+
+				}
+
 				if (includeCount && this.searchCountType != null) {
 					body.append( "count", new Document( "type", this.searchCountType.getValue() ) );
 
@@ -3436,6 +3529,7 @@ public class ReactiveMongoDsl<K> {
 				for (SearchSortSpec<?> spec : this.searchSortSpecs) {
 					if (spec == null)
 						continue;
+
 					Document d = spec.toDocument();
 
 					for (Map.Entry<String, Object> entry : d.entrySet()) {
@@ -3486,6 +3580,7 @@ public class ReactiveMongoDsl<K> {
 				}
 
 				body.append( "count", new Document( "type", countType.getValue() ) );
+
 				return body;
 
 			}
@@ -4166,6 +4261,719 @@ public class ReactiveMongoDsl<K> {
 				/**
 				 * Returns whether the Atlas Search query yields at least one final pipeline
 				 * result.
+				 *
+				 * @return a {@link Mono} emitting {@code true} when at least one result exists
+				 */
+				public Mono<Boolean> execute() {
+
+					return count().execute().map( count -> count > 0L );
+
+				}
+
+			}
+
+		}
+
+
+		/**
+		 * MongoDB {@code $vectorSearch}-specific builder.
+		 * <p>This builder is intentionally separated from {@link SearchBuilder}
+		 * because {@code $vectorSearch} is a different aggregation stage with its own
+		 * syntax, pagination constraints, and pre-filter semantics.</p>
+		 * <p>Stage-level pre-filtering is expressed with {@link #filterFields(FieldsPair[])}
+		 * and rendered into the {@code filter} field inside {@code $vectorSearch}.
+		 * Regular {@link FieldsPair}-based {@link #fields(FieldsPair[])} conditions are
+		 * rendered after the stage as a normal aggregation {@code $match}.</p>
+		 *
+		 * @param <S>
+		 *            the current mapped entity type
+		 */
+		public class VectorSearchBuilder<S extends E> extends QueryBuilderAccesser<VectorSearchBuilder<S>, VectorSearchBuilder<S>> {
+
+			private final String index;
+
+			private final FieldBuilder<E> preFilterBuilder = new FieldBuilder<>( LogicalOperator.AND );
+
+			private final FieldBuilder<E> postFilterBuilder = new FieldBuilder<>( LogicalOperator.AND );
+
+			private String path;
+
+			private VectorQueryVector queryVector;
+
+			private String queryText;
+
+			private Long limit;
+
+			private Long numCandidates;
+
+			private Boolean exact;
+
+			private final List<Document> addFieldsDocs = new ArrayList<>();
+
+			private String[] excludes;
+
+			VectorSearchBuilder(
+				String index
+			) {
+
+				this.index = index;
+
+			}
+
+			/**
+			 * Returns this builder with the given read preference applied to the generated
+			 * aggregation query.
+			 *
+			 * @param rp
+			 *            the read preference
+			 *
+			 * @return this builder
+			 */
+			@Override
+			public VectorSearchBuilder<S> readPreference(
+				ReadPreference rp
+			) {
+
+				super.readPreference( rp );
+				return this;
+
+			}
+
+			/**
+			 * Returns this builder with the given disk-use option applied to the generated
+			 * aggregation query.
+			 *
+			 * @param allow
+			 *            whether disk use should be allowed
+			 *
+			 * @return this builder
+			 */
+			@Override
+			public VectorSearchBuilder<S> isAllowDiskUse(
+				Boolean allow
+			) {
+
+				super.isAllowDiskUse( allow );
+				return this;
+
+			}
+
+			/**
+			 * Sets the vector-embedding field path.
+			 *
+			 * @param path
+			 *            the logical path input
+			 * @param <K2>
+			 *            the logical path type
+			 *
+			 * @return this builder
+			 */
+			public <K2> VectorSearchBuilder<S> path(
+				K2 path
+			) {
+
+				this.path = VectorPathResolver.resolve( path );
+				return this;
+
+			}
+
+			/**
+			 * Sets the query vector.
+			 *
+			 * @param queryVector
+			 *            the query vector wrapper
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> queryVector(
+				VectorQueryVector queryVector
+			) {
+
+				this.queryVector = Objects.requireNonNull( queryVector, "queryVector" );
+				this.queryText = null;
+				return this;
+
+			}
+
+			/**
+			 * Sets the query vector from a float array.
+			 *
+			 * @param values
+			 *            the float values
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> queryVector(
+				float[] values
+			) {
+
+				return queryVector( VectorQueryVector.ofFloatArray( values ) );
+
+			}
+
+			/**
+			 * Sets the query vector from a double array.
+			 *
+			 * @param values
+			 *            the double values
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> queryVector(
+				double[] values
+			) {
+
+				return queryVector( VectorQueryVector.ofDoubleArray( values ) );
+
+			}
+
+			/**
+			 * Sets the query vector from a collection of doubles.
+			 *
+			 * @param values
+			 *            the vector values
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> queryVector(
+				Collection<Double> values
+			) {
+
+				return queryVector( VectorQueryVector.ofDoubleList( values ) );
+
+			}
+
+			/**
+			 * Sets the text query used for an auto-embedding vector index.
+			 *
+			 * @param queryText
+			 *            the source text that should be embedded by MongoDB
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> queryText(
+				String queryText
+			) {
+
+				if (queryText == null || queryText.isBlank()) {
+					throw new IllegalArgumentException( "queryText must not be blank" );
+
+				}
+
+				this.queryText = queryText;
+				this.queryVector = null;
+				return this;
+
+			}
+
+			/**
+			 * Sets the maximum number of documents to return.
+			 *
+			 * @param limit
+			 *            the result limit
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> limit(
+				long limit
+			) {
+
+				if (limit <= 0L) {
+					throw new IllegalArgumentException( "limit must be > 0" );
+
+				}
+
+				this.limit = limit;
+				return this;
+
+			}
+
+			/**
+			 * Configures an ANN search by specifying {@code numCandidates}.
+			 *
+			 * @param numCandidates
+			 *            the candidate count used for ANN
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> numCandidates(
+				long numCandidates
+			) {
+
+				if (numCandidates <= 0L) {
+					throw new IllegalArgumentException( "numCandidates must be > 0" );
+
+				}
+
+				this.numCandidates = numCandidates;
+				return this;
+
+			}
+
+			/**
+			 * Sets whether to run an exact nearest-neighbor (ENN) search.
+			 *
+			 * @param exact
+			 *            whether exact search should be used
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> exact(
+				boolean exact
+			) {
+
+				this.exact = exact;
+				return this;
+
+			}
+
+			/**
+			 * Convenience method for exact nearest-neighbor (ENN) search.
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> exact() {
+
+				this.exact = true;
+				return this;
+
+			}
+
+			/**
+			 * Convenience method for ANN search with the given candidate count.
+			 *
+			 * @param numCandidates
+			 *            the candidate count used for ANN
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> approximate(
+				long numCandidates
+			) {
+
+				this.exact = false;
+				return numCandidates( numCandidates );
+
+			}
+
+			/**
+			 * Adds Mongo Query Language pre-filters that are rendered into the
+			 * {@code filter} field inside {@code $vectorSearch}.
+			 *
+			 * @param fieldsPairs
+			 *            the pre-filter field conditions
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> filterFields(
+				FieldsPair<?, ?>... fieldsPairs
+			) {
+
+				this.preFilterBuilder.fields( fieldsPairs );
+				return this;
+
+			}
+
+			/**
+			 * Adds Mongo Query Language pre-filters that are rendered into the
+			 * {@code filter} field inside {@code $vectorSearch}.
+			 *
+			 * @param fieldsPairs
+			 *            the pre-filter field conditions
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> filterFields(
+				Collection<FieldsPair<?, ?>> fieldsPairs
+			) {
+
+				if (fieldsPairs == null || fieldsPairs.isEmpty())
+					return this;
+
+				this.preFilterBuilder.fields( fieldsPairs.stream().toArray( FieldsPair[]::new ) );
+				return this;
+
+			}
+
+			/**
+			 * Allows callers to compose nested AND/OR/NOR pre-filters using the regular
+			 * {@link FieldBuilder}.
+			 *
+			 * @param block
+			 *            the pre-filter composition callback
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> filter(
+				Consumer<FieldBuilder<E>> block
+			) {
+
+				if (block != null) {
+					block.accept( this.preFilterBuilder );
+
+				}
+
+				return this;
+
+			}
+
+			/**
+			 * Adds post-vector-search filters rendered as a normal aggregation
+			 * {@code $match}.
+			 *
+			 * @param fieldsPairs
+			 *            the post-stage field conditions
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> fields(
+				FieldsPair<?, ?>... fieldsPairs
+			) {
+
+				this.postFilterBuilder.fields( fieldsPairs );
+				return this;
+
+			}
+
+			/**
+			 * Adds post-vector-search filters rendered as a normal aggregation
+			 * {@code $match}.
+			 *
+			 * @param fieldsPairs
+			 *            the post-stage field conditions
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> fields(
+				Collection<FieldsPair<?, ?>> fieldsPairs
+			) {
+
+				if (fieldsPairs == null || fieldsPairs.isEmpty())
+					return this;
+
+				this.postFilterBuilder.fields( fieldsPairs.stream().toArray( FieldsPair[]::new ) );
+				return this;
+
+			}
+
+			/**
+			 * Adds a post-stage field exposing the vector-search similarity score using the
+			 * default alias {@code vectorSearchScore}.
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> addFieldsVectorSearchScore() {
+
+				return addFieldsVectorSearchScore( "vectorSearchScore" );
+
+			}
+
+			/**
+			 * Adds a post-stage field exposing the vector-search similarity score using the
+			 * given alias.
+			 *
+			 * @param alias
+			 *            the target field alias
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> addFieldsVectorSearchScore(
+				String alias
+			) {
+
+				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "vectorSearchScore" ) ) );
+				return this;
+
+			}
+
+			/**
+			 * Excludes the given fields from the final mapped result projection.
+			 *
+			 * @param excludes
+			 *            the field names to exclude
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> excludes(
+				String... excludes
+			) {
+
+				this.excludes = excludes;
+				return this;
+
+			}
+
+			/**
+			 * Creates a terminal builder for multi-result vector-search reads.
+			 *
+			 * @return a multi-result vector-search terminal builder
+			 */
+			public VectorFindAllQueryBuilder<S> findAll() {
+
+				return new VectorFindAllQueryBuilder<>();
+
+			}
+
+			/**
+			 * Creates a terminal builder for single-result vector-search reads.
+			 *
+			 * @return a single-result vector-search terminal builder
+			 */
+			public VectorFindQueryBuilder<S> find() {
+
+				return new VectorFindQueryBuilder<>();
+
+			}
+
+			/**
+			 * Creates a terminal builder for vector-search count reads.
+			 * <p>This count reflects the pipeline output after {@code $vectorSearch} and
+			 * therefore counts only the documents returned by the configured stage limit and
+			 * post-stage filters. It is <strong>not</strong> a corpus-wide metadata count.</p>
+			 *
+			 * @return a vector-search count terminal builder
+			 */
+			public VectorCountQueryBuilder count() {
+
+				return new VectorCountQueryBuilder();
+
+			}
+
+			/**
+			 * Creates a terminal builder for vector-search existence checks.
+			 *
+			 * @return a vector-search exists terminal builder
+			 */
+			public VectorExistsQueryBuilder existsQuery() {
+
+				return new VectorExistsQueryBuilder();
+
+			}
+
+			private void validateVectorSearchBody() {
+
+				if (this.index == null || this.index.isBlank()) {
+					throw new IllegalStateException( "vectorSearch.index is required" );
+
+				}
+
+				if (this.path == null || this.path.isBlank()) {
+					throw new IllegalStateException( "vectorSearch.path is required" );
+
+				}
+
+				if (this.limit == null || this.limit <= 0L) {
+					throw new IllegalStateException( "vectorSearch.limit is required" );
+
+				}
+
+				if (this.queryVector == null && (this.queryText == null || this.queryText.isBlank())) {
+					throw new IllegalStateException( "vectorSearch.queryVector or vectorSearch.queryText is required" );
+
+				}
+
+				if (this.queryVector != null && this.queryText != null && ! this.queryText.isBlank()) {
+					throw new IllegalStateException( "vectorSearch.queryVector and vectorSearch.queryText cannot be used together" );
+
+				}
+
+				if (! Boolean.TRUE.equals( this.exact ) && this.numCandidates == null) {
+					throw new IllegalStateException( "vectorSearch.numCandidates is required for ANN search" );
+
+				}
+
+			}
+
+			private Document buildVectorSearchStageBody(
+				Optional<Criteria> preFilterCriteria
+			) {
+
+				validateVectorSearchBody();
+
+				Document body = new Document()
+					.append( "index", this.index )
+					.append( "path", this.path )
+					.append( "limit", this.limit );
+
+				if (this.queryVector != null) {
+					body.append( "queryVector", this.queryVector.toBsonValue() );
+
+				}
+
+				if (this.queryText != null && ! this.queryText.isBlank()) {
+					body.append( "queryText", this.queryText );
+
+				}
+
+				if (this.numCandidates != null) {
+					body.append( "numCandidates", this.numCandidates );
+
+				}
+
+				if (this.exact != null) {
+					body.append( "exact", this.exact );
+
+				}
+
+				preFilterCriteria.ifPresent( criteria -> body.append( "filter", criteria.getCriteriaObject() ) );
+
+				return body;
+
+			}
+
+			private List<AggregationOperation> buildAggregationOps(
+				Optional<Criteria> preFilterCriteria,
+				Optional<Criteria> postFilterCriteria,
+				boolean includeProjection,
+				boolean includeMetaAdds
+			) {
+
+				List<AggregationOperation> ops = new ArrayList<>();
+
+				ops.add( ctx -> new Document( "$vectorSearch", buildVectorSearchStageBody( preFilterCriteria ) ) );
+
+				postFilterCriteria.ifPresent( criteria -> ops.add( Aggregation.match( criteria ) ) );
+
+				if (includeMetaAdds && ! this.addFieldsDocs.isEmpty()) {
+					Document addFields = new Document();
+
+					for (Document d : this.addFieldsDocs) {
+						for (Map.Entry<String, Object> entry : d.entrySet()) {
+							addFields.append( entry.getKey(), entry.getValue() );
+
+						}
+					}
+
+					ops.add( ctx -> new Document( "$addFields", addFields ) );
+
+				}
+
+				if (includeProjection && this.excludes != null && this.excludes.length > 0) {
+					ops.add( Aggregation.project().andExclude( this.excludes ) );
+
+				}
+
+				return ops;
+
+			}
+
+			private Flux<Document> aggregateDocuments(
+				Class<?> entityClass,
+				List<AggregationOperation> ops
+			) {
+
+				Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+
+				return (collectionName != null && ! collectionName.isBlank())
+					? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
+					: reactiveMongoTemplate.aggregate( agg, entityClass, Document.class );
+
+			}
+
+			/**
+			 * Terminal builder for multi-result vector-search reads.
+			 *
+			 * @param <T>
+			 *            the current mapped entity type
+			 */
+			public class VectorFindAllQueryBuilder<T extends E> {
+
+				/**
+				 * Executes the vector-search query and maps all returned documents to the
+				 * current entity type.
+				 *
+				 * @return a {@link Flux} emitting the mapped vector-search results
+				 */
+				public Flux<E> execute() {
+
+					return Mono
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.flatMapMany( tuple -> {
+							Class<E> entityClass = tuple.getT1();
+							Optional<Criteria> preCriteria = tuple.getT2();
+							Optional<Criteria> postCriteria = tuple.getT3();
+							List<AggregationOperation> ops = buildAggregationOps( preCriteria, postCriteria, true, true );
+							return aggregateDocuments( entityClass, ops )
+								.map( doc -> reactiveMongoTemplate.getConverter().read( entityClass, doc ) );
+
+						} );
+
+				}
+
+			}
+
+			/**
+			 * Terminal builder for single-result vector-search reads.
+			 *
+			 * @param <T>
+			 *            the current mapped entity type
+			 */
+			public class VectorFindQueryBuilder<T extends E> {
+
+				/**
+				 * Executes the vector-search query and returns at most one mapped entity.
+				 *
+				 * @return a {@link Mono} emitting the mapped vector-search result
+				 */
+				public Mono<E> execute() {
+
+					return executeFirst();
+
+				}
+
+				/**
+				 * Executes the vector-search query and returns the first mapped entity.
+				 *
+				 * @return a {@link Mono} emitting the first mapped vector-search result
+				 */
+				public Mono<E> executeFirst() {
+
+					return new VectorFindAllQueryBuilder<T>().execute().next();
+
+				}
+
+			}
+
+			/**
+			 * Terminal builder for vector-search count reads.
+			 */
+			public class VectorCountQueryBuilder {
+
+				/**
+				 * Counts the documents returned by the current vector-search pipeline.
+				 *
+				 * @return a {@link Mono} emitting the limited pipeline result count
+				 */
+				public Mono<Long> execute() {
+
+					return Mono
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.flatMap( tuple -> {
+							Class<E> entityClass = tuple.getT1();
+							Optional<Criteria> preCriteria = tuple.getT2();
+							Optional<Criteria> postCriteria = tuple.getT3();
+
+							List<AggregationOperation> ops = buildAggregationOps( preCriteria, postCriteria, false, false );
+							ops.add( ctx -> new Document( "$count", "count" ) );
+
+							return aggregateDocuments( entityClass, ops )
+								.next()
+								.map( d -> Optional.ofNullable( d.get( "count", Number.class ) ).map( Number::longValue ).orElse( 0L ) )
+								.defaultIfEmpty( 0L );
+
+						} );
+
+				}
+
+			}
+
+			/**
+			 * Terminal builder for vector-search existence checks.
+			 */
+			public class VectorExistsQueryBuilder {
+
+				/**
+				 * Returns whether the vector-search query yields at least one pipeline result.
 				 *
 				 * @return a {@link Mono} emitting {@code true} when at least one result exists
 				 */
