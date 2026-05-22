@@ -722,9 +722,11 @@ Core vector-search options:
 
 - `path(K path)`
 - `queryVector(VectorQueryVector)`
+- `queryVector(Mono<VectorQueryVector>)`
 - `queryVector(float[] values)`
 - `queryVector(double[] values)`
 - `queryVector(Collection<Double> values)`
+- `queryEmbedding(String queryText, VectorEmbeddingFunction embeddingFunction)`
 - `queryText(String queryText)`
 - `limit(long limit)`
 - `numCandidates(long numCandidates)`
@@ -810,7 +812,95 @@ Flux<Article> results =
      .execute();
 ```
 
-`queryVector(...)` and `queryText(...)` are mutually exclusive in the current implementation.
+`queryVector(...)` / `queryEmbedding(...)` and `queryText(...)` are mutually exclusive in the current implementation.
+
+---
+
+## Application-provided embedding function
+
+For external embedding providers such as Voyage, OpenAI-compatible APIs, internal gateways, or SDK-based clients, keep the provider implementation in the consuming application and pass only the final reactive vector into the DSL.
+
+The core library does **not** own:
+
+- provider DTOs
+- API keys
+- base URLs
+- model names
+- HTTP clients such as Spring `WebClient`
+- timeout / retry / rate-limit policy
+
+The DSL only needs a `Mono<VectorQueryVector>` or a provider-neutral `VectorEmbeddingFunction`.
+
+### Direct asynchronous vector
+
+```java
+Mono<VectorQueryVector> queryVector = userOwnedEmbeddingClient
+    .embedQuery("reactive mongo dsl")
+    .map(VectorQueryVector::ofDoubleList);
+
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(queryVector)
+     .limit(10)
+     .approximate(200)
+     .findAll()
+     .execute();
+```
+
+### Provider-neutral embedding function
+
+`VectorEmbeddingFunction` receives a logical input type so the application can map it to provider-specific options.
+
+```java
+import com.byeolnaerim.mongodsl.vector.VectorEmbeddingFunction;
+import com.byeolnaerim.mongodsl.vector.VectorQueryVector;
+
+VectorEmbeddingFunction embeddingFunction = (text, inputType) -> {
+    String providerInputType = switch (inputType) {
+        case QUERY -> "query";
+        case DOCUMENT -> "document";
+    };
+
+    return userOwnedEmbeddingClient
+        .embed(text, providerInputType)
+        .map(VectorQueryVector::ofDoubleList);
+};
+```
+
+Use `queryEmbedding(...)` when the search query should be embedded at execution time.
+
+```java
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryEmbedding("reactive mongo dsl", embeddingFunction)
+     .limit(10)
+     .approximate(200)
+     .addFieldsVectorSearchScore()
+     .findAll()
+     .execute();
+```
+
+For indexing corpus documents or chunks, use the same function outside the search DSL and store the returned vector in your MongoDB document.
+
+```java
+Mono<ArticleChunk> save = embeddingFunction
+    .embedDocument(chunkText)
+    .flatMap(vector -> {
+        ArticleChunk chunk = ArticleChunk.builder()
+            .articleId(articleId)
+            .content(chunkText)
+            .embedding(vector.toBsonValue())
+            .build();
+
+        return mongoTemplate.save(chunk);
+    });
+```
+
+This keeps model selection, URL configuration, authentication, batching, retry, and HTTP client choice entirely in the application layer.
 
 ---
 
@@ -857,7 +947,8 @@ Validation rules in the current code:
 - `index` is required
 - `path` is required
 - `limit` is required
-- either `queryVector(...)` or `queryText(...)` is required
+- either `queryVector(...)`, `queryEmbedding(...)`, or `queryText(...)` is required
+- `queryVector(...)` / `queryEmbedding(...)` and `queryText(...)` are mutually exclusive
 - for ANN mode, `numCandidates(...)` is required
 
 ---
@@ -1014,6 +1105,7 @@ Mono<Boolean> exists =
 - `$vectorSearch` must be the first stage of the pipeline.
 - `$vectorSearch` can't be used inside `$facet` or inside a `$lookup` sub-pipeline.
 - ANN mode requires `numCandidates(...)`.
+- `queryEmbedding(...)` delegates embedding creation to the application-provided `VectorEmbeddingFunction`; this library does not include provider clients or HTTP-client dependencies.
 - `count()` only counts the limited pipeline output; there is no metadata count terminal today.
 - There is no built-in page token, `executePage()`, or sort DSL for vector search in the current implementation.
 - For advanced analyzed text filtering together with vectors, this DSL currently keeps that concern separate rather than trying to blend it into a single stage.
@@ -1036,5 +1128,6 @@ When in doubt, keep this rule in mind:
 - use `search(...)` for Atlas Search querying
 - use `search().fields(...)` only when you intentionally want a **post-search** ordinary `$match`
 - use `vectorSearch(...)` for MongoDB Vector Search querying
+- use `queryVector(Mono<VectorQueryVector>)` or `queryEmbedding(...)` when query vectors come from an application-owned embedding provider
 - use `vectorSearch().filter(...)` / `filterFields(...)` for stage-level vector pre-filters
 - use `vectorSearch().fields(...)` only when you intentionally want a **post-vector-search** ordinary `$match`

@@ -729,9 +729,11 @@ vectorSearch("indexName")
 
 - `path(K path)`
 - `queryVector(VectorQueryVector)`
+- `queryVector(Mono<VectorQueryVector>)`
 - `queryVector(float[] values)`
 - `queryVector(double[] values)`
 - `queryVector(Collection<Double> values)`
+- `queryEmbedding(String queryText, VectorEmbeddingFunction embeddingFunction)`
 - `queryText(String queryText)`
 - `limit(long limit)`
 - `numCandidates(long numCandidates)`
@@ -817,7 +819,95 @@ Flux<Article> results =
      .execute();
 ```
 
-현재 구현에서는 `queryVector(...)` 와 `queryText(...)` 를 동시에 사용할 수 없습니다.
+현재 구현에서는 `queryVector(...)` / `queryEmbedding(...)` 과 `queryText(...)` 를 동시에 사용할 수 없습니다.
+
+---
+
+## 애플리케이션 제공 embedding function
+
+Voyage, OpenAI-compatible API, 사내 gateway, SDK 기반 client 같은 외부 embedding provider 는 사용하는 애플리케이션 쪽에서 구현하고, DSL 에는 최종 reactive vector 만 넘기는 방식으로 사용합니다.
+
+이 라이브러리 코어는 다음을 소유하지 않습니다.
+
+- provider DTO
+- API key
+- base URL
+- model name
+- Spring `WebClient` 같은 HTTP client
+- timeout / retry / rate-limit 정책
+
+DSL 이 필요로 하는 것은 `Mono<VectorQueryVector>` 또는 provider-neutral `VectorEmbeddingFunction` 뿐입니다.
+
+### 비동기 vector 직접 전달
+
+```java
+Mono<VectorQueryVector> queryVector = userOwnedEmbeddingClient
+    .embedQuery("reactive mongo dsl")
+    .map(VectorQueryVector::ofDoubleList);
+
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryVector(queryVector)
+     .limit(10)
+     .approximate(200)
+     .findAll()
+     .execute();
+```
+
+### provider-neutral embedding function
+
+`VectorEmbeddingFunction` 은 logical input type 을 함께 받습니다. 애플리케이션은 이 값을 provider 별 옵션으로 매핑하면 됩니다.
+
+```java
+import com.byeolnaerim.mongodsl.vector.VectorEmbeddingFunction;
+import com.byeolnaerim.mongodsl.vector.VectorQueryVector;
+
+VectorEmbeddingFunction embeddingFunction = (text, inputType) -> {
+    String providerInputType = switch (inputType) {
+        case QUERY -> "query";
+        case DOCUMENT -> "document";
+    };
+
+    return userOwnedEmbeddingClient
+        .embed(text, providerInputType)
+        .map(VectorQueryVector::ofDoubleList);
+};
+```
+
+검색 query 를 실행 시점에 embedding 해야 하면 `queryEmbedding(...)` 을 사용합니다.
+
+```java
+Flux<Article> results =
+  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
+     .vectorSearch("articles_vector_index")
+     .path(ArticleField.embedding)
+     .queryEmbedding("reactive mongo dsl", embeddingFunction)
+     .limit(10)
+     .approximate(200)
+     .addFieldsVectorSearchScore()
+     .findAll()
+     .execute();
+```
+
+문서나 chunk 를 인덱싱할 때는 같은 function 을 search DSL 밖에서 사용하고, 반환된 vector 를 MongoDB 문서에 저장하면 됩니다.
+
+```java
+Mono<ArticleChunk> save = embeddingFunction
+    .embedDocument(chunkText)
+    .flatMap(vector -> {
+        ArticleChunk chunk = ArticleChunk.builder()
+            .articleId(articleId)
+            .content(chunkText)
+            .embedding(vector.toBsonValue())
+            .build();
+
+        return mongoTemplate.save(chunk);
+    });
+```
+
+이 구조에서는 model 선택, URL 설정, 인증, batch 처리, retry, HTTP client 선택이 모두 애플리케이션 레이어에 남습니다.
 
 ---
 
@@ -864,7 +954,8 @@ Flux<Article> enn =
 - `index` 필수
 - `path` 필수
 - `limit` 필수
-- `queryVector(...)` 또는 `queryText(...)` 중 하나 필수
+- `queryVector(...)`, `queryEmbedding(...)`, `queryText(...)` 중 하나 필수
+- `queryVector(...)` / `queryEmbedding(...)` 과 `queryText(...)` 는 동시에 사용할 수 없음
 - ANN 모드에서는 `numCandidates(...)` 필수
 
 ---
@@ -1021,6 +1112,7 @@ Mono<Boolean> exists =
 - `$vectorSearch` 는 파이프라인 첫 stage 여야 합니다.
 - `$vectorSearch` 는 `$facet` 내부나 `$lookup` sub-pipeline 안에서 사용할 수 없습니다.
 - ANN 모드에서는 `numCandidates(...)` 가 필요합니다.
+- `queryEmbedding(...)` 은 embedding 생성을 애플리케이션이 제공한 `VectorEmbeddingFunction` 에 위임합니다. 이 라이브러리는 provider client 나 HTTP-client dependency 를 포함하지 않습니다.
 - `count()` 는 제한된 pipeline output 만 셉니다. metadata count terminal 은 아직 없습니다.
 - 현재 구현에는 page token, `executePage()`, sort DSL 이 없습니다.
 - analyzed text 와 vector 를 한 stage 에 혼합하는 고급 하이브리드 검색은 현재 DSL 에서 별도 경로로 풀지 않고 분리해서 두고 있습니다.
@@ -1043,5 +1135,6 @@ Mono<Boolean> exists =
 - Atlas Search 기반 검색이면 `search(...)`
 - Atlas Search 뒤에 일반 Mongo `$match` 를 의도적으로 넣고 싶을 때만 `search().fields(...)`
 - 벡터 검색이면 `vectorSearch(...)`
+- query vector 를 애플리케이션 소유 embedding provider 에서 가져와야 하면 `queryVector(Mono<VectorQueryVector>)` 또는 `queryEmbedding(...)`
 - vector stage 내부 pre-filter 가 필요하면 `vectorSearch().filter(...)` / `filterFields(...)`
 - vector stage 뒤에 일반 Mongo `$match` 를 의도적으로 넣고 싶을 때만 `vectorSearch().fields(...)`
