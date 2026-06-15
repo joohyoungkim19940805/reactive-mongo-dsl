@@ -112,7 +112,7 @@ public class ReactiveMongoDsl<K> {
 	 *            the template and transaction resolver
 	 */
 	public ReactiveMongoDsl(
-								MongoTemplateResolver<K> resolver
+							MongoTemplateResolver<K> resolver
 	) {
 
 		this( resolver, JsonMapper.builder().build() );
@@ -128,8 +128,8 @@ public class ReactiveMongoDsl<K> {
 	 *            the object mapper used by helper features such as history snapshot creation
 	 */
 	public ReactiveMongoDsl(
-								MongoTemplateResolver<K> resolver,
-								ObjectMapper objectMapper
+							MongoTemplateResolver<K> resolver,
+							ObjectMapper objectMapper
 	) {
 
 		this.resolver = resolver;
@@ -2097,7 +2097,7 @@ public class ReactiveMongoDsl<K> {
 				final LookupSpec spec;
 
 				LookupCtx(
-						ReactiveMongoDsl<K>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rb,
+							ReactiveMongoDsl<K>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rb,
 							LookupSpec sp
 				) {
 
@@ -2122,7 +2122,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		
 
 
 
@@ -2804,6 +2803,10 @@ public class ReactiveMongoDsl<K> {
 
 			private final List<Document> addFieldsDocs = new ArrayList<>();
 
+			private Double scoreGte;
+
+			private Double scoreLte;
+
 			private final List<SearchSortSpec<?>> searchSortSpecs = new ArrayList<>();
 
 			private Integer pageNumber;
@@ -2813,7 +2816,7 @@ public class ReactiveMongoDsl<K> {
 			private String[] excludes;
 
 			private SearchHighlightSpec highlightSpec;
-			
+
 			SearchBuilder(
 							String index
 			) {
@@ -3056,6 +3059,93 @@ public class ReactiveMongoDsl<K> {
 			) {
 
 				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "searchScore" ) ) );
+				return this;
+
+			}
+
+			/**
+			 * Filters out Atlas Search results whose {@code searchScore} is lower than
+			 * the given value.
+			 * <p>This filter is rendered after {@code $addFields: { score: { $meta:
+			 * "searchScore" } }} and before paging/count terminal stages, so
+			 * {@code executePage()} and {@code count().execute()} use the same threshold.</p>
+			 *
+			 * @param score
+			 *            the inclusive minimum score
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> matchScoreGte(
+				double score
+			) {
+
+				validateSearchScore( score );
+
+				if (this.scoreLte != null && score > this.scoreLte) {
+					throw new IllegalArgumentException( "score must be <= current lte score." );
+
+				}
+
+				this.scoreGte = score;
+				return this;
+
+			}
+
+			/**
+			 * Filters out Atlas Search results whose {@code searchScore} is greater than
+			 * the given value.
+			 * <p>This filter is rendered after {@code $addFields: { score: { $meta:
+			 * "searchScore" } }} and before paging/count terminal stages, so
+			 * {@code executePage()} and {@code count().execute()} use the same threshold.</p>
+			 *
+			 * @param score
+			 *            the inclusive maximum score
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> matchScoreLte(
+				double score
+			) {
+
+				validateSearchScore( score );
+
+				if (this.scoreGte != null && score < this.scoreGte) {
+					throw new IllegalArgumentException( "score must be >= current gte score." );
+
+				}
+
+				this.scoreLte = score;
+				return this;
+
+			}
+
+			/**
+			 * Filters Atlas Search results to the inclusive {@code searchScore} range.
+			 * <p>This filter is rendered after {@code $addFields: { score: { $meta:
+			 * "searchScore" } }} and before paging/count terminal stages, so
+			 * {@code executePage()} and {@code count().execute()} use the same threshold.</p>
+			 *
+			 * @param gte
+			 *            the inclusive minimum score
+			 * @param lte
+			 *            the inclusive maximum score
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> matchScoreBetween(
+				double gte, double lte
+			) {
+
+				validateSearchScore( gte );
+				validateSearchScore( lte );
+
+				if (gte > lte) {
+					throw new IllegalArgumentException( "gte score must be <= lte score." );
+
+				}
+
+				this.scoreGte = gte;
+				this.scoreLte = lte;
 				return this;
 
 			}
@@ -3559,6 +3649,41 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @return the rendered {@code $searchMeta} body
 			 */
+			private boolean hasScoreMatch() {
+
+				return this.scoreGte != null || this.scoreLte != null;
+
+			}
+
+			private Criteria buildScoreMatchCriteria() {
+
+				Criteria criteria = Criteria.where( "score" );
+
+				if (this.scoreGte != null) {
+					criteria.gte( this.scoreGte );
+
+				}
+
+				if (this.scoreLte != null) {
+					criteria.lte( this.scoreLte );
+
+				}
+
+				return criteria;
+
+			}
+
+			private void validateSearchScore(
+				double score
+			) {
+
+				if (! Double.isFinite( score )) {
+					throw new IllegalArgumentException( "score must be finite." );
+
+				}
+
+			}
+
 			private Document buildSearchMetaStageBody(
 				SearchCountType countType
 			) {
@@ -3614,18 +3739,33 @@ public class ReactiveMongoDsl<K> {
 
 				postCriteria.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
 
-				if (includeMetaAdds && ! this.addFieldsDocs.isEmpty()) {
+				if ((includeMetaAdds && ! this.addFieldsDocs.isEmpty()) || hasScoreMatch()) {
 					Document addFields = new Document();
 
-					for (Document d : this.addFieldsDocs) {
-						for (Map.Entry<String, Object> entry : d.entrySet()) {
-							addFields.append( entry.getKey(), entry.getValue() );
+					if (includeMetaAdds) {
+
+						for (Document d : this.addFieldsDocs) {
+
+							for (Map.Entry<String, Object> entry : d.entrySet()) {
+								addFields.append( entry.getKey(), entry.getValue() );
+
+							}
 
 						}
 
 					}
 
+					if (hasScoreMatch() && ! addFields.containsKey( "score" )) {
+						addFields.append( "score", new Document( "$meta", "searchScore" ) );
+
+					}
+
 					ops.add( ctx -> new Document( "$addFields", addFields ) );
+
+				}
+
+				if (hasScoreMatch()) {
+					ops.add( Aggregation.match( buildScoreMatchCriteria() ) );
 
 				}
 
@@ -4313,7 +4453,7 @@ public class ReactiveMongoDsl<K> {
 			private String[] excludes;
 
 			VectorSearchBuilder(
-				String index
+								String index
 			) {
 
 				this.index = index;
@@ -4822,10 +4962,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			private List<AggregationOperation> buildAggregationOps(
-				Optional<Criteria> preFilterCriteria,
-				Optional<Criteria> postFilterCriteria,
-				boolean includeProjection,
-				boolean includeMetaAdds
+				Optional<Criteria> preFilterCriteria, Optional<Criteria> postFilterCriteria, boolean includeProjection, boolean includeMetaAdds
 			) {
 
 				List<AggregationOperation> ops = new ArrayList<>();
@@ -4838,10 +4975,12 @@ public class ReactiveMongoDsl<K> {
 					Document addFields = new Document();
 
 					for (Document d : this.addFieldsDocs) {
+
 						for (Map.Entry<String, Object> entry : d.entrySet()) {
 							addFields.append( entry.getKey(), entry.getValue() );
 
 						}
+
 					}
 
 					ops.add( ctx -> new Document( "$addFields", addFields ) );
@@ -4858,8 +4997,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			private Flux<Document> aggregateDocuments(
-				Class<?> entityClass,
-				List<AggregationOperation> ops
+				Class<?> entityClass, List<AggregationOperation> ops
 			) {
 
 				Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
@@ -7615,6 +7753,6 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
-	
+
 
 }
