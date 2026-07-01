@@ -76,6 +76,7 @@ import com.byeolnaerim.mongodsl.search.TextClause;
 import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
 import com.byeolnaerim.mongodsl.vector.VectorPathResolver;
 import com.byeolnaerim.mongodsl.vector.VectorQueryVector;
+import com.byeolnaerim.mongodsl.vector.VectorTextQueryShape;
 import com.mongodb.ReadPreference;
 import com.mongodb.bulk.BulkWriteResult;
 import com.mongodb.client.result.DeleteResult;
@@ -4438,9 +4439,14 @@ public class ReactiveMongoDsl<K> {
 
 			private String path;
 
+
 			private VectorQueryVector queryVector;
 
 			private String queryText;
+
+			private String model;
+
+			private VectorTextQueryShape textQueryShape = VectorTextQueryShape.STRING;
 
 			private Long limit;
 
@@ -4499,7 +4505,9 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Sets the vector-embedding field path.
+			 * Sets the field path used by {@code $vectorSearch}.
+			 * <p>For manual vector indexes this is the embedding vector field. For
+			 * Automated Embedding indexes this is the indexed text field.</p>
 			 *
 			 * @param path
 			 *            the logical path input
@@ -4531,6 +4539,7 @@ public class ReactiveMongoDsl<K> {
 
 				this.queryVector = Objects.requireNonNull( queryVector, "queryVector" );
 				this.queryText = null;
+				this.model = null;
 				return this;
 
 			}
@@ -4584,24 +4593,86 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Sets the text query used for an auto-embedding vector index.
+			 * Sets the text query used for a MongoDB Automated Embedding vector index.
+			 * <p>This renders the official {@code $vectorSearch.query} field. Use
+			 * {@link #queryVector(VectorQueryVector)} for application-provided vectors.</p>
+			 *
+			 * @param query
+			 *            the source text that should be embedded by MongoDB
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> query(
+				String query
+			) {
+
+				if (query == null || query.isBlank()) {
+					throw new IllegalArgumentException( "query must not be blank" );
+
+				}
+
+				this.queryText = query;
+				this.queryVector = null;
+				return this;
+
+			}
+
+			/**
+			 * Backward-compatible alias for {@link #query(String)}.
 			 *
 			 * @param queryText
 			 *            the source text that should be embedded by MongoDB
 			 *
 			 * @return this builder
+			 *
+			 * @deprecated Use {@link #query(String)} for MongoDB Automated Embedding.
 			 */
+			@Deprecated
 			public VectorSearchBuilder<S> queryText(
 				String queryText
 			) {
 
-				if (queryText == null || queryText.isBlank()) {
-					throw new IllegalArgumentException( "queryText must not be blank" );
+				return query( queryText );
+
+			}
+
+			/**
+			 * Sets the optional embedding model override for MongoDB Automated Embedding
+			 * text queries. This option is valid only with {@link #query(String)}.
+			 *
+			 * @param model
+			 *            the automated embedding model name
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> model(
+				String model
+			) {
+
+				if (model == null || model.isBlank()) {
+					throw new IllegalArgumentException( "model must not be blank" );
 
 				}
 
-				this.queryText = queryText;
-				this.queryVector = null;
+				this.model = model;
+				return this;
+
+			}
+
+			/**
+			 * Sets the BSON shape used to render text queries for MongoDB Automated
+			 * Embedding. The default is {@link VectorTextQueryShape#STRING}.
+			 *
+			 * @param textQueryShape
+			 *            the text-query BSON shape
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> textQueryShape(
+				VectorTextQueryShape textQueryShape
+			) {
+
+				this.textQueryShape = Objects.requireNonNull( textQueryShape, "textQueryShape" );
 				return this;
 
 			}
@@ -4645,7 +4716,13 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
+				if (numCandidates > 10000L) {
+					throw new IllegalArgumentException( "numCandidates must be <= 10000" );
+
+				}
+
 				this.numCandidates = numCandidates;
+				this.exact = false;
 				return this;
 
 			}
@@ -4663,6 +4740,12 @@ public class ReactiveMongoDsl<K> {
 			) {
 
 				this.exact = exact;
+
+				if (exact) {
+					this.numCandidates = null;
+
+				}
+
 				return this;
 
 			}
@@ -4674,8 +4757,7 @@ public class ReactiveMongoDsl<K> {
 			 */
 			public VectorSearchBuilder<S> exact() {
 
-				this.exact = true;
-				return this;
+				return exact( true );
 
 			}
 
@@ -4691,7 +4773,6 @@ public class ReactiveMongoDsl<K> {
 				long numCandidates
 			) {
 
-				this.exact = false;
 				return numCandidates( numCandidates );
 
 			}
@@ -4908,17 +4989,37 @@ public class ReactiveMongoDsl<K> {
 				}
 
 				if (this.queryVector == null && (this.queryText == null || this.queryText.isBlank())) {
-					throw new IllegalStateException( "vectorSearch.queryVector or vectorSearch.queryText is required" );
+					throw new IllegalStateException( "vectorSearch.queryVector or vectorSearch.query is required" );
 
 				}
 
 				if (this.queryVector != null && this.queryText != null && ! this.queryText.isBlank()) {
-					throw new IllegalStateException( "vectorSearch.queryVector and vectorSearch.queryText cannot be used together" );
+					throw new IllegalStateException( "vectorSearch.queryVector and vectorSearch.query cannot be used together" );
+
+				}
+
+				if (this.queryVector != null && this.model != null && ! this.model.isBlank()) {
+					throw new IllegalStateException( "vectorSearch.model can be used only with automated text query, not queryVector" );
+
+				}
+
+				if (Boolean.TRUE.equals( this.exact ) && this.numCandidates != null) {
+					throw new IllegalStateException( "vectorSearch.exact=true and numCandidates cannot be used together" );
 
 				}
 
 				if (! Boolean.TRUE.equals( this.exact ) && this.numCandidates == null) {
 					throw new IllegalStateException( "vectorSearch.numCandidates is required for ANN search" );
+
+				}
+
+				if (this.numCandidates != null && this.numCandidates < this.limit) {
+					throw new IllegalStateException( "vectorSearch.numCandidates must be >= limit" );
+
+				}
+
+				if (this.numCandidates != null && this.numCandidates > 10000L) {
+					throw new IllegalStateException( "vectorSearch.numCandidates must be <= 10000" );
 
 				}
 
@@ -4941,7 +5042,19 @@ public class ReactiveMongoDsl<K> {
 				}
 
 				if (this.queryText != null && ! this.queryText.isBlank()) {
-					body.append( "queryText", this.queryText );
+					if (this.textQueryShape == VectorTextQueryShape.TEXT_OBJECT) {
+						body.append( "query", new Document( "text", this.queryText ) );
+
+					}
+					else {
+						body.append( "query", this.queryText );
+
+					}
+
+				}
+
+				if (this.model != null && ! this.model.isBlank()) {
+					body.append( "model", this.model );
 
 				}
 
