@@ -34,7 +34,6 @@ import org.springframework.data.mongodb.core.aggregation.AggregationOperation;
 import org.springframework.data.mongodb.core.aggregation.AggregationOptions;
 import org.springframework.data.mongodb.core.aggregation.AggregationUpdate;
 import org.springframework.data.mongodb.core.aggregation.FacetOperation;
-import org.springframework.data.mongodb.core.aggregation.ProjectionOperation;
 import org.springframework.data.mongodb.core.mapping.MongoMappingContext;
 import org.springframework.data.mongodb.core.mapping.MongoPersistentEntity;
 import org.springframework.data.mongodb.core.mapping.MongoPersistentProperty;
@@ -59,6 +58,7 @@ import com.byeolnaerim.mongodsl.criteria.MongoCriteriaSupport;
 import com.byeolnaerim.mongodsl.internal.MongoIdFieldResolver;
 import com.byeolnaerim.mongodsl.lookup.LookupSpec;
 import com.byeolnaerim.mongodsl.result.PageResult;
+import com.byeolnaerim.mongodsl.result.PageStream;
 import com.byeolnaerim.mongodsl.result.ResultTuple;
 import com.byeolnaerim.mongodsl.search.AtlasSearchOperator;
 import com.byeolnaerim.mongodsl.search.AutocompleteClause;
@@ -2256,9 +2256,34 @@ public class ReactiveMongoDsl<K> {
 
 				Flux<E> execute();
 
+				/**
+				 * Executes the current query as a reactive page.
+				 * <p>The data part remains a {@link Flux}; use {@code data()} for streaming
+				 * processing and {@code totalCount()} only when the total count is needed.</p>
+				 *
+				 * @return a reactive page wrapper containing streamed data and total count
+				 */
+				PageStream<E> executePageStream();
+
 			}
 
 			public interface FindAllAggregation<E> extends Runner {
+
+				/**
+				 * Executes the current query as an aggregation pipeline and emits mapped
+				 * entities directly. This method is intended for batch/streaming workloads.
+				 *
+				 * @return a {@link Flux} emitting aggregation results one by one
+				 */
+				Flux<E> executeAggregationStream();
+
+				/**
+				 * Executes the current aggregation as a reactive page. The page data remains
+				 * a {@link Flux}; total count is exposed as a separate {@link Mono}.
+				 *
+				 * @return a reactive page wrapper for aggregation results
+				 */
+				PageStream<E> executeAggregationPageStream();
 
 				Mono<PageResult<E>> executeAggregation();
 
@@ -4250,9 +4275,19 @@ public class ReactiveMongoDsl<K> {
 				 */
 				public Mono<PageResult<E>> executePage() {
 
-					Mono<List<E>> dataMono = execute().collectList();
-					Mono<Long> totalMono = count().execute();
-					return Mono.zip( dataMono, totalMono ).map( tuple -> new PageResult<>( tuple.getT1(), tuple.getT2() ) );
+					return executePageStream().collectToPageResult();
+
+				}
+
+				/**
+				 * Executes the Atlas Search query as a reactive page. The data stream is not
+				 * collected unless the caller explicitly invokes {@code collectToPageResult()}.
+				 *
+				 * @return a reactive page wrapper containing streamed search data and total count
+				 */
+				public PageStream<E> executePageStream() {
+
+					return new PageStream<>( execute(), count().execute() );
 
 				}
 
@@ -5042,11 +5077,11 @@ public class ReactiveMongoDsl<K> {
 				}
 
 				if (this.queryText != null && ! this.queryText.isBlank()) {
+
 					if (this.textQueryShape == VectorTextQueryShape.TEXT_OBJECT) {
 						body.append( "query", new Document( "text", this.queryText ) );
 
-					}
-					else {
+					} else {
 						body.append( "query", this.queryText );
 
 					}
@@ -5515,114 +5550,111 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Executes the current query as an aggregation pipeline.
-			 * <p>When paging is configured, this method builds a {@code $facet(data, totalCount)} pipeline
-			 * and returns a {@link PageResult} containing both page data and total count.</p>
+			 * Executes the current query as a reactive page. Unlike {@link PageResult},
+			 * the data side is kept as a {@link Flux}, so batch callers can keep
+			 * streaming with {@code executePageStream().data().flatMap(...)}.
 			 *
-			 * @return a {@link Mono} emitting the paged aggregation result
+			 * @return a reactive page wrapper containing streamed data and total count
+			 */
+			@Override
+			public PageStream<E> executePageStream() {
+
+				return new PageStream<>( execute(), new CountQueryBuilder().execute() );
+
+			}
+
+			/**
+			 * Builds the aggregation pipeline used by streaming aggregation reads.
+			 * This deliberately avoids {@code $facet} so documents can be emitted as
+			 * the cursor produces them.
+			 */
+			private List<AggregationOperation> buildFindAllAggregationOps(
+				Optional<Criteria> criteriaOptional, boolean includePaging, boolean includeProjection
+			) {
+
+				List<AggregationOperation> operations = new ArrayList<>();
+
+				criteriaOptional.ifPresent( criteria -> operations.add( Aggregation.match( criteria ) ) );
+
+				operations
+					.add(
+						Aggregation
+							.sort(
+								(this.sort != null && this.sort.isSorted())
+									? this.sort
+									: Sort.by( Sort.Direction.DESC, "_id" )
+							)
+					);
+
+				if (includePaging && paging != null) {
+					operations.add( Aggregation.skip( (long) paging.pageNumber * paging.pageSize ) );
+					operations.add( Aggregation.limit( paging.pageSize ) );
+
+				}
+
+				if (includeProjection && excludes != null && excludes.length != 0) {
+					operations.add( Aggregation.project().andExclude( excludes ) );
+
+				}
+
+				return operations;
+
+			}
+
+			/**
+			 * Executes the current query as an aggregation pipeline and streams mapped
+			 * entities directly. This is the aggregation counterpart of {@link #execute()}
+			 * for batch jobs.
+			 *
+			 * @return a {@link Flux} emitting aggregation results one by one
+			 */
+			@Override
+			public Flux<E> executeAggregationStream() {
+
+				Mono<Aggregation> aggregationMono = fieldBuilder
+					.buildCriteria()
+					.map( criteriaOptional -> applyAggOptions( Aggregation.newAggregation( buildFindAllAggregationOps( criteriaOptional, true, true ) ) ) );
+
+				return Mono
+					.zip( executeClassMono, aggregationMono )
+					.flatMapMany( tuple -> {
+						Class<E> entityClass = tuple.getT1();
+						Aggregation aggregation = tuple.getT2();
+
+						return collectionName != null && ! collectionName.isBlank()
+							? reactiveMongoTemplate.aggregate( aggregation, collectionName, entityClass )
+							: reactiveMongoTemplate.aggregate( aggregation, entityClass, entityClass );
+
+					} );
+
+			}
+
+			/**
+			 * Executes the current aggregation as a reactive page. Data and count are
+			 * independent publishers, so callers can consume {@code data()} as a stream
+			 * instead of waiting for a {@link PageResult}.
+			 *
+			 * @return a reactive page wrapper for aggregation results
+			 */
+			@Override
+			public PageStream<E> executeAggregationPageStream() {
+
+				return new PageStream<>( executeAggregationStream(), new CountQueryBuilder().executeAggregation() );
+
+			}
+
+			/**
+			 * Executes the current query as an aggregation pipeline and collects the
+			 * streamed page data into the legacy {@link PageResult} shape. Prefer
+			 * {@link #executeAggregationStream()} or {@link #executeAggregationPageStream()}
+			 * for batch jobs.
+			 *
+			 * @return a {@link Mono} emitting the collected aggregation result
 			 */
 			@Override
 			public Mono<PageResult<E>> executeAggregation() {
 
-				// fieldBuilder.buildCriteria()는 Mono<Optional<Criteria>>를 반환한다고 가정합니다.
-				Mono<Aggregation> aggregationMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					List<AggregationOperation> operations = new ArrayList<>();
-
-					// criteriaOptional이 존재하면 $match 단계 추가
-					if (criteriaOptional.isPresent()) {
-						operations.add( Aggregation.match( criteriaOptional.get() ) );
-
-					}
-
-					// 정렬 단계 추가 (this.sort가 null이 아니라고 가정)
-					operations
-						.add(
-							Aggregation
-								.sort(
-									(this.sort != null && this.sort.isSorted())
-										? this.sort
-										: Sort.by( Sort.Direction.DESC, "_id" )
-								)
-						);
-
-
-					if (paging != null) {
-						// operations.add( Aggregation.limit( paging.pageSize ) );
-						// operations.add( Aggregation.skip( (long) paging.pageNumber * paging.pageSize ) );
-
-						// "data" facet: 실제 데이터를 skip 후 limit 적용
-						AggregationOperation dataFacet = Aggregation.skip( (long) paging.pageNumber * paging.pageSize );
-						AggregationOperation dataLimitFacet = Aggregation.limit( paging.pageSize );
-
-						// "totalCount" facet: 전체 개수를 계산
-						AggregationOperation countFacet = Aggregation.count().as( "count" );
-
-						FacetOperation facetOperation = Aggregation
-							.facet( dataFacet, dataLimitFacet )
-							.as( "data" )
-							.and( countFacet )
-							.as( "totalCount" );
-						operations.add( facetOperation );
-
-					}
-
-					// excludes가 있을 경우 $project 단계로 제외할 필드 지정
-					if (excludes != null && excludes.length != 0) {
-						ProjectionOperation projection = Aggregation.project().andExclude( excludes );
-						operations.add( projection );
-
-					}
-
-					Aggregation aggregation = applyAggOptions( Aggregation.newAggregation( operations ) );
-
-					return aggregation;
-
-				} );
-				Mono<PageResult<E>> result = Mono
-					.zip( executeClassMono, aggregationMono )
-					.flatMap( tuple -> {
-						Class<E> entityClass = tuple.getT1();
-						Aggregation aggregation = tuple.getT2();
-
-						// collectionName이 지정되어 있으면 해당 컬렉션에서 Aggregation 실행
-						Flux<Document> resultDocument;
-
-						if (collectionName != null && ! collectionName.isBlank()) {
-							resultDocument = reactiveMongoTemplate
-								.aggregate( aggregation, collectionName, Document.class );
-
-						} else {
-							resultDocument = reactiveMongoTemplate
-								.aggregate( aggregation, entityClass, Document.class );
-
-						}
-
-						return resultDocument
-							.single()
-							.map( doc -> {
-								// "data" 배열 추출 후, Entity로 매핑
-								@SuppressWarnings("unchecked")
-								List<Document> dataDocs = (List<Document>) doc.get( "data" );
-								List<E> entities = dataDocs
-									.stream()
-									.map( document -> reactiveMongoTemplate.getConverter().read( entityClass, document ) )
-									.collect( Collectors.toList() );
-
-								// "totalCount" 배열에서 전체 개수 추출
-								@SuppressWarnings("unchecked")
-								List<Document> countDocs = (List<Document>) doc.get( "totalCount" );
-								Number countNumber = countDocs.isEmpty()
-									? 0
-									: countDocs.get( 0 ).get( "count", Number.class );
-								long totalCount = countNumber == null ? 0 : countNumber.longValue();
-								return new PageResult<>( entities, totalCount );
-
-							} );
-
-					} );
-
-				return result;
-				// .onErrorMap( e -> new RuntimeException( "Failed to find with: " + e.getMessage(), e ) );
+				return executeAggregationPageStream().collectToPageResult();
 
 			}
 
