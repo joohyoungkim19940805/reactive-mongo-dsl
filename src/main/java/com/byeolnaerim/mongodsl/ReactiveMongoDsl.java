@@ -7187,307 +7187,398 @@ public class ReactiveMongoDsl<K> {
 		 */
 		public class AtomicUpdateQueryBuilder {
 
-			private boolean multi = false;
-
-			private boolean upsert = false;
-
-			private final DocumentSpec doc = new DocumentSpec();
-
-			private final PipelineSpec pipe = new PipelineSpec();
-
 			/**
-			 * Configures the update to affect all matching documents.
-			 *
-			 * @return this builder
+			 * Execution mode for an atomic update.
 			 */
-			public AtomicUpdateQueryBuilder multi() {
-
-				this.multi = true;
-				return this;
-
+			private enum AtomicUpdateMode {
+				FIRST,
+				MULTI,
+				UPSERT_ONE
 			}
 
 			/**
 			 * Configures the update to affect only the first matching document.
+			 * <p>This is the default MongoDB/Spring Data single-update behavior, but it
+			 * is exposed explicitly so callers must choose the update cardinality before
+			 * choosing the update shape and operations.</p>
 			 *
-			 * @return this builder
+			 * @return a typed builder for choosing document or pipeline update operations
 			 */
-			public AtomicUpdateQueryBuilder first() {
+			public AtomicUpdateTypedBuilder first() {
 
-				this.multi = false;
-				return this;
+				return new AtomicUpdateTypedBuilder( AtomicUpdateMode.FIRST );
 
 			}
 
 			/**
-			 * Enables upsert semantics for the update operation.
+			 * Configures the update to affect all matching documents.
 			 *
-			 * @return this builder
+			 * @return a typed builder for choosing document or pipeline update operations
 			 */
-			public AtomicUpdateQueryBuilder upsert() {
+			public AtomicUpdateTypedBuilder multi() {
 
-				this.upsert = true;
-				return this;
-
-			}
-
-			// -------------------------
-			// Document(Update) 연산들
-			// -------------------------
-
-			/**
-			 * Increments the given field by the specified delta.
-			 *
-			 * @param field
-			 *            the target field
-			 * @param delta
-			 *            the increment amount
-			 * 
-			 * @return this builder
-			 */
-			public AtomicUpdateQueryBuilder inc(
-				String field, Number delta
-			) {
-
-				doc.inc( field, delta );
-				return this;
+				return new AtomicUpdateTypedBuilder( AtomicUpdateMode.MULTI );
 
 			}
 
 			/**
-			 * Sets the given field to the specified value.
+			 * Configures a single-document upsert.
+			 * <p>MongoDB/Spring Data upsert is single-document oriented. This method name
+			 * intentionally includes {@code One} so callers do not mistake it for a
+			 * multi-upsert operation.</p>
 			 *
-			 * @param field
-			 *            the target field
-			 * @param value
-			 *            the value to assign
-			 * 
-			 * @return this builder
+			 * @return a typed builder for choosing document or pipeline update operations
 			 */
-			public AtomicUpdateQueryBuilder set(
-				String field, Object value
-			) {
+			public AtomicUpdateTypedBuilder upsertOne() {
 
-				doc.set( field, value );
-				return this;
+				return new AtomicUpdateTypedBuilder( AtomicUpdateMode.UPSERT_ONE );
 
 			}
 
 			/**
-			 * Sets the given field only when an upsert results in an insert.
+			 * Configures a single-document upsert.
 			 *
-			 * @param field
-			 *            the target field
-			 * @param value
-			 *            the value to assign on insert
-			 * 
-			 * @return this builder
+			 * @return a typed builder for choosing document or pipeline update operations
+			 *
+			 * @deprecated use {@link #upsertOne()} to make the single-document semantics explicit
 			 */
-			public AtomicUpdateQueryBuilder setOnInsert(
-				String field, Object value
-			) {
+			@Deprecated
+			public AtomicUpdateTypedBuilder upsert() {
 
-				doc.setOnInsert( field, value );
-				return this;
+				return upsertOne();
 
 			}
 
 			/**
-			 * Removes the given field from the matched document.
-			 *
-			 * @param field
-			 *            the target field
-			 * 
-			 * @return this builder
+			 * Builder returned after the caller has explicitly selected the update mode.
 			 */
-			public AtomicUpdateQueryBuilder unset(
-				String field
-			) {
+			public class AtomicUpdateTypedBuilder {
 
-				doc.unset( field );
-				return this;
+				private final AtomicUpdateMode mode;
+
+				private AtomicUpdateTypedBuilder(
+					AtomicUpdateMode mode
+				) {
+
+					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
+
+				}
+
+				/**
+				 * Selects regular MongoDB update operators such as {@code $set}, {@code $inc},
+				 * {@code $unset}, {@code $push}, {@code $pull}, and {@code $setOnInsert}.
+				 *
+				 * @return a document-update builder
+				 */
+				public AtomicDocumentUpdateBuilder document() {
+
+					return new AtomicDocumentUpdateBuilder( mode );
+
+				}
+
+				/**
+				 * Selects aggregation-pipeline update operators.
+				 *
+				 * @return a pipeline-update builder
+				 */
+				public AtomicPipelineUpdateBuilder pipeline() {
+
+					return new AtomicPipelineUpdateBuilder( mode );
+
+				}
 
 			}
 
 			/**
-			 * Pushes the given value into the target array field.
-			 *
-			 * @param field
-			 *            the target array field
-			 * @param value
-			 *            the value to push
-			 * 
-			 * @return this builder
+			 * Document-update builder for regular {@link Update} operators.
 			 */
-			public AtomicUpdateQueryBuilder push(
-				String field, Object value
-			) {
+			public class AtomicDocumentUpdateBuilder {
 
-				doc.push( field, value );
-				return this;
+				private final AtomicUpdateMode mode;
+
+				private final DocumentSpec doc = new DocumentSpec();
+
+				private AtomicDocumentUpdateBuilder(
+					AtomicUpdateMode mode
+				) {
+
+					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
+
+				}
+
+				/**
+				 * Increments the given field by the specified delta.
+				 *
+				 * @param field
+				 *            the target field
+				 * @param delta
+				 *            the increment amount
+				 *
+				 * @return this builder
+				 */
+				public AtomicDocumentUpdateBuilder inc(
+					String field, Number delta
+				) {
+
+					doc.inc( field, delta );
+					return this;
+
+				}
+
+				/**
+				 * Sets the given field to the specified value.
+				 *
+				 * @param field
+				 *            the target field
+				 * @param value
+				 *            the value to assign
+				 *
+				 * @return this builder
+				 */
+				public AtomicDocumentUpdateBuilder set(
+					String field, Object value
+				) {
+
+					doc.set( field, value );
+					return this;
+
+				}
+
+				/**
+				 * Sets the given field only when {@link #execute()} performs an insert through
+				 * {@code atomicUpdate().upsertOne().document()}.
+				 *
+				 * @param field
+				 *            the target field
+				 * @param value
+				 *            the value to assign on insert
+				 *
+				 * @return this builder
+				 */
+				public AtomicDocumentUpdateBuilder setOnInsert(
+					String field, Object value
+				) {
+
+					if (mode != AtomicUpdateMode.UPSERT_ONE) {
+						throw new IllegalStateException( "setOnInsert() requires atomicUpdate().upsertOne().document()." );
+					}
+
+					doc.setOnInsert( field, value );
+					return this;
+
+				}
+
+				/**
+				 * Removes the given field from the matched document.
+				 *
+				 * @param field
+				 *            the target field
+				 *
+				 * @return this builder
+				 */
+				public AtomicDocumentUpdateBuilder unset(
+					String field
+				) {
+
+					doc.unset( field );
+					return this;
+
+				}
+
+				/**
+				 * Pushes the given value into the target array field.
+				 *
+				 * @param field
+				 *            the target array field
+				 * @param value
+				 *            the value to push
+				 *
+				 * @return this builder
+				 */
+				public AtomicDocumentUpdateBuilder push(
+					String field, Object value
+				) {
+
+					doc.push( field, value );
+					return this;
+
+				}
+
+				/**
+				 * Adds the given value to the target array field if it is not already present.
+				 *
+				 * @param field
+				 *            the target array field
+				 * @param value
+				 *            the value to add
+				 *
+				 * @return this builder
+				 */
+				public AtomicDocumentUpdateBuilder addToSet(
+					String field, Object value
+				) {
+
+					doc.addToSet( field, value );
+					return this;
+
+				}
+
+				/**
+				 * Removes matching values from the target array field.
+				 *
+				 * @param field
+				 *            the target array field
+				 * @param value
+				 *            the value to remove
+				 *
+				 * @return this builder
+				 */
+				public AtomicDocumentUpdateBuilder pull(
+					String field, Object value
+				) {
+
+					doc.pull( field, value );
+					return this;
+
+				}
+
+				/**
+				 * Executes the configured document-based atomic update.
+				 *
+				 * @return a {@link Mono} emitting the update result
+				 */
+				public Mono<UpdateResult> execute() {
+
+					if (doc.isEmpty())
+						return Mono.error( new IllegalStateException( "No document update specified." ) );
+
+					UpdateDefinition updateDefinition = doc.build();
+					return doExecute( mode, updateDefinition );
+
+				}
 
 			}
 
 			/**
-			 * Adds the given value to the target array field if it is not already present.
-			 *
-			 * @param field
-			 *            the target array field
-			 * @param value
-			 *            the value to add
-			 * 
-			 * @return this builder
+			 * Pipeline-update builder for {@link AggregationUpdate} operators.
 			 */
-			public AtomicUpdateQueryBuilder addToSet(
-				String field, Object value
-			) {
+			public class AtomicPipelineUpdateBuilder {
 
-				doc.addToSet( field, value );
-				return this;
+				private final AtomicUpdateMode mode;
 
-			}
+				private final PipelineSpec pipe = new PipelineSpec();
 
-			/**
-			 * Removes matching values from the target array field.
-			 *
-			 * @param field
-			 *            the target array field
-			 * @param value
-			 *            the value to remove
-			 * 
-			 * @return this builder
-			 */
-			public AtomicUpdateQueryBuilder pull(
-				String field, Object value
-			) {
+				private AtomicPipelineUpdateBuilder(
+					AtomicUpdateMode mode
+				) {
 
-				doc.pull( field, value );
-				return this;
+					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
 
-			}
+				}
 
-			// -------------------------
-			// Pipeline(AggregationUpdate) 연산들
-			// (이름을 구분하거나, pipelineXXX로 두는게 안전)
-			// -------------------------
+				/**
+				 * Adds a pipeline-based {@code $set} expression for the given field.
+				 *
+				 * @param field
+				 *            the target field
+				 * @param valueOrExpr
+				 *            the assigned value or aggregation expression
+				 *
+				 * @return this builder
+				 */
+				public AtomicPipelineUpdateBuilder set(
+					String field, Object valueOrExpr
+				) {
 
-			/**
-			 * Adds a pipeline-based {@code $set} expression for the given field.
-			 *
-			 * @param field
-			 *            the target field
-			 * @param valueOrExpr
-			 *            the assigned value or aggregation expression
-			 * 
-			 * @return this builder
-			 */
-			public AtomicUpdateQueryBuilder pipelineSet(
-				String field, Object valueOrExpr
-			) {
+					pipe.set( field, valueOrExpr );
+					return this;
 
-				pipe.set( field, valueOrExpr );
-				return this;
+				}
 
-			}
+				/**
+				 * Adds a pipeline-based increment expression for the given field.
+				 *
+				 * @param field
+				 *            the target field
+				 * @param delta
+				 *            the increment amount
+				 *
+				 * @return this builder
+				 */
+				public AtomicPipelineUpdateBuilder inc(
+					String field, Number delta
+				) {
 
-			/**
-			 * Adds a pipeline-based increment expression for the given field.
-			 *
-			 * @param field
-			 *            the target field
-			 * @param delta
-			 *            the increment amount
-			 * 
-			 * @return this builder
-			 */
-			public AtomicUpdateQueryBuilder pipelineInc(
-				String field, Number delta
-			) {
+					pipe.inc( field, delta );
+					return this;
 
-				pipe.inc( field, delta );
-				return this;
+				}
 
-			}
+				/**
+				 * Adds a pipeline-based {@code $unset} stage for the given fields.
+				 *
+				 * @param fields
+				 *            the fields to unset
+				 *
+				 * @return this builder
+				 */
+				public AtomicPipelineUpdateBuilder unset(
+					String... fields
+				) {
 
-			/**
-			 * Adds a pipeline-based {@code $unset} stage for the given fields.
-			 *
-			 * @param fields
-			 *            the fields to unset
-			 * 
-			 * @return this builder
-			 */
-			public AtomicUpdateQueryBuilder pipelineUnset(
-				String... fields
-			) {
+					pipe.unset( fields );
+					return this;
 
-				pipe.unset( fields );
-				return this;
+				}
 
-			}
+				/**
+				 * Appends a raw aggregation update stage.
+				 *
+				 * @param stage
+				 *            the raw stage document
+				 *
+				 * @return this builder
+				 */
+				public AtomicPipelineUpdateBuilder stage(
+					Document stage
+				) {
 
-			/**
-			 * Appends a raw aggregation update stage.
-			 *
-			 * @param stage
-			 *            the raw stage document
-			 * 
-			 * @return this builder
-			 */
-			public AtomicUpdateQueryBuilder stage(
-				Document stage
-			) {
+					pipe.stage( stage );
+					return this;
 
-				pipe.stage( stage );
-				return this;
+				}
 
-			}
+				/**
+				 * Flushes the current pending pipeline stage and starts a new stage boundary.
+				 *
+				 * @return this builder
+				 */
+				public AtomicPipelineUpdateBuilder nextStage() {
 
-			/**
-			 * Flushes the current pending pipeline stage and starts a new stage boundary.
-			 *
-			 * @return this builder
-			 */
-			public AtomicUpdateQueryBuilder nextStage() {
+					pipe.nextStage();
+					return this;
 
-				pipe.nextStage();
-				return this;
+				}
 
-			}
+				/**
+				 * Executes the configured pipeline-based atomic update.
+				 *
+				 * @return a {@link Mono} emitting the update result
+				 */
+				public Mono<UpdateResult> execute() {
 
-			// -------------------------
-			// execute 분기
-			// -------------------------
-			/**
-			 * Executes the configured document-based atomic update.
-			 *
-			 * @return a {@link Mono} emitting the update result
-			 */
-			public Mono<UpdateResult> execute() {
+					if (pipe.isEmpty())
+						return Mono.error( new IllegalStateException( "No pipeline update specified." ) );
 
-				UpdateDefinition ud = doc.build();
-				if (doc.isEmpty())
-					return Mono.error( new IllegalStateException( "No document update specified." ) );
-				return doExecute( ud );
+					UpdateDefinition updateDefinition = pipe.build();
+					return doExecute( mode, updateDefinition );
 
-			}
-
-			/**
-			 * Executes the configured pipeline-based atomic update.
-			 *
-			 * @return a {@link Mono} emitting the update result
-			 */
-			public Mono<UpdateResult> executeAggregation() {
-
-				UpdateDefinition ud = pipe.build();
-				if (pipe.isEmpty())
-					return Mono.error( new IllegalStateException( "No pipeline update specified." ) );
-				return doExecute( ud );
+				}
 
 			}
 
 			private Mono<UpdateResult> doExecute(
-				UpdateDefinition updateDef
+				AtomicUpdateMode mode, UpdateDefinition updateDef
 			) {
 
 				Mono<Query> queryMono = fieldBuilder.buildCriteria().map( opt -> {
@@ -7507,28 +7598,24 @@ public class ReactiveMongoDsl<K> {
 						boolean hasCollection = (collectionName != null && ! collectionName.isBlank());
 
 						if (hasCollection) {
-							if (upsert)
-								return reactiveMongoTemplate.upsert( query, updateDef, entityClass, collectionName );
-							if (multi)
-								return reactiveMongoTemplate.updateMulti( query, updateDef, entityClass, collectionName );
-							return reactiveMongoTemplate.updateFirst( query, updateDef, entityClass, collectionName );
-
-						} else {
-							if (upsert)
-								return reactiveMongoTemplate.upsert( query, updateDef, entityClass );
-							if (multi)
-								return reactiveMongoTemplate.updateMulti( query, updateDef, entityClass );
-							return reactiveMongoTemplate.updateFirst( query, updateDef, entityClass );
+							return switch (mode) {
+								case UPSERT_ONE -> reactiveMongoTemplate.upsert( query, updateDef, entityClass, collectionName );
+								case MULTI -> reactiveMongoTemplate.updateMulti( query, updateDef, entityClass, collectionName );
+								case FIRST -> reactiveMongoTemplate.updateFirst( query, updateDef, entityClass, collectionName );
+							};
 
 						}
+
+						return switch (mode) {
+							case UPSERT_ONE -> reactiveMongoTemplate.upsert( query, updateDef, entityClass );
+							case MULTI -> reactiveMongoTemplate.updateMulti( query, updateDef, entityClass );
+							case FIRST -> reactiveMongoTemplate.updateFirst( query, updateDef, entityClass );
+						};
 
 					} );
 
 			}
 
-			// -------------------------
-			// 내부 Spec
-			// -------------------------
 			private class DocumentSpec {
 
 				private final Update update = new Update();
@@ -7688,6 +7775,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 		}
+
 
 
 
