@@ -7229,9 +7229,9 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @return a typed builder for choosing document or pipeline update operations
 			 */
-			public AtomicUpdateTypedBuilder upsertOne() {
+			public AtomicUpsertTypedBuilder upsertOne() {
 
-				return new AtomicUpdateTypedBuilder( AtomicUpdateMode.UPSERT_ONE );
+				return new AtomicUpsertTypedBuilder();
 
 			}
 
@@ -7243,7 +7243,7 @@ public class ReactiveMongoDsl<K> {
 			 * @deprecated use {@link #upsertOne()} to make the single-document semantics explicit
 			 */
 			@Deprecated
-			public AtomicUpdateTypedBuilder upsert() {
+			public AtomicUpsertTypedBuilder upsert() {
 
 				return upsertOne();
 
@@ -7256,7 +7256,7 @@ public class ReactiveMongoDsl<K> {
 
 				private final AtomicUpdateMode mode;
 
-				private AtomicUpdateTypedBuilder(
+				protected AtomicUpdateTypedBuilder(
 					AtomicUpdateMode mode
 				) {
 
@@ -7290,15 +7290,42 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
+			 * Builder returned after the caller has explicitly selected single-document upsert mode.
+			 * <p>This type narrows {@link #document()} so {@code setOnInsert()} is available
+			 * only after {@code atomicUpdate().upsertOne().document()} at compile time.</p>
+			 */
+			public class AtomicUpsertTypedBuilder extends AtomicUpdateTypedBuilder {
+
+				private AtomicUpsertTypedBuilder() {
+
+					super( AtomicUpdateMode.UPSERT_ONE );
+
+				}
+
+				/**
+				 * Selects regular MongoDB update operators for a single-document upsert.
+				 *
+				 * @return an upsert document-update builder that exposes {@code setOnInsert()}
+				 */
+				@Override
+				public AtomicUpsertDocumentBuilder document() {
+
+					return new AtomicUpsertDocumentBuilder();
+
+				}
+
+			}
+
+			/**
 			 * Document-update builder for regular {@link Update} operators.
 			 */
 			public class AtomicDocumentUpdateBuilder {
 
-				private final AtomicUpdateMode mode;
+				protected final AtomicUpdateMode mode;
 
-				private final DocumentSpec doc = new DocumentSpec();
+				protected final DocumentSpec doc = new DocumentSpec();
 
-				private AtomicDocumentUpdateBuilder(
+				protected AtomicDocumentUpdateBuilder(
 					AtomicUpdateMode mode
 				) {
 
@@ -7344,29 +7371,6 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				/**
-				 * Sets the given field only when {@link #execute()} performs an insert through
-				 * {@code atomicUpdate().upsertOne().document()}.
-				 *
-				 * @param field
-				 *            the target field
-				 * @param value
-				 *            the value to assign on insert
-				 *
-				 * @return this builder
-				 */
-				public AtomicDocumentUpdateBuilder setOnInsert(
-					String field, Object value
-				) {
-
-					if (mode != AtomicUpdateMode.UPSERT_ONE) {
-						throw new IllegalStateException( "setOnInsert() requires atomicUpdate().upsertOne().document()." );
-					}
-
-					doc.setOnInsert( field, value );
-					return this;
-
-				}
 
 				/**
 				 * Removes the given field from the matched document.
@@ -7454,6 +7458,101 @@ public class ReactiveMongoDsl<K> {
 
 					UpdateDefinition updateDefinition = doc.build();
 					return doExecute( mode, updateDefinition );
+
+				}
+
+			}
+
+			/**
+			 * Document-update builder for {@code atomicUpdate().upsertOne().document()}.
+			 * <p>This subclass is the only document-update builder that exposes
+			 * {@code setOnInsert()}, so {@code first().document()} and {@code multi().document()}
+			 * cannot call it at compile time.</p>
+			 */
+			public class AtomicUpsertDocumentBuilder extends AtomicDocumentUpdateBuilder {
+
+				private AtomicUpsertDocumentBuilder() {
+
+					super( AtomicUpdateMode.UPSERT_ONE );
+
+				}
+
+				@Override
+				public AtomicUpsertDocumentBuilder inc(
+					String field, Number delta
+				) {
+
+					super.inc( field, delta );
+					return this;
+
+				}
+
+				@Override
+				public AtomicUpsertDocumentBuilder set(
+					String field, Object value
+				) {
+
+					super.set( field, value );
+					return this;
+
+				}
+
+				/**
+				 * Sets the given field only when the upsert inserts a new document.
+				 *
+				 * @param field
+				 *            the target field
+				 * @param value
+				 *            the value to assign on insert
+				 *
+				 * @return this builder
+				 */
+				public AtomicUpsertDocumentBuilder setOnInsert(
+					String field, Object value
+				) {
+
+					doc.setOnInsert( field, value );
+					return this;
+
+				}
+
+				@Override
+				public AtomicUpsertDocumentBuilder unset(
+					String field
+				) {
+
+					super.unset( field );
+					return this;
+
+				}
+
+				@Override
+				public AtomicUpsertDocumentBuilder push(
+					String field, Object value
+				) {
+
+					super.push( field, value );
+					return this;
+
+				}
+
+				@Override
+				public AtomicUpsertDocumentBuilder addToSet(
+					String field, Object value
+				) {
+
+					super.addToSet( field, value );
+					return this;
+
+				}
+
+				@Override
+				public AtomicUpsertDocumentBuilder pull(
+					String field, Object value
+				) {
+
+					super.pull( field, value );
+					return this;
 
 				}
 
