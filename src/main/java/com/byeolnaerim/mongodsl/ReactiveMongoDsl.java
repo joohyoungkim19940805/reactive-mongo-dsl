@@ -240,20 +240,21 @@ public class ReactiveMongoDsl<K> {
 	}
 
 	private FindPublisher<Document> applyQuery(
-		MongoCollection<Document> collection, MongoQuery query, ClientSession session
+		MongoExecutionContext executionContext, Class<?> entityClass, MongoCollection<Document> collection, MongoQuery query, ClientSession session
 	) {
 
 		MongoCollection<Document> target = query.readPreference() == null
 			? collection
 			: collection.withReadPreference( query.readPreference() );
+		Document filter = executionContext.mapQuery( entityClass, query.filter() );
 		FindPublisher<Document> publisher = session == null
-			? target.find( query.filter() )
-			: target.find( session, query.filter() );
+			? target.find( filter )
+			: target.find( session, filter );
 
 		if (query.sort() != null && query.sort().isSorted())
-			publisher = publisher.sort( query.sort().toDocument() );
+			publisher = publisher.sort( executionContext.mapSort( entityClass, query.sort().toDocument() ) );
 		if (! query.projection().isEmpty())
-			publisher = publisher.projection( query.projection() );
+			publisher = publisher.projection( executionContext.mapProjection( entityClass, query.projection() ) );
 		if (query.skip() > 0)
 			publisher = publisher.skip( Math.toIntExact( query.skip() ) );
 		if (query.limit() > 0)
@@ -272,8 +273,8 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMapMany(
 				collection -> executeFluxWithSession(
-					session -> applyQuery( collection, query, session ),
-					() -> applyQuery( collection, query, null )
+					session -> applyQuery( executionContext, entityClass, collection, query, session ),
+					() -> applyQuery( executionContext, entityClass, collection, query, null )
 				)
 			)
 			.map( document -> executionContext.read( entityClass, document ) );
@@ -287,8 +288,8 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
-					session -> applyQuery( collection, query, session ).first(),
-					() -> applyQuery( collection, query, null ).first()
+					session -> applyQuery( executionContext, entityClass, collection, query, session ).first(),
+					() -> applyQuery( executionContext, entityClass, collection, query, null ).first()
 				)
 			)
 			.map( document -> executionContext.read( entityClass, document ) );
@@ -296,16 +297,17 @@ public class ReactiveMongoDsl<K> {
 	}
 
 	private AggregatePublisher<Document> applyAggregation(
-		MongoCollection<Document> collection, MongoAggregation aggregation, ClientSession session
+		MongoExecutionContext executionContext, Class<?> entityClass, MongoCollection<Document> collection, MongoAggregation aggregation, ClientSession session
 	) {
 
 		MongoAggregationOptions options = aggregation.options();
 		MongoCollection<Document> target = options.readPreference() == null
 			? collection
 			: collection.withReadPreference( options.readPreference() );
+		List<Document> pipeline = executionContext.mapAggregationPipeline( entityClass, aggregation.pipeline() );
 		AggregatePublisher<Document> publisher = session == null
-			? target.aggregate( aggregation.pipeline() )
-			: target.aggregate( session, aggregation.pipeline() );
+			? target.aggregate( pipeline )
+			: target.aggregate( session, pipeline );
 
 		if (options.allowDiskUse() != null)
 			publisher = publisher.allowDiskUse( options.allowDiskUse() );
@@ -327,8 +329,8 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMapMany(
 				collection -> executeFluxWithSession(
-					session -> applyAggregation( collection, aggregation, session ),
-					() -> applyAggregation( collection, aggregation, null )
+					session -> applyAggregation( executionContext, entityClass, collection, aggregation, session ),
+					() -> applyAggregation( executionContext, entityClass, collection, aggregation, null )
 				)
 			);
 
@@ -440,11 +442,12 @@ public class ReactiveMongoDsl<K> {
 		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, Document filter, boolean many
 	) {
 
+		Document mappedFilter = executionContext.mapQuery( entityClass, filter );
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
-					session -> many ? collection.deleteMany( session, filter ) : collection.deleteOne( session, filter ),
-					() -> many ? collection.deleteMany( filter ) : collection.deleteOne( filter )
+					session -> many ? collection.deleteMany( session, mappedFilter ) : collection.deleteOne( session, mappedFilter ),
+					() -> many ? collection.deleteMany( mappedFilter ) : collection.deleteOne( mappedFilter )
 				)
 			);
 
@@ -466,9 +469,10 @@ public class ReactiveMongoDsl<K> {
 				if (query.limit() > 0)
 					options.limit( query.limit() );
 
+				Document filter = executionContext.mapQuery( entityClass, query.filter() );
 				return executeWithSession(
-					session -> target.countDocuments( session, query.filter(), options ),
-					() -> target.countDocuments( query.filter(), options )
+					session -> target.countDocuments( session, filter, options ),
+					() -> target.countDocuments( filter, options )
 				);
 
 			} );
@@ -482,8 +486,8 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
-					session -> applyQuery( collection, query.limit( 1 ), session ).first(),
-					() -> applyQuery( collection, query.limit( 1 ), null ).first()
+					session -> applyQuery( executionContext, entityClass, collection, query.limit( 1 ), session ).first(),
+					() -> applyQuery( executionContext, entityClass, collection, query.limit( 1 ), null ).first()
 				).hasElement()
 			);
 
@@ -493,6 +497,14 @@ public class ReactiveMongoDsl<K> {
 		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, MongoQuery query, MongoUpdateDefinition updateDefinition, boolean multi, boolean upsert
 	) {
 
+		Document filter = executionContext.mapQuery( entityClass, query.filter() );
+		Document updateDocument = updateDefinition.isPipeline()
+			? new Document()
+			: executionContext.mapUpdate( entityClass, updateDefinition.document() );
+		List<Document> updatePipeline = updateDefinition.isPipeline()
+			? executionContext.mapUpdatePipeline( entityClass, updateDefinition.pipeline() )
+			: List.of();
+
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
@@ -501,14 +513,14 @@ public class ReactiveMongoDsl<K> {
 
 						if (updateDefinition.isPipeline()) {
 							return multi
-								? collection.updateMany( session, query.filter(), updateDefinition.pipeline(), options )
-								: collection.updateOne( session, query.filter(), updateDefinition.pipeline(), options );
+								? collection.updateMany( session, filter, updatePipeline, options )
+								: collection.updateOne( session, filter, updatePipeline, options );
 
 						}
 
 						return multi
-							? collection.updateMany( session, query.filter(), updateDefinition.document(), options )
-							: collection.updateOne( session, query.filter(), updateDefinition.document(), options );
+							? collection.updateMany( session, filter, updateDocument, options )
+							: collection.updateOne( session, filter, updateDocument, options );
 
 					},
 					() -> {
@@ -516,14 +528,14 @@ public class ReactiveMongoDsl<K> {
 
 						if (updateDefinition.isPipeline()) {
 							return multi
-								? collection.updateMany( query.filter(), updateDefinition.pipeline(), options )
-								: collection.updateOne( query.filter(), updateDefinition.pipeline(), options );
+								? collection.updateMany( filter, updatePipeline, options )
+								: collection.updateOne( filter, updatePipeline, options );
 
 						}
 
 						return multi
-							? collection.updateMany( query.filter(), updateDefinition.document(), options )
-							: collection.updateOne( query.filter(), updateDefinition.document(), options );
+							? collection.updateMany( filter, updateDocument, options )
+							: collection.updateOne( filter, updateDocument, options );
 
 					}
 				)
@@ -794,9 +806,10 @@ public class ReactiveMongoDsl<K> {
 
 					}
 
+					keyDocument = mongoExecutionContext.mapQuery( entityClass, keyDocument );
 					document.remove( "_id" );
 					for (String key : keys)
-						document.remove( key );
+						document.remove( mongoExecutionContext.getMappedFieldName( entityClass, key ) );
 
 					Document updateDocument = new Document( "$setOnInsert", new Document( keyDocument ) );
 					if (! document.isEmpty())
@@ -1510,7 +1523,7 @@ public class ReactiveMongoDsl<K> {
 							: lookup.rightClass().map( rightClass -> {
 								String rightColl = (lookup.rightCollectionName() != null && ! lookup.rightCollectionName().isBlank())
 									? lookup.rightCollectionName()
-									: mongoExecutionContext.getCollectionName( rightClass );
+									: lookup.rightBuilder.getMongoExecutionContext().getCollectionName( rightClass );
 
 								String rightAs = (lookup.spec.getAs() != null && ! lookup.spec.getAs().isBlank())
 									? lookup.spec.getAs()
@@ -1520,13 +1533,18 @@ public class ReactiveMongoDsl<K> {
 
 								if (lookup.spec.getLocalField() != null && lookup.spec.getForeignField() != null) {
 									lk
-										.append( "localField", lookup.spec.getLocalField() )
-										.append( "foreignField", lookup.spec.getForeignField() );
+										.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, lookup.spec.getLocalField() ) )
+										.append( "foreignField", lookup.rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, lookup.spec.getForeignField() ) );
 
 								} else {
 									lk
 										.append( "let", Optional.ofNullable( lookup.spec.getLetDoc() ).orElseGet( Document::new ) )
-										.append( "pipeline", Optional.ofNullable( lookup.spec.getPipelineDocs() ).orElseGet( List::of ) );
+										.append(
+											"pipeline",
+											lookup.rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
+												rightClass, Optional.ofNullable( lookup.spec.getPipelineDocs() ).orElseGet( List::of )
+											)
+										);
 
 								}
 
@@ -1749,7 +1767,9 @@ public class ReactiveMongoDsl<K> {
 			}
 
 
-			protected Mono<Class<E>> getExecuteClassMono() { return executeClassMono; }
+			protected MongoExecutionContext getMongoExecutionContext() { return AbstractQueryBuilder.this.mongoExecutionContext; }
+
+		protected Mono<Class<E>> getExecuteClassMono() { return executeClassMono; }
 
 			protected String getCollectionName() { return collectionName; }
 
@@ -5208,7 +5228,9 @@ public class ReactiveMongoDsl<K> {
 						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
 
 						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of );
+						List<Document> userStages = rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
+							rightClass, Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of )
+						);
 						List<Document> nonLimitStages = new ArrayList<>();
 						List<Document> limitStages = new ArrayList<>();
 
@@ -5227,26 +5249,26 @@ public class ReactiveMongoDsl<K> {
 						if (! needPipeline) {
 							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
 							lookupBody
-								.append( "localField", spec.getLocalField() )
-								.append( "foreignField", spec.getForeignField() );
+								.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) )
+								.append( "foreignField", rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ) );
 
 						} else {
 							List<Document> pipe = new ArrayList<>();
 
 							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rc.getCriteriaObject() ) ) );
+							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rightBuilder.getMongoExecutionContext().mapQuery( rightClass, rc.getCriteriaObject() ) ) ) );
 
 							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
 							if (spec.getLocalField() != null && spec.getForeignField() != null) {
 								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lookupBody.append( "let", new Document( lfVar, "$" + spec.getLocalField() ) );
+								lookupBody.append( "let", new Document( lfVar, "$" + mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) ) );
 								pipe
 									.add(
 										new Document(
 											"$match",
 											new Document(
 												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + spec.getForeignField(), "$$" + lfVar ) )
+												new Document( "$eq", Arrays.asList( "$" + rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ), "$$" + lfVar ) )
 											)
 										)
 									);
@@ -5343,7 +5365,7 @@ public class ReactiveMongoDsl<K> {
 							List<R2> rightVal = (rightArr == null) ? List.of()
 								: rightArr
 									.stream()
-									.map( x -> mongoExecutionContext.read( rightClass, x ) )
+									.map( x -> rightBuilder.getMongoExecutionContext().read( rightClass, x ) )
 									.collect( Collectors.toList() );
 
 							return new ResultTuple<>( leftKey, leftVal, rightKey, rightVal );
@@ -5408,7 +5430,9 @@ public class ReactiveMongoDsl<K> {
 						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
 
 						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of );
+						List<Document> userStages = rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
+							rightClass, Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of )
+						);
 						List<Document> nonLimitStages = new ArrayList<>();
 						List<Document> limitStages = new ArrayList<>();
 
@@ -5427,26 +5451,26 @@ public class ReactiveMongoDsl<K> {
 						if (! needPipeline) {
 							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
 							lookupBody
-								.append( "localField", spec.getLocalField() )
-								.append( "foreignField", spec.getForeignField() );
+								.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) )
+								.append( "foreignField", rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ) );
 
 						} else {
 							List<Document> pipe = new ArrayList<>();
 
 							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rc.getCriteriaObject() ) ) );
+							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rightBuilder.getMongoExecutionContext().mapQuery( rightClass, rc.getCriteriaObject() ) ) ) );
 
 							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
 							if (spec.getLocalField() != null && spec.getForeignField() != null) {
 								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lookupBody.append( "let", new Document( lfVar, "$" + spec.getLocalField() ) );
+								lookupBody.append( "let", new Document( lfVar, "$" + mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) ) );
 								pipe
 									.add(
 										new Document(
 											"$match",
 											new Document(
 												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + spec.getForeignField(), "$$" + lfVar ) )
+												new Document( "$eq", Arrays.asList( "$" + rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ), "$$" + lfVar ) )
 											)
 										)
 									);
@@ -5560,12 +5584,12 @@ public class ReactiveMongoDsl<K> {
 									List<Document> rightDocs = (List<Document>) rawList;
 									rightVal = rightDocs
 										.stream()
-										.map( x -> mongoExecutionContext.read( rightClass, x ) )
+										.map( x -> rightBuilder.getMongoExecutionContext().read( rightClass, x ) )
 										.collect( Collectors.toList() );
 
 								} else if (rawRight instanceof Document rd) {
 									// unwind(true) 케이스: 단건을 리스트로 래핑
-									rightVal = List.of( mongoExecutionContext.read( rightClass, rd ) );
+									rightVal = List.of( rightBuilder.getMongoExecutionContext().read( rightClass, rd ) );
 
 								} else {
 									rightVal = List.of();
@@ -5890,7 +5914,9 @@ public class ReactiveMongoDsl<K> {
 						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
 
 						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of );
+						List<Document> userStages = rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
+							rightClass, Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of )
+						);
 						List<Document> nonLimitStages = new ArrayList<>();
 						List<Document> limitStages = new ArrayList<>();
 
@@ -5909,26 +5935,26 @@ public class ReactiveMongoDsl<K> {
 						if (! needPipeline) {
 							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
 							lookupBody
-								.append( "localField", spec.getLocalField() )
-								.append( "foreignField", spec.getForeignField() );
+								.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) )
+								.append( "foreignField", rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ) );
 
 						} else {
 							List<Document> pipe = new ArrayList<>();
 
 							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rc.getCriteriaObject() ) ) );
+							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rightBuilder.getMongoExecutionContext().mapQuery( rightClass, rc.getCriteriaObject() ) ) ) );
 
 							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
 							if (spec.getLocalField() != null && spec.getForeignField() != null) {
 								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lookupBody.append( "let", new Document( lfVar, "$" + spec.getLocalField() ) );
+								lookupBody.append( "let", new Document( lfVar, "$" + mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) ) );
 								pipe
 									.add(
 										new Document(
 											"$match",
 											new Document(
 												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + spec.getForeignField(), "$$" + lfVar ) )
+												new Document( "$eq", Arrays.asList( "$" + rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ), "$$" + lfVar ) )
 											)
 										)
 									);
@@ -6020,10 +6046,10 @@ public class ReactiveMongoDsl<K> {
 							R2 rightVal = null;
 
 							if (raw instanceof Document rd) {
-								rightVal = mongoExecutionContext.read( rightClass, rd );
+								rightVal = rightBuilder.getMongoExecutionContext().read( rightClass, rd );
 
 							} else if (raw instanceof List<?> rl && ! rl.isEmpty() && rl.get( 0 ) instanceof Document r0) {
-								rightVal = mongoExecutionContext.read( rightClass, r0 ); // 첫 원소
+								rightVal = rightBuilder.getMongoExecutionContext().read( rightClass, r0 ); // 첫 원소
 
 							}
 
@@ -6169,7 +6195,9 @@ public class ReactiveMongoDsl<K> {
 						// $lookup
 						Document lk = new Document( "from", rightColl ).append( "as", rightAs );
 						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of );
+						List<Document> userStages = rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
+							rightClass, Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of )
+						);
 						List<Document> nonLimitStages = new ArrayList<>();
 						List<Document> limitStages = new ArrayList<>();
 
@@ -6188,26 +6216,26 @@ public class ReactiveMongoDsl<K> {
 						if (! needPipeline) {
 							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
 							lk
-								.append( "localField", spec.getLocalField() )
-								.append( "foreignField", spec.getForeignField() );
+								.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) )
+								.append( "foreignField", rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ) );
 
 						} else {
 							List<Document> pipe = new ArrayList<>();
 
 							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightMatch.ifPresent( rc -> pipe.add( new Document( "$match", rc.getCriteriaObject() ) ) );
+							rightMatch.ifPresent( rc -> pipe.add( new Document( "$match", rightBuilder.getMongoExecutionContext().mapQuery( rightClass, rc.getCriteriaObject() ) ) ) );
 
 							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
 							if (spec.getLocalField() != null && spec.getForeignField() != null) {
 								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lk.append( "let", new Document( lfVar, "$" + spec.getLocalField() ) );
+								lk.append( "let", new Document( lfVar, "$" + mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) ) );
 								pipe
 									.add(
 										new Document(
 											"$match",
 											new Document(
 												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + spec.getForeignField(), "$$" + lfVar ) )
+												new Document( "$eq", Arrays.asList( "$" + rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ), "$$" + lfVar ) )
 											)
 										)
 									);
@@ -6480,7 +6508,7 @@ public class ReactiveMongoDsl<K> {
 					.map( tp -> {
 						Optional<MongoCriteria> leftMatch = tp.getT1();
 						Optional<MongoCriteria> rightMatch = tp.getT2();
-						// Class<E> leftClass = tp.getT3();
+						Class<E> leftClass = tp.getT3();
 						Class<R2> rightClass = tp.getT4();
 
 						String rightColl = (rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank())
@@ -6496,7 +6524,9 @@ public class ReactiveMongoDsl<K> {
 
 
 						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of );
+						List<Document> userStages = rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
+							rightClass, Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of )
+						);
 						List<Document> nonLimitStages = new ArrayList<>();
 						List<Document> limitStages = new ArrayList<>();
 
@@ -6515,26 +6545,26 @@ public class ReactiveMongoDsl<K> {
 						if (! needPipeline) {
 							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
 							lk
-								.append( "localField", spec.getLocalField() )
-								.append( "foreignField", spec.getForeignField() );
+								.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) )
+								.append( "foreignField", rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ) );
 
 						} else {
 							List<Document> pipe = new ArrayList<>();
 
 							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightMatch.ifPresent( rc -> pipe.add( new Document( "$match", rc.getCriteriaObject() ) ) );
+							rightMatch.ifPresent( rc -> pipe.add( new Document( "$match", rightBuilder.getMongoExecutionContext().mapQuery( rightClass, rc.getCriteriaObject() ) ) ) );
 
 							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
 							if (spec.getLocalField() != null && spec.getForeignField() != null) {
 								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lk.append( "let", new Document( lfVar, "$" + spec.getLocalField() ) );
+								lk.append( "let", new Document( lfVar, "$" + mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) ) );
 								pipe
 									.add(
 										new Document(
 											"$match",
 											new Document(
 												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + spec.getForeignField(), "$$" + lfVar ) )
+												new Document( "$eq", Arrays.asList( "$" + rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ), "$$" + lfVar ) )
 											)
 										)
 									);

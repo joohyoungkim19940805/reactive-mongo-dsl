@@ -3,6 +3,7 @@ package com.byeolnaerim.mongodsl.internal;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import org.bson.codecs.pojo.annotations.BsonId;
+import org.bson.types.ObjectId;
 
 /** Utility class for resolving the identifier field of a Mongo entity. */
 public final class MongoIdFieldResolver {
@@ -57,7 +58,20 @@ public final class MongoIdFieldResolver {
         try {
             Field idField = findIdField(entity.getClass());
             if (!Modifier.isFinal(idField.getModifiers())) {
-                idField.set(entity, id);
+                Object value = id;
+                if (id instanceof ObjectId objectId && idField.getType() == String.class) {
+                    value = objectId.toHexString();
+                } else if (id instanceof String stringId && idField.getType() == ObjectId.class && ObjectId.isValid(stringId)) {
+                    value = new ObjectId(stringId);
+                }
+                if (value == null || idField.getType().isInstance(value)) {
+                    idField.set(entity, value);
+                } else {
+                    throw new IllegalArgumentException(
+                        "Generated Mongo identifier type " + value.getClass().getName() +
+                            " cannot be assigned to " + idField.getType().getName()
+                    );
+                }
             }
         } catch (IllegalArgumentException ignored) {
             // Immutable/no-id types may intentionally not expose a writable identifier field.
