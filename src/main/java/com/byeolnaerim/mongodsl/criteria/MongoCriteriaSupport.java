@@ -4,15 +4,14 @@ import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
-import org.springframework.data.geo.Point;
-import org.springframework.data.mongodb.core.query.Criteria;
+import com.byeolnaerim.mongodsl.query.MongoCriteria;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 
 /**
- * Utility methods for converting {@link FieldsPair} definitions into Spring Data MongoDB
- * {@link Criteria}.
+ * Utility methods for converting {@link FieldsPair} definitions into BSON-backed
+ * {@link MongoCriteria}.
  */
 public class MongoCriteriaSupport {
 	private MongoCriteriaSupport() {}
@@ -54,14 +53,14 @@ public class MongoCriteriaSupport {
 
 	/**
 	 * Converts a collection of {@link FieldsPair} definitions into a reactive stream of
-	 * {@link Criteria}.
+	 * {@link MongoCriteria}.
 	 *
 	 * @param fieldsPairs
 	 *            the field condition pairs
 	 * 
 	 * @return a {@link Flux} emitting generated criteria
 	 */
-	public static Flux<Criteria> createQueryReactive(
+	public static Flux<MongoCriteria> createQueryReactive(
 		Collection<FieldsPair<?, ?>> fieldsPairs
 	) {
 
@@ -89,7 +88,7 @@ public class MongoCriteriaSupport {
 				FieldsPair.Condition queryType = fieldsPair.getQueryType();
 
 				return Mono
-					.just( Criteria.where( fieldName ) )
+					.just( MongoCriteria.where( fieldName ) )
 					.map( criteria -> switch (queryType) {
 						case eq -> criteria.is( fieldValue );
 						case notEq -> criteria.ne( fieldValue );
@@ -152,7 +151,7 @@ public class MongoCriteriaSupport {
 							// FieldsPair.of("propertyDetail.location", new Double[]{127.0, 37.0, 5000.0},
 							// FieldsPair.Query.near)
 							if (fieldValue instanceof Double[] point && point.length >= 3) {
-								var near = criteria.near( new Point( point[0], point[1] ) );
+								var near = criteria.near( point[0], point[1] );
 
 								if (point.length == 4) {
 									near.maxDistance( point[2] ).minDistance( point[3] );
@@ -177,13 +176,13 @@ public class MongoCriteriaSupport {
 							if (fieldValue instanceof Collection<?> subPairs) {
 								// subPairs 안에 FieldsPair<?,?> 들이 있다고 가정
 								// -> 하위 조건을 Criteria로 만든다 (AND 연산)
-								List<Criteria> subCriteriaList = new ArrayList<>();
+								List<MongoCriteria> subCriteriaList = new ArrayList<>();
 
 								for (Object o : subPairs) {
 
 									if (o instanceof FieldsPair<?, ?> sp) {
 										// 여기서 createSingleCriteria(sp)를 재사용
-										Criteria sc = createSingleCriteria( sp );
+										MongoCriteria sc = createSingleCriteria( sp );
 										subCriteriaList.add( sc );
 
 									}
@@ -191,8 +190,8 @@ public class MongoCriteriaSupport {
 								}
 
 								// subCriteriaList를 하나의 Criteria로 합친다(AND)
-								// ex) new Criteria().andOperator(subCriteriaList.toArray(new Criteria[0]))
-								Criteria subCombined = new Criteria().andOperator( subCriteriaList.toArray( new Criteria[0] ) );
+								// ex) new MongoCriteria().andOperator(subCriteriaList.toArray(new MongoCriteria[0]))
+								MongoCriteria subCombined = new MongoCriteria().andOperator( subCriteriaList.toArray( new MongoCriteria[0] ) );
 
 								// 최종 elemMatch
 								yield criteria.elemMatch( subCombined );
@@ -213,7 +212,7 @@ public class MongoCriteriaSupport {
 	}
 
 	/**
-	 * Creates a single {@link Criteria} from the given {@link FieldsPair}.
+	 * Creates a single {@link MongoCriteria} from the given {@link FieldsPair}.
 	 * <p>Supported value formats depend on the selected condition:</p>
 	 * <ul>
 	 * <li>{@code in}, {@code notIn}, and {@code all}: a {@link Collection}</li>
@@ -229,7 +228,7 @@ public class MongoCriteriaSupport {
 	 * 
 	 * @return the generated criteria
 	 */
-	public static Criteria createSingleCriteria(
+	public static MongoCriteria createSingleCriteria(
 		FieldsPair<?, ?> pair
 	) {
 
@@ -247,7 +246,7 @@ public class MongoCriteriaSupport {
 		FieldsPair.Condition queryType = pair.getQueryType();
 
 		try {
-			Criteria criteria = Criteria.where( fieldName );
+			MongoCriteria criteria = MongoCriteria.where( fieldName );
 
 			switch (queryType) {
 				case eq:
@@ -314,8 +313,7 @@ public class MongoCriteriaSupport {
 					}
 				case near:
 					if (fieldValue instanceof Double[] point && point.length >= 3) {
-						Point location = new Point( point[0], point[1] );
-						Criteria nearCriteria = criteria.near( location );
+						MongoCriteria nearCriteria = criteria.near( point[0], point[1] );
 
 						if (point.length == 4) {
 							nearCriteria.maxDistance( point[2] ).minDistance( point[3] );
@@ -339,8 +337,8 @@ public class MongoCriteriaSupport {
 						// 미터를 라디안으로 변환
 						double maxRadians = maxMeters / EARTH_RADIUS_M;
 
-						Criteria c = criteria
-							.nearSphere( new Point( lon, lat ) )
+						MongoCriteria c = criteria
+							.nearSphere( lon, lat )
 							.maxDistance( maxRadians );
 
 						if (p.length == 4) {
@@ -363,13 +361,13 @@ public class MongoCriteriaSupport {
 					 * ), Query.elemMatch) */
 					if (fieldValue instanceof Collection<?> subPairs) {
 						// subPairs 안에 FieldsPair<?,?> 들이 들어있다고 가정
-						List<Criteria> subCriteriaList = new ArrayList<>();
+						List<MongoCriteria> subCriteriaList = new ArrayList<>();
 
 						for (Object o : subPairs) {
 
 							if (o instanceof FieldsPair<?, ?> sp) {
 								// 재귀적으로 Criteria 생성
-								Criteria sc = createSingleCriteria( sp );
+								MongoCriteria sc = createSingleCriteria( sp );
 								subCriteriaList.add( sc );
 
 							}
@@ -379,7 +377,7 @@ public class MongoCriteriaSupport {
 						// subCriteriaList를 하나로 합치기
 						// $elemMatch는 내부적으로 "이 배열 원소 중에서 아래 Criteria들을 모두 만족하는 원소"
 						// => typically andOperator
-						Criteria subCombined = new Criteria().andOperator( subCriteriaList.toArray( new Criteria[0] ) );
+						MongoCriteria subCombined = new MongoCriteria().andOperator( subCriteriaList.toArray( new MongoCriteria[0] ) );
 						return criteria.elemMatch( subCombined );
 
 					} else {

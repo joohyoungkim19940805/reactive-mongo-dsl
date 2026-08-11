@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import org.bson.Document;
-import org.springframework.data.domain.Sort;
+import com.byeolnaerim.mongodsl.query.MongoSort;
 import com.byeolnaerim.mongodsl.criteria.FieldsPair;
 import com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition;
 
@@ -623,13 +623,13 @@ public class LookupSpec {
 		 * @return this builder
 		 */
 		public Builder sort(
-			Sort sort
+			MongoSort sort
 		) {
 
 			if (sort == null || sort.isUnsorted())
 				return this;
 			Document sortDoc = new Document();
-			sort.forEach( o -> sortDoc.append( o.getProperty(), o.isAscending() ? 1 : -1 ) );
+			sort.orders().forEach( o -> sortDoc.append( o.getProperty(), o.isAscending() ? 1 : -1 ) );
 			pipeline.add( new Document( "$sort", sortDoc ) );
 			return this;
 

@@ -3,47 +3,22 @@ package com.byeolnaerim.mongodsl;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.ParameterizedType;
-import java.lang.reflect.Type;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Deque;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.bson.Document;
-import org.springframework.data.domain.Sort;
-import org.springframework.data.domain.Sort.Order;
-import org.springframework.data.mapping.PersistentPropertyAccessor;
-import org.springframework.data.mongodb.core.BulkOperations;
-import org.springframework.data.mongodb.core.ReactiveBulkOperations;
-import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
-import org.springframework.data.mongodb.core.aggregation.Aggregation;
-import org.springframework.data.mongodb.core.aggregation.AggregationOperation;
-import org.springframework.data.mongodb.core.aggregation.AggregationOptions;
-import org.springframework.data.mongodb.core.aggregation.AggregationUpdate;
-import org.springframework.data.mongodb.core.aggregation.FacetOperation;
-import org.springframework.data.mongodb.core.mapping.MongoMappingContext;
-import org.springframework.data.mongodb.core.mapping.MongoPersistentEntity;
-import org.springframework.data.mongodb.core.mapping.MongoPersistentProperty;
-import org.springframework.data.mongodb.core.query.BasicUpdate;
-import org.springframework.data.mongodb.core.query.Criteria;
-import org.springframework.data.mongodb.core.query.Query;
-import org.springframework.data.mongodb.core.query.Update;
-import org.springframework.data.mongodb.core.query.UpdateDefinition;
-import org.springframework.data.repository.reactive.ReactiveCrudRepository;
-import org.springframework.transaction.reactive.TransactionalOperator;
+import org.reactivestreams.Publisher;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.ExecuteBuilder;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.CountAggregation;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.CountExecute;
@@ -53,10 +28,19 @@ import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuild
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllAggregation;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllExecute;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindExecute;
+import com.byeolnaerim.mongodsl.aggregation.MongoAggregationOptions;
 import com.byeolnaerim.mongodsl.criteria.FieldsPair;
 import com.byeolnaerim.mongodsl.criteria.MongoCriteriaSupport;
-import com.byeolnaerim.mongodsl.internal.MongoIdFieldResolver;
+import com.byeolnaerim.mongodsl.internal.aggregation.MongoAggregation;
+import com.byeolnaerim.mongodsl.internal.aggregation.MongoAggregationOperation;
+import com.byeolnaerim.mongodsl.internal.update.MongoAggregationUpdate;
+import com.byeolnaerim.mongodsl.internal.update.MongoUpdate;
+import com.byeolnaerim.mongodsl.internal.update.MongoUpdateDefinition;
 import com.byeolnaerim.mongodsl.lookup.LookupSpec;
+import com.byeolnaerim.mongodsl.query.MongoCriteria;
+import com.byeolnaerim.mongodsl.query.MongoQuery;
+import com.byeolnaerim.mongodsl.query.MongoSort;
+import com.byeolnaerim.mongodsl.query.MongoSort.Order;
 import com.byeolnaerim.mongodsl.result.PageResult;
 import com.byeolnaerim.mongodsl.result.PageStream;
 import com.byeolnaerim.mongodsl.result.ResultTuple;
@@ -73,14 +57,27 @@ import com.byeolnaerim.mongodsl.search.SearchOperators;
 import com.byeolnaerim.mongodsl.search.SearchScoreSpec;
 import com.byeolnaerim.mongodsl.search.SearchSortSpec;
 import com.byeolnaerim.mongodsl.search.TextClause;
+import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
 import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
 import com.byeolnaerim.mongodsl.vector.VectorPathResolver;
 import com.byeolnaerim.mongodsl.vector.VectorQueryVector;
 import com.byeolnaerim.mongodsl.vector.VectorTextQueryShape;
 import com.mongodb.ReadPreference;
 import com.mongodb.bulk.BulkWriteResult;
+import com.mongodb.client.model.BulkWriteOptions;
+import com.mongodb.client.model.CountOptions;
+import com.mongodb.client.model.DeleteOneModel;
+import com.mongodb.client.model.InsertOneModel;
+import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.UpdateOneModel;
+import com.mongodb.client.model.UpdateOptions;
+import com.mongodb.client.model.WriteModel;
 import com.mongodb.client.result.DeleteResult;
 import com.mongodb.client.result.UpdateResult;
+import com.mongodb.reactivestreams.client.AggregatePublisher;
+import com.mongodb.reactivestreams.client.ClientSession;
+import com.mongodb.reactivestreams.client.FindPublisher;
+import com.mongodb.reactivestreams.client.MongoCollection;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import tools.jackson.databind.ObjectMapper;
@@ -88,15 +85,14 @@ import tools.jackson.databind.json.JsonMapper;
 
 
 /**
- * Fluent reactive MongoDB DSL built on top of {@link ReactiveMongoTemplate}.
+ * Fluent reactive MongoDB DSL built on top of {@link MongoExecutionContext}.
  * <p>This DSL helps compose dynamic criteria, aggregation pipelines, lookup joins,
  * bulk operations, and atomic updates in a reactive style.</p>
- * <p>Template and transaction resolution are delegated to {@link MongoTemplateResolver},
- * which makes this DSL suitable for multi-template, multi-database, or multi-tenant use cases.</p>
+ * <p>Mongo execution-context resolution is delegated to {@link MongoTemplateResolver},
+ * which makes this DSL suitable for multi-database or multi-tenant use cases.</p>
  *
  * @param <K>
- *            the logical key type used to resolve the target Mongo template and transaction
- *            resources
+ *            the logical key type used to resolve the target Mongo execution context
  */
 public class ReactiveMongoDsl<K> {
 
@@ -104,13 +100,13 @@ public class ReactiveMongoDsl<K> {
 
 	private final ObjectMapper objectMapper;
 
-	private final static ConcurrentHashMap<Class<? extends ReactiveCrudRepository<?, ?>>, Class<?>> entityClassCache = new ConcurrentHashMap<>();
+	private static final Object CLIENT_SESSION_CONTEXT_KEY = new Object();
 
 	/**
 	 * Creates a new DSL instance using the given resolver and a default {@link ObjectMapper}.
 	 *
 	 * @param resolver
-	 *            the template and transaction resolver
+	 *            the Mongo execution-context resolver
 	 */
 	public ReactiveMongoDsl(
 							MongoTemplateResolver<K> resolver
@@ -124,7 +120,7 @@ public class ReactiveMongoDsl<K> {
 	 * Creates a new DSL instance using the given resolver and object mapper.
 	 *
 	 * @param resolver
-	 *            the template and transaction resolver
+	 *            the Mongo execution-context resolver
 	 * @param objectMapper
 	 *            the object mapper used by helper features such as history snapshot creation
 	 */
@@ -140,14 +136,14 @@ public class ReactiveMongoDsl<K> {
 
 
 	/**
-	 * Returns the {@link ReactiveMongoTemplate} resolved for the given key.
+	 * Returns the {@link MongoExecutionContext} resolved for the given key.
 	 *
 	 * @param key
-	 *            the logical template key
+	 *            the logical Mongo execution-context key
 	 * 
-	 * @return the resolved reactive Mongo template
+	 * @return the resolved Mongo execution context
 	 */
-	public ReactiveMongoTemplate getMongoTemplate(
+	public MongoExecutionContext getMongoTemplate(
 		K key
 	) {
 
@@ -156,31 +152,13 @@ public class ReactiveMongoDsl<K> {
 	}
 
 	/**
-	 * Returns the {@link TransactionalOperator} resolved for the given key.
-	 *
-	 * @param key
-	 *            the logical template key
-	 * 
-	 * @return the resolved transactional operator, or {@code null} if transactional execution is not
-	 *         configured
-	 */
-	public TransactionalOperator getTxOperator(
-		K key
-	) {
-
-		return resolver.getTxOperator( key );
-
-	}
-
-	/**
-	 * Executes the supplied reactive job within the transaction resolved for the given key.
-	 * <p>This method simply resolves the {@link TransactionalOperator} from the configured
-	 * {@link MongoTemplateResolver} and applies it to the deferred publisher.</p>
+	 * Executes the supplied reactive job in a MongoDB client-session transaction.
+	 * The session is propagated through Reactor Context and picked up by DSL terminal operations.
 	 *
 	 * @param <T>
 	 *            the result type
 	 * @param key
-	 *            the logical template key
+	 *            the logical Mongo execution-context key
 	 * @param supplier
 	 *            the deferred reactive job to execute
 	 * 
@@ -190,58 +168,369 @@ public class ReactiveMongoDsl<K> {
 		K key, Supplier<? extends Mono<? extends T>> supplier
 	) {
 
-		var op = resolver.getTxOperator( key );
-		return Mono.defer( supplier ).as( op::transactional );
+		MongoExecutionContext executionContext = resolver.getTemplate( key );
+
+		return Mono
+			.usingWhen(
+				executionContext.startSession(),
+				session -> {
+					session.startTransaction();
+					return Mono
+						.defer( supplier )
+						.contextWrite( context -> context.put( CLIENT_SESSION_CONTEXT_KEY, session ) )
+						.flatMap( value -> Mono.from( session.commitTransaction() ).thenReturn( value ) )
+						.switchIfEmpty( Mono.from( session.commitTransaction() ).then( Mono.empty() ) );
+
+				},
+				session -> Mono.fromRunnable( session::close ),
+				(session, error) -> Mono
+					.from( session.abortTransaction() )
+					.onErrorResume( ignored -> Mono.empty() )
+					.then( Mono.fromRunnable( session::close ) ),
+				session -> Mono
+					.from( session.abortTransaction() )
+					.onErrorResume( ignored -> Mono.empty() )
+					.then( Mono.fromRunnable( session::close ) )
+			);
 
 	}
 
 
-	// 트렌젝션 사용 방식
-	// .flatMap( tuple -> {
-	// var account = tuple.getT1();
-	// var body = tuple.getT2();
-	// mongoQueryBuilder.getMongoTemplate( null );
-	// TransactionalOperator transactionalOperator = TransactionalOperator.create(
-	// mongoQueryBuilder.getTxManager( MongoTemplateName.FRONT ) );
-	// var equipAndUnequip = Mono.defer( () -> {
-	// var equipSave = mongoQueryBuilder
-	// .executeEntity( UserUnitEntity.class, MongoTemplateName.FRONT )
-	// .fields(
-	// pair( "accountId", account.getId() ),
-	// pair( "id", body.id() )
-	// )
-	// .end()
-	// .find()
-	// .execute()
-	// .flatMap( e -> {
-	// e.setParentUserUnitId( parentUserUnitId );
-	// return mongoQueryBuilder
-	// .executeEntity( UserUnitEntity.class, MongoTemplateName.FRONT )
-	// .save( e );
-	//
-	// } );
-	// var equipDelete = mongoQueryBuilder
-	// .executeEntity( UserUnitEntity.class, MongoTemplateName.FRONT )
-	// .fields(
-	// pair( "accountId", account.getId() ),
-	// pair( "prevId", body.id() )
-	// )
-	// .end()
-	// .find()
-	// .execute()
-	// .flatMap( e -> {
-	// e.setParentUserUnitId( null );
-	// return mongoQueryBuilder
-	// .executeEntity( UserUnitEntity.class, MongoTemplateName.FRONT )
-	// .save( e );
-	//
-	// } );
-	// return Mono.zip( equipSave, equipDelete );
-	//
-	// } );
-	// return equipAndUnequip.as( transactionalOperator::transactional );
-	//
-	// } )
+	private <T> Mono<T> executeWithSession(
+		Function<ClientSession, ? extends Publisher<T>> withSession, Supplier<? extends Publisher<T>> withoutSession
+	) {
+
+		return Mono
+			.deferContextual(
+				context -> context.hasKey( CLIENT_SESSION_CONTEXT_KEY )
+					? Mono.from( withSession.apply( context.get( CLIENT_SESSION_CONTEXT_KEY ) ) )
+					: Mono.from( withoutSession.get() )
+			);
+
+	}
+
+	private <T> Flux<T> executeFluxWithSession(
+		Function<ClientSession, ? extends Publisher<T>> withSession, Supplier<? extends Publisher<T>> withoutSession
+	) {
+
+		return Flux
+			.deferContextual(
+				context -> context.hasKey( CLIENT_SESSION_CONTEXT_KEY )
+					? Flux.from( withSession.apply( context.get( CLIENT_SESSION_CONTEXT_KEY ) ) )
+					: Flux.from( withoutSession.get() )
+			);
+
+	}
+
+	private Mono<MongoCollection<Document>> resolveCollection(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName
+	) {
+
+		return executionContext
+			.getDatabase()
+			.map(
+				database -> database
+					.getCollection(
+						explicitCollectionName != null && ! explicitCollectionName.isBlank()
+							? explicitCollectionName
+							: executionContext.getCollectionName( entityClass )
+					)
+			);
+
+	}
+
+	private FindPublisher<Document> applyQuery(
+		MongoCollection<Document> collection, MongoQuery query, ClientSession session
+	) {
+
+		MongoCollection<Document> target = query.readPreference() == null
+			? collection
+			: collection.withReadPreference( query.readPreference() );
+		FindPublisher<Document> publisher = session == null
+			? target.find( query.filter() )
+			: target.find( session, query.filter() );
+
+		if (query.sort() != null && query.sort().isSorted())
+			publisher = publisher.sort( query.sort().toDocument() );
+		if (! query.projection().isEmpty())
+			publisher = publisher.projection( query.projection() );
+		if (query.skip() > 0)
+			publisher = publisher.skip( Math.toIntExact( query.skip() ) );
+		if (query.limit() > 0)
+			publisher = publisher.limit( query.limit() );
+		if (query.allowDiskUse() != null)
+			publisher = publisher.allowDiskUse( query.allowDiskUse() );
+
+		return publisher;
+
+	}
+
+	private <T> Flux<T> find(
+		MongoExecutionContext executionContext, Class<T> entityClass, String explicitCollectionName, MongoQuery query
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMapMany(
+				collection -> executeFluxWithSession(
+					session -> applyQuery( collection, query, session ),
+					() -> applyQuery( collection, query, null )
+				)
+			)
+			.map( document -> executionContext.read( entityClass, document ) );
+
+	}
+
+	private <T> Mono<T> findOne(
+		MongoExecutionContext executionContext, Class<T> entityClass, String explicitCollectionName, MongoQuery query
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> applyQuery( collection, query, session ).first(),
+					() -> applyQuery( collection, query, null ).first()
+				)
+			)
+			.map( document -> executionContext.read( entityClass, document ) );
+
+	}
+
+	private AggregatePublisher<Document> applyAggregation(
+		MongoCollection<Document> collection, MongoAggregation aggregation, ClientSession session
+	) {
+
+		MongoAggregationOptions options = aggregation.options();
+		MongoCollection<Document> target = options.readPreference() == null
+			? collection
+			: collection.withReadPreference( options.readPreference() );
+		AggregatePublisher<Document> publisher = session == null
+			? target.aggregate( aggregation.pipeline() )
+			: target.aggregate( session, aggregation.pipeline() );
+
+		if (options.allowDiskUse() != null)
+			publisher = publisher.allowDiskUse( options.allowDiskUse() );
+		if (options.batchSize() != null)
+			publisher = publisher.batchSize( options.batchSize() );
+		if (options.maxTimeMillis() != null)
+			publisher = publisher.maxTime( options.maxTimeMillis(), java.util.concurrent.TimeUnit.MILLISECONDS );
+		if (options.comment() != null)
+			publisher = publisher.comment( options.comment() );
+
+		return publisher;
+
+	}
+
+	private Flux<Document> aggregateDocuments(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, MongoAggregation aggregation
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMapMany(
+				collection -> executeFluxWithSession(
+					session -> applyAggregation( collection, aggregation, session ),
+					() -> applyAggregation( collection, aggregation, null )
+				)
+			);
+
+	}
+
+	private <T> Flux<T> aggregate(
+		MongoExecutionContext executionContext, Class<?> sourceClass, String explicitCollectionName, MongoAggregation aggregation, Class<T> targetClass
+	) {
+
+		return aggregateDocuments( executionContext, sourceClass, explicitCollectionName, aggregation )
+			.map( document -> executionContext.read( targetClass, document ) );
+
+	}
+
+	private <T> Mono<T> saveEntity(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, T entity
+	) {
+
+		Document document = executionContext.write( entity );
+		Object id = executionContext.getId( entity );
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap( collection -> {
+
+				if (id == null) {
+					return executeWithSession(
+						session -> collection.insertOne( session, document ),
+						() -> collection.insertOne( document )
+					).doOnSuccess( ignored -> {
+						if (document.get( "_id" ) != null)
+							executionContext.setId( entity, document.get( "_id" ) );
+
+					} ).thenReturn( entity );
+
+				}
+
+				return executeWithSession(
+					session -> collection.replaceOne( session, new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) ),
+					() -> collection.replaceOne( new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) )
+				).thenReturn( entity );
+
+			} );
+
+	}
+
+	private <T> Flux<T> insertEntities(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<T> entities
+	) {
+
+		if (entities.isEmpty())
+			return Flux.empty();
+
+		List<Document> documents = entities.stream().map( executionContext::write ).toList();
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> collection.insertMany( session, documents ),
+					() -> collection.insertMany( documents )
+				)
+			)
+			.doOnSuccess( ignored -> {
+
+				for (int i = 0; i < entities.size(); i++) {
+					Object generatedId = documents.get( i ).get( "_id" );
+					if (generatedId != null && executionContext.getId( entities.get( i ) ) == null)
+						executionContext.setId( entities.get( i ), generatedId );
+
+				}
+
+			} )
+			.thenMany( Flux.fromIterable( entities ) );
+
+	}
+
+	private Mono<Void> insertDocuments(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<Document> documents
+	) {
+
+		if (documents.isEmpty())
+			return Mono.empty();
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> collection.insertMany( session, documents ),
+					() -> collection.insertMany( documents )
+				)
+			)
+			.then();
+
+	}
+
+	private Mono<BulkWriteResult> bulkWrite(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<? extends WriteModel<Document>> writes
+	) {
+
+		if (writes.isEmpty())
+			return Mono.empty();
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> collection.bulkWrite( session, writes, new BulkWriteOptions().ordered( false ) ),
+					() -> collection.bulkWrite( writes, new BulkWriteOptions().ordered( false ) )
+				)
+			);
+
+	}
+
+	private Mono<DeleteResult> deleteByFilter(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, Document filter, boolean many
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> many ? collection.deleteMany( session, filter ) : collection.deleteOne( session, filter ),
+					() -> many ? collection.deleteMany( filter ) : collection.deleteOne( filter )
+				)
+			);
+
+	}
+
+	private Mono<Long> count(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, MongoQuery query
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap( collection -> {
+				MongoCollection<Document> target = query.readPreference() == null
+					? collection
+					: collection.withReadPreference( query.readPreference() );
+				CountOptions options = new CountOptions();
+
+				if (query.skip() > 0)
+					options.skip( Math.toIntExact( query.skip() ) );
+				if (query.limit() > 0)
+					options.limit( query.limit() );
+
+				return executeWithSession(
+					session -> target.countDocuments( session, query.filter(), options ),
+					() -> target.countDocuments( query.filter(), options )
+				);
+
+			} );
+
+	}
+
+	private Mono<Boolean> exists(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, MongoQuery query
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> applyQuery( collection, query.limit( 1 ), session ).first(),
+					() -> applyQuery( collection, query.limit( 1 ), null ).first()
+				).hasElement()
+			);
+
+	}
+
+	private Mono<UpdateResult> update(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, MongoQuery query, MongoUpdateDefinition updateDefinition, boolean multi, boolean upsert
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> {
+						UpdateOptions options = new UpdateOptions().upsert( upsert );
+
+						if (updateDefinition.isPipeline()) {
+							return multi
+								? collection.updateMany( session, query.filter(), updateDefinition.pipeline(), options )
+								: collection.updateOne( session, query.filter(), updateDefinition.pipeline(), options );
+
+						}
+
+						return multi
+							? collection.updateMany( session, query.filter(), updateDefinition.document(), options )
+							: collection.updateOne( session, query.filter(), updateDefinition.document(), options );
+
+					},
+					() -> {
+						UpdateOptions options = new UpdateOptions().upsert( upsert );
+
+						if (updateDefinition.isPipeline()) {
+							return multi
+								? collection.updateMany( query.filter(), updateDefinition.pipeline(), options )
+								: collection.updateOne( query.filter(), updateDefinition.pipeline(), options );
+
+						}
+
+						return multi
+							? collection.updateMany( query.filter(), updateDefinition.document(), options )
+							: collection.updateOne( query.filter(), updateDefinition.document(), options );
+
+					}
+				)
+			);
+
+	}
+
 
 	/**
 	 * Logical operators used to combine criteria groups in the field builder.
@@ -259,7 +548,7 @@ public class ReactiveMongoDsl<K> {
 
 		LogicalOperator operator;
 
-		List<Criteria> criteriaList;
+		List<MongoCriteria> criteriaList;
 
 		CriteriaGroup(
 						LogicalOperator operator
@@ -285,11 +574,10 @@ public class ReactiveMongoDsl<K> {
 	 */
 	public abstract class AbstractQueryBuilder<E, T extends AbstractQueryBuilder<E, T>> {
 
-		protected Class<? extends ReactiveCrudRepository<?, ?>> repositoryClass;
 
-		protected ReactiveMongoTemplate reactiveMongoTemplate;
+		protected MongoExecutionContext mongoExecutionContext;
 
-		// protected Mono<Query> queryMono;
+		// protected Mono<MongoQuery> queryMono;
 
 		protected Mono<Class<E>> executeClassMono;
 
@@ -299,55 +587,31 @@ public class ReactiveMongoDsl<K> {
 
 		protected AbstractQueryBuilder<E, T> executeBuilder;
 
-		/**
-		 * Saves a single entity using the resolved {@link ReactiveMongoTemplate}.
-		 *
-		 * @param e
-		 *            the entity to save
-		 * 
-		 * @return a {@link Mono} emitting the saved entity
-		 */
+
+		/** Saves a single entity using the resolved Mongo execution context. */
 		public Mono<E> save(
 			E e
 		) {
 
-			return reactiveMongoTemplate.save( e );
+			Objects.requireNonNull( e, "entity must not be null" );
+			return executeClassMono.flatMap( entityClass -> saveEntity( mongoExecutionContext, entityClass, collectionName, e ) );
 
 		}
 
-		/**
-		 * Saves a single entity emitted by the given publisher.
-		 *
-		 * @param e
-		 *            a publisher that emits the entity to save
-		 * 
-		 * @return a {@link Mono} emitting the saved entity
-		 */
+		/** Saves a single entity emitted by the given publisher. */
 		public Mono<E> save(
 			Mono<E> e
 		) {
 
-			return reactiveMongoTemplate.save( e );
+			return e.flatMap( this::save );
 
 		}
 
-		/**
-		 * Saves all given entities one by one using regular save operations.
-		 * <p>This method does not use a bulk insert operation.</p>
-		 *
-		 * @param entities
-		 *            the entities to save
-		 * 
-		 * @return a {@link Flux} emitting the saved entities
-		 */
 		public Flux<E> saveAll(
 			Iterable<E> entities
 		) {
 
-			return saveAll(
-				Flux
-					.fromIterable( entities )
-			);
+			return saveAll( Flux.fromIterable( entities ) );
 
 		}
 
@@ -355,40 +619,18 @@ public class ReactiveMongoDsl<K> {
 			Collection<E> entities
 		) {
 
-			return saveAll(
-				Flux
-					.fromIterable( entities )
-			);
+			return saveAll( Flux.fromIterable( entities ) );
 
 		}
 
-		/**
-		 * Saves all entities emitted by the given stream using regular save operations.
-		 * <p>This method saves each entity individually and does not use a bulk insert operation.</p>
-		 *
-		 * @param entityFlux
-		 *            the entities to save
-		 * 
-		 * @return a {@link Flux} emitting the saved entities
-		 */
 		public Flux<E> saveAll(
 			Flux<E> entityFlux
 		) {
 
-			return entityFlux.flatMap( entity -> reactiveMongoTemplate.save( entity ) );
+			return entityFlux.flatMap( this::save );
 
 		}
 
-
-		/**
-		 * Performs a bulk insert for the given entities.
-		 * <p>This method collects the input and performs a single {@code insertAll} call.</p>
-		 *
-		 * @param entities
-		 *            the entities to insert
-		 * 
-		 * @return a {@link Flux} emitting the inserted entities
-		 */
 		public Flux<E> saveAllBulk(
 			Iterable<E> entities
 		) {
@@ -397,15 +639,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Performs a bulk insert for the given entities.
-		 * <p>This method collects the input and performs a single {@code insertAll} call.</p>
-		 *
-		 * @param entities
-		 *            the entities to insert
-		 * 
-		 * @return a {@link Flux} emitting the inserted entities
-		 */
 		public Flux<E> saveAllBulk(
 			Collection<E> entities
 		) {
@@ -414,428 +647,93 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Performs a bulk insert for the given entity stream.
-		 * <p>All emitted entities are collected first and then inserted using a single
-		 * {@code insertAll} call. If the source is empty, an empty {@link Flux} is returned.</p>
-		 *
-		 * @param entityFlux
-		 *            the entities to insert
-		 * 
-		 * @return a {@link Flux} emitting the inserted entities
-		 */
 		public Flux<E> saveAllBulk(
 			Flux<E> entityFlux
 		) {
 
 			return entityFlux
 				.collectList()
-				.flatMapMany( list -> {
-
-					if (list.isEmpty()) { return Flux.empty(); }
-
-					return reactiveMongoTemplate.insertAll( list );
-
-				} );
+				.flatMapMany(
+					entities -> entities.isEmpty()
+						? Flux.empty()
+						: executeClassMono.flatMapMany( entityClass -> insertEntities( mongoExecutionContext, entityClass, collectionName, entities ) )
+				);
 
 		}
 
-		/**
-		 * 엔티티 한 개를 BulkOperations에 반영하는 공통 처리
-		 */
-		private void applyBulkForEntity(
-			E entity, Field idField, ReactiveBulkOperations bulkOps
-		)
-			throws IllegalAccessException {
-
-			Object id = idField.get( entity );
-
-			if (id == null) {
-				// 신규 레코드는 insert
-				bulkOps.insert( entity );
-				return;
-
-			}
-
-			// 기존 레코드는 upsert
-			Query query = Query.query( Criteria.where( "_id" ).is( id ) );
-
-			// Document로 변환 후 _id 제거
-			org.bson.Document doc = new org.bson.Document();
-			reactiveMongoTemplate.getConverter().write( entity, doc );
-			doc.remove( "_id" );
-
-			if (! doc.isEmpty()) {
-				org.bson.Document updateDoc = new org.bson.Document( "$set", doc );
-				Update update = new BasicUpdate( updateDoc );
-				bulkOps.upsert( query, update );
-
-			}
-
-		}
-
-		/**
-		 * Performs a bulk upsert using the entity identifier.
-		 * <p>The identifier field is resolved from an {@code @Id} field or, if none exists,
-		 * from a field named {@code id}.</p>
-		 * <p>Entities with a {@code null} identifier are inserted as new documents.</p>
-		 *
-		 * @param entities
-		 *            the entities to upsert
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
 		public Mono<BulkWriteResult> saveAllBulkUpsert(
 			Iterable<E> entities
 		) {
 
 			Objects.requireNonNull( entities, "entities must not be null" );
-
-			// 비어 있으면 바로 종료
-			Iterator<E> it = entities.iterator();
-
-			if (! it.hasNext()) { return Mono.empty(); }
-
-			// 첫 번째 엔티티로부터 타입/ID 필드 정보 추출
-			E first = it.next();
-			Class<?> entityClass = first.getClass();
-			Field idField = MongoIdFieldResolver.findIdField( entityClass );
-			idField.setAccessible( true );
-
-			ReactiveBulkOperations bulkOps = reactiveMongoTemplate
-				.bulkOps(
-					BulkOperations.BulkMode.UNORDERED,
-					entityClass
-				);
-
-			try {
-				// 첫 번째 엔티티 처리
-				applyBulkForEntity( first, idField, bulkOps );
-
-				// 나머지 엔티티 처리
-				while (it.hasNext()) {
-					E entity = it.next();
-					applyBulkForEntity( entity, idField, bulkOps );
-
-				}
-
-			} catch (IllegalAccessException e) {
-				return Mono
-					.error(
-						new RuntimeException( "Failed to access @Id field via reflection", e )
-					);
-
-			} finally {
-				idField.setAccessible( false );
-
-			}
-
-			return bulkOps.execute();
+			List<E> values = new ArrayList<>();
+			entities.forEach( values::add );
+			return saveAllBulkUpsert( values );
 
 		}
 
-		/**
-		 * Performs a bulk upsert using the entity identifier.
-		 * <p>The identifier field is resolved from an {@code @Id} field or, if none exists,
-		 * from a field named {@code id}.</p>
-		 * <p>Entities with a {@code null} identifier are inserted as new documents.</p>
-		 *
-		 * @param entities
-		 *            the entities to upsert
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
 		public Mono<BulkWriteResult> saveAllBulkUpsert(
 			Collection<E> entities
 		) {
 
-			return saveAllBulkUpsert( (Iterable<E>) entities );
+			if (entities == null || entities.isEmpty())
+				return Mono.empty();
 
-		}
+			return executeClassMono.flatMap( entityClass -> {
+				List<WriteModel<Document>> writes = new ArrayList<>();
 
-		/**
-		 * Performs a bulk upsert for the given entity stream using the entity identifier.
-		 * <p>The identifier field is resolved lazily from the first emitted entity.
-		 * Entities with a {@code null} identifier are inserted as new documents.</p>
-		 *
-		 * @param entityFlux
-		 *            the entities to upsert
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
-		public Mono<BulkWriteResult> saveAllBulkUpsert(
-			Flux<E> entityFlux
-		) {
+				for (E entity : entities) {
+					Document document = mongoExecutionContext.write( entity );
+					Object id = mongoExecutionContext.getId( entity );
 
-			AtomicReference<ReactiveBulkOperations> bulkRef = new AtomicReference<>();
-			AtomicReference<Field> idFieldRef = new AtomicReference<>();
-			AtomicBoolean hasValue = new AtomicBoolean( false );
-
-			return entityFlux
-				.flatMap( entity -> {
-					hasValue.set( true );
-
-					ReactiveBulkOperations bulkOps = bulkRef.get();
-					Field idField = idFieldRef.get();
-
-					// 첫 요소에서 lazy init
-					if (bulkOps == null) {
-						Class<?> entityClass = entity.getClass();
-						Field f = MongoIdFieldResolver.findIdField( entityClass );
-						f.setAccessible( true );
-
-						ReactiveBulkOperations newBulk = reactiveMongoTemplate
-							.bulkOps( BulkOperations.BulkMode.UNORDERED, entityClass );
-
-						bulkRef.set( newBulk );
-						idFieldRef.set( f );
-
-						bulkOps = newBulk;
-						idField = f;
+					if (id == null) {
+						writes.add( new InsertOneModel<>( document ) );
+						continue;
 
 					}
 
-					try {
-						Object id = idField.get( entity );
+					document.remove( "_id" );
 
-						if (id == null) {
-							// 신규 레코드 → insert
-							bulkOps.insert( entity );
-							return Mono.empty();
-
-						}
-
-						Query query = Query.query( Criteria.where( "_id" ).is( id ) );
-
-						org.bson.Document doc = new org.bson.Document();
-						reactiveMongoTemplate.getConverter().write( entity, doc );
-						doc.remove( "_id" );
-
-						if (! doc.isEmpty()) {
-							org.bson.Document updateDoc = new org.bson.Document( "$set", doc );
-							Update update = new BasicUpdate( updateDoc );
-							bulkOps.upsert( query, update );
-
-						}
-
-						return Mono.empty();
-
-					} catch (IllegalAccessException e) {
-						return Mono
-							.error(
-								new RuntimeException( "Failed to access @Id field via reflection", e )
+					if (! document.isEmpty()) {
+						writes
+							.add(
+								new UpdateOneModel<>(
+									new Document( "_id", id ),
+									new Document( "$set", document ),
+									new UpdateOptions().upsert( true )
+								)
 							);
 
 					}
 
-				} )
-				// 모든 엔티티에 대해 bulk 작업 쌓기 끝난 뒤 execute
-				.then(
-					Mono.defer( () -> {
+				}
 
-						if (! hasValue.get()) {
-							// 비어있는 Flux 였으면 아무 작업도 안 함
-							return Mono.empty();
+				return bulkWrite( mongoExecutionContext, entityClass, collectionName, writes );
 
-						}
-
-						ReactiveBulkOperations bulkOps = bulkRef.get();
-
-						if (bulkOps == null) { return Mono.empty(); }
-
-						return bulkOps.execute();
-
-					} )
-				)
-				// 성공/실패/취소 어떤 경우든 @Id 필드 접근 권한 원복
-				.doFinally( signalType -> {
-					Field idField = idFieldRef.get();
-
-					if (idField != null) {
-						idField.setAccessible( false );
-
-					}
-
-				} );
+			} );
 
 		}
 
-		/**
-		 * Performs a bulk upsert using one or more business key fields instead of the entity identifier.
-		 * <p>When multiple key fields are provided, they are combined as a composite key.</p>
-		 * <p>If any configured key field is missing or {@code null} for an entity,
-		 * that entity is inserted instead of being upserted.</p>
-		 *
-		 * @param entityFlux
-		 *            the entities to upsert
-		 * @param keyFieldName
-		 *            one or more business key field names
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
+		public Mono<BulkWriteResult> saveAllBulkUpsert(
+			Flux<E> entityFlux
+		) {
+
+			return entityFlux.collectList().flatMap( this::saveAllBulkUpsert );
+
+		}
+
 		public Mono<BulkWriteResult> saveAllBulkUpsertByKey(
-			Flux<E> entityFlux, String... keyFieldName // 예: "caseKey" 또는 "court","year","caseNo"
+			Flux<E> entityFlux, String... keyFieldName
 		) {
 
 			if (entityFlux == null)
 				return Mono.error( new IllegalArgumentException( "entityFlux must not be null" ) );
-			if (keyFieldName == null || keyFieldName.length == 0)
-				return Mono.error( new IllegalArgumentException( "keyFieldName must not be null/empty" ) );
-
-			// blank 방지 + 정규화
-			final String[] keys = Arrays
-				.stream( keyFieldName )
-				.filter( Objects::nonNull )
-				.map( String::trim )
-				.filter( s -> ! s.isBlank() )
-				.toArray( String[]::new );
-
-			if (keys.length == 0)
-				return Mono.error( new IllegalArgumentException( "keyFieldName must contain at least 1 non-blank field" ) );
-
-			AtomicReference<ReactiveBulkOperations> bulkRef = new AtomicReference<>();
-			AtomicReference<Field[]> keyFieldsRef = new AtomicReference<>();
-			AtomicBoolean hasValue = new AtomicBoolean( false );
-
-			return entityFlux
-				// bulkOps에 작업 쌓기는 side-effect -> 순차로 안전하게
-				.concatMap( entity -> {
-					hasValue.set( true );
-
-					ReactiveBulkOperations bulkOps = bulkRef.get();
-					Field[] keyFields = keyFieldsRef.get();
-
-					// 첫 요소에서 lazy init
-					if (bulkOps == null) {
-						Class<?> entityClass = entity.getClass();
-
-						Field[] fs = new Field[keys.length];
-
-						try {
-
-							for (int i = 0; i < keys.length; i++) {
-								Field f = entityClass.getDeclaredField( keys[i] );
-								f.setAccessible( true );
-								fs[i] = f;
-
-							}
-
-						} catch (NoSuchFieldException e) {
-							return Mono
-								.error(
-									new IllegalArgumentException(
-										"No field in " + entityClass.getName() + ": " + e.getMessage(),
-										e
-									)
-								);
-
-						}
-
-						ReactiveBulkOperations newBulk = reactiveMongoTemplate.bulkOps( BulkOperations.BulkMode.UNORDERED, entityClass );
-
-						bulkRef.set( newBulk );
-						keyFieldsRef.set( fs );
-
-						bulkOps = newBulk;
-						keyFields = fs;
-
-					}
-
-					try {
-						// keyDoc 구성 + null 체크
-						Document keyDoc = new Document();
-
-						for (int i = 0; i < keys.length; i++) {
-							Object v = keyFields[i].get( entity );
-
-							if (v == null) {
-								// 정책: 키 하나라도 없으면 upsert 불가 -> insert(또는 skip/에러로 바꿔도 됨)
-								bulkOps.insert( entity );
-								return Mono.empty();
-
-							}
-
-							keyDoc.append( keys[i], v );
-
-						}
-
-						// Query: 단일키면 where, 복합키면 andOperator
-						Query query;
-
-						if (keys.length == 1) {
-							query = Query.query( Criteria.where( keys[0] ).is( keyDoc.get( keys[0] ) ) );
-
-						} else {
-							Criteria[] cs = new Criteria[keys.length];
-
-							for (int i = 0; i < keys.length; i++) {
-								cs[i] = Criteria.where( keys[i] ).is( keyDoc.get( keys[i] ) );
-
-							}
-
-							query = Query.query( new Criteria().andOperator( cs ) );
-
-						}
-
-						// Update: 엔티티 -> doc 변환 후 _id 제거
-						Document doc = new Document();
-						reactiveMongoTemplate.getConverter().write( entity, doc );
-						doc.remove( "_id" );
-
-						Document updateDoc = new Document()
-							.append( "$set", new Document( doc ) )
-							.append( "$setOnInsert", new Document( keyDoc ) ); // 키 필드들 고정
-
-						bulkOps.upsert( query, new BasicUpdate( updateDoc ) );
-						return Mono.empty();
-
-					} catch (IllegalAccessException e) {
-						return Mono.error( new RuntimeException( "Failed to access key field(s)", e ) );
-
-					}
-
-				} )
-				.then( Mono.defer( () -> {
-					if (! hasValue.get())
-						return Mono.empty();
-					ReactiveBulkOperations bulkOps = bulkRef.get();
-					if (bulkOps == null)
-						return Mono.empty();
-					return bulkOps.execute();
-
-				} ) )
-				.doFinally( st -> {
-					Field[] fs = keyFieldsRef.get();
-
-					if (fs != null) {
-
-						for (Field f : fs) {
-							if (f != null)
-								f.setAccessible( false );
-
-						}
-
-					}
-
-				} );
+			return entityFlux.collectList().flatMap( entities -> saveAllBulkUpsertByKey( entities, keyFieldName ) );
 
 		}
 
-		/**
-		 * Performs a bulk upsert using one or more business key fields instead of the entity identifier.
-		 * <p>When multiple key fields are provided, they are combined as a composite key.</p>
-		 * <p>If any configured key field is missing or {@code null} for an entity,
-		 * that entity is inserted instead of being upserted.</p>
-		 *
-		 * @param entities
-		 *            the entities to upsert
-		 * @param keyFieldName
-		 *            one or more business key field names
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
 		public Mono<BulkWriteResult> saveAllBulkUpsertByKey(
-			Collection<E> entities, String... keyFieldName // 예: "caseKey" 또는 "court", "year", "caseNo"
+			Collection<E> entities, String... keyFieldName
 		) {
 
 			if (entities == null || entities.isEmpty())
@@ -843,110 +741,92 @@ public class ReactiveMongoDsl<K> {
 			if (keyFieldName == null || keyFieldName.length == 0)
 				return Mono.error( new IllegalArgumentException( "keyFieldName must not be null/empty" ) );
 
-			// blank 방지
 			String[] keys = Arrays
 				.stream( keyFieldName )
 				.filter( Objects::nonNull )
 				.map( String::trim )
-				.filter( s -> ! s.isBlank() )
+				.filter( value -> ! value.isBlank() )
 				.toArray( String[]::new );
-
 			if (keys.length == 0)
 				return Mono.error( new IllegalArgumentException( "keyFieldName must contain at least 1 non-blank field" ) );
 
 			Class<?> entityClass = entities.iterator().next().getClass();
-
-			// key Field들 준비
-			final Field[] keyFields = new Field[keys.length];
+			Field[] keyFields = new Field[keys.length];
 
 			try {
 
 				for (int i = 0; i < keys.length; i++) {
-					Field f = entityClass.getDeclaredField( keys[i] );
-					f.setAccessible( true );
-					keyFields[i] = f;
+					keyFields[i] = entityClass.getDeclaredField( keys[i] );
+					keyFields[i].setAccessible( true );
 
 				}
 
 			} catch (NoSuchFieldException e) {
-				// 어떤 키에서 터졌는지 메시지 보강
 				return Mono.error( new IllegalArgumentException( "No field in " + entityClass.getName() + ": " + e.getMessage(), e ) );
 
 			}
 
-			ReactiveBulkOperations bulkOps = reactiveMongoTemplate.bulkOps( BulkOperations.BulkMode.UNORDERED, entityClass );
-
 			try {
+				List<WriteModel<Document>> writes = new ArrayList<>();
 
 				for (E entity : entities) {
-
-					// 1) key 값 수집 + null 체크
-					Document keyDoc = new Document(); // {k1:v1, k2:v2...} (setOnInsert에도 재사용)
+					Document keyDocument = new Document();
 					boolean missingKey = false;
 
 					for (int i = 0; i < keys.length; i++) {
-						Object v = keyFields[i].get( entity );
+						Object value = keyFields[i].get( entity );
 
-						if (v == null) {
+						if (value == null) {
 							missingKey = true;
 							break;
 
 						}
 
-						keyDoc.append( keys[i], v );
+						keyDocument.append( keys[i], value );
 
 					}
 
+					Document document = mongoExecutionContext.write( entity );
+
 					if (missingKey) {
-						// 정책: 키가 하나라도 없으면 upsert 기준이 없으니 insert(또는 skip/에러) 중 택1
-						bulkOps.insert( entity );
+						writes.add( new InsertOneModel<>( document ) );
 						continue;
 
 					}
 
-					// 2) Query: AND 조건으로 결합 (복합키)
-					Criteria[] cs = new Criteria[keys.length];
+					document.remove( "_id" );
+					for (String key : keys)
+						document.remove( key );
 
-					for (int i = 0; i < keys.length; i++) {
-						cs[i] = Criteria.where( keys[i] ).is( keyDoc.get( keys[i] ) );
+					Document updateDocument = new Document( "$setOnInsert", new Document( keyDocument ) );
+					if (! document.isEmpty())
+						updateDocument.append( "$set", document );
 
-					}
-
-					Query query = Query.query( new Criteria().andOperator( cs ) );
-
-					// 3) Update document 생성
-					Document doc = new Document();
-					reactiveMongoTemplate.getConverter().write( entity, doc );
-					doc.remove( "_id" ); // _id는 기본 생성 유지
-
-					for (String k : keys) {
-						doc.remove( k );
-
-					}
-
-					// 업데이트는 $set, 키는 불변 가정이면 $setOnInsert로만
-					Document updateDoc = new Document()
-						.append( "$set", new Document( doc ) )
-						.append( "$setOnInsert", new Document( keyDoc ) ); // key들 전부 넣기
-
-					bulkOps.upsert( query, new BasicUpdate( updateDoc ) );
+					writes
+						.add(
+							new UpdateOneModel<>(
+								keyDocument,
+								updateDocument,
+								new UpdateOptions().upsert( true )
+							)
+						);
 
 				}
+
+				return bulkWrite( mongoExecutionContext, entityClass, collectionName, writes );
 
 			} catch (IllegalAccessException e) {
 				return Mono.error( new RuntimeException( "Failed to access key field(s)", e ) );
 
 			} finally {
 
-				for (Field f : keyFields) {
-					if (f != null)
-						f.setAccessible( false );
+				for (Field field : keyFields) {
+					if (field != null)
+						field.setAccessible( false );
 
 				}
 
 			}
-
-			return bulkOps.execute();
 
 		}
 
@@ -954,26 +834,10 @@ public class ReactiveMongoDsl<K> {
 			Class<?> clazz
 		) {
 
-			var doc = clazz
-				.getDeclaredAnnotation(
-					org.springframework.data.mongodb.core.mapping.Document.class
-				);
-
-			if (doc == null || doc.collection() == null || doc.collection().isBlank()) { return clazz.getSimpleName() + "_remove"; }
-
-			return doc.collection() + "_remove";
+			return mongoExecutionContext.getCollectionName( clazz ) + "_remove";
 
 		}
 
-		/**
-		 * Deletes the given entities in bulk by identifier.
-		 * <p>Entities without an identifier are ignored.</p>
-		 *
-		 * @param entities
-		 *            the entities to delete
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
 		public Mono<BulkWriteResult> deleteBulk(
 			Iterable<E> entities
 		) {
@@ -982,15 +846,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Deletes the given entities in bulk by identifier.
-		 * <p>Entities without an identifier are ignored.</p>
-		 *
-		 * @param entities
-		 *            the entities to delete
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
 		public Mono<BulkWriteResult> deleteBulk(
 			Collection<E> entities
 		) {
@@ -999,15 +854,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Deletes the given entities in bulk by identifier.
-		 * <p>Entities without an identifier are ignored.</p>
-		 *
-		 * @param entities
-		 *            the entities to delete
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
 		public Mono<BulkWriteResult> deleteBulk(
 			Flux<E> entityFlux
 		) {
@@ -1016,19 +862,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Deletes the given entities in bulk by identifier.
-		 * <p>When backup is enabled, the original entities are first inserted into a backup
-		 * collection named {@code {collection}_remove}, and are then deleted from the source
-		 * collection.</p>
-		 *
-		 * @param entities
-		 *            the entities to delete
-		 * @param isBackup
-		 *            whether a backup snapshot should be stored before deletion
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
 		public Mono<BulkWriteResult> deleteBulk(
 			Iterable<E> entities, boolean isBackup
 		) {
@@ -1037,19 +870,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Deletes the given entities in bulk by identifier.
-		 * <p>When backup is enabled, the original entities are first inserted into a backup
-		 * collection named {@code {collection}_remove}, and are then deleted from the source
-		 * collection.</p>
-		 *
-		 * @param entities
-		 *            the entities to delete
-		 * @param isBackup
-		 *            whether a backup snapshot should be stored before deletion
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
 		public Mono<BulkWriteResult> deleteBulk(
 			Collection<E> entities, boolean isBackup
 		) {
@@ -1058,246 +878,81 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Deletes the given entities in bulk by identifier.
-		 * <p>When backup is enabled, the original entities are first inserted into a backup
-		 * collection named {@code {collection}_remove}, and are then deleted from the source
-		 * collection.</p>
-		 *
-		 * @param entities
-		 *            the entities to delete
-		 * @param isBackup
-		 *            whether a backup snapshot should be stored before deletion
-		 * 
-		 * @return a {@link Mono} emitting the bulk write result
-		 */
 		public Mono<BulkWriteResult> deleteBulk(
 			Flux<E> entityFlux, boolean isBackup
 		) {
 
-			if (! isBackup) { return deleteBulkInternal( entityFlux ); }
+			return entityFlux.collectList().flatMap( entities -> {
+				if (entities.isEmpty())
+					return Mono.empty();
 
-			// backup이 필요한 경우엔 엔티티를 재사용해야 하므로 list로 한번 모음
-			return entityFlux
-				.collectList()
-				.flatMap( list -> {
+				Class<?> entityClass = entities.get( 0 ).getClass();
+				Mono<Void> backup = isBackup
+					? insertDocuments(
+						mongoExecutionContext,
+						entityClass,
+						resolveRemoveCollectionName( entityClass ),
+						entities.stream().map( mongoExecutionContext::write ).toList()
+					)
+					: Mono.empty();
+				List<WriteModel<Document>> writes = entities
+					.stream()
+					.map( mongoExecutionContext::getId )
+					.filter( Objects::nonNull )
+					.map( id -> (WriteModel<Document>) new DeleteOneModel<Document>( new Document( "_id", id ) ) )
+					.toList();
 
-					if (list.isEmpty())
-						return Mono.empty();
+				return backup.then( bulkWrite( mongoExecutionContext, entityClass, collectionName, writes ) );
 
-					Class<?> entityClass = list.get( 0 ).getClass();
-					String backupCollectionName = resolveRemoveCollectionName( entityClass );
-
-					// 백업 먼저 적재 -> 그 다음 bulk delete
-					return reactiveMongoTemplate
-						.insert( list, backupCollectionName )
-						.then( deleteBulkInternal( Flux.fromIterable( list ) ) );
-
-				} );
-
-		}
-
-		/**
-		 * 실제 bulk delete 수행(backup 없이).
-		 * saveAllBulkUpsert(Flux)와 동일한 lazy-init 패턴을 사용합니다.
-		 */
-		private Mono<BulkWriteResult> deleteBulkInternal(
-			Flux<E> entityFlux
-		) {
-
-			AtomicReference<ReactiveBulkOperations> bulkRef = new AtomicReference<>();
-			AtomicReference<Field> idFieldRef = new AtomicReference<>();
-			AtomicBoolean hasValue = new AtomicBoolean( false );
-
-			return entityFlux
-				.flatMap( entity -> {
-
-					hasValue.set( true );
-
-					ReactiveBulkOperations bulkOps = bulkRef.get();
-					Field idField = idFieldRef.get();
-
-					// 첫 요소에서 lazy init
-					if (bulkOps == null) {
-						Class<?> entityClass = entity.getClass();
-
-						Field f = MongoIdFieldResolver.findIdField( entityClass );
-						f.setAccessible( true );
-
-						ReactiveBulkOperations newBulk = reactiveMongoTemplate
-							.bulkOps( BulkOperations.BulkMode.UNORDERED, entityClass );
-
-						bulkRef.set( newBulk );
-						idFieldRef.set( f );
-
-						bulkOps = newBulk;
-						idField = f;
-
-					}
-
-					try {
-						Object id = idField.get( entity );
-
-						// id 없으면 삭제 대상에서 제외
-						if (id == null)
-							return Mono.empty();
-
-						Query q = Query.query( Criteria.where( "_id" ).is( id ) );
-						bulkOps.remove( q );
-
-						return Mono.empty();
-
-					} catch (IllegalAccessException e) {
-						return Mono.error( new RuntimeException( "Failed to access @Id field via reflection", e ) );
-
-					}
-
-				} )
-				.then(
-					Mono.defer( () -> {
-
-						if (! hasValue.get())
-							return Mono.empty();
-
-						ReactiveBulkOperations bulkOps = bulkRef.get();
-						if (bulkOps == null)
-							return Mono.empty();
-
-						return bulkOps.execute();
-
-					} )
-				)
-				.doFinally( signalType -> {
-					Field idField = idFieldRef.get();
-					if (idField != null)
-						idField.setAccessible( false );
-
-				} );
+			} );
 
 		}
 
-		/**
-		 * Deletes the given entity.
-		 *
-		 * @param e
-		 *            the entity to delete
-		 * 
-		 * @return a {@link Mono} emitting the delete result
-		 */
 		public Mono<DeleteResult> delete(
 			E e
 		) {
 
-			return this.delete( e, false );
+			return delete( e, false );
 
 		}
 
-		/**
-		 * Deletes the given entity emitted by the publisher.
-		 *
-		 * @param e
-		 *            the publisher emitting the entity to delete
-		 * 
-		 * @return a {@link Mono} emitting the delete result
-		 */
 		public Mono<DeleteResult> delete(
 			Mono<E> e
 		) {
 
-			return this.delete( e, false );
+			return delete( e, false );
 
 		}
 
-		/**
-		 * Deletes the given entity.
-		 * <p>When backup is enabled, the deleted entity is copied into a backup collection
-		 * named {@code {collection}_remove}.</p>
-		 *
-		 * @param e
-		 *            the entity to delete
-		 * @param isBackup
-		 *            whether a backup snapshot should be stored before deletion
-		 * 
-		 * @return a {@link Mono} emitting the delete result
-		 */
 		public Mono<DeleteResult> delete(
 			E e, boolean isBackup
 		) {
 
-			return reactiveMongoTemplate
-				.remove( e )
-				.flatMap( dr -> {
+			Objects.requireNonNull( e, "entity must not be null" );
+			return executeClassMono.flatMap( entityClass -> {
+				Object id = mongoExecutionContext.getId( e );
+				Document filter = id == null ? mongoExecutionContext.write( e ) : new Document( "_id", id );
+				return deleteByFilter( mongoExecutionContext, entityClass, collectionName, filter, false )
+					.flatMap(
+						result -> ! isBackup
+							? Mono.just( result )
+							: insertDocuments(
+								mongoExecutionContext,
+								entityClass,
+								resolveRemoveCollectionName( entityClass ),
+								List.of( mongoExecutionContext.write( e ) )
+							).thenReturn( result )
+					);
 
-					if (! isBackup) { return Mono.just( dr ); }
-
-					return executeClassMono.flatMap( clazz -> {
-						var doc = clazz
-							.getDeclaredAnnotation(
-								org.springframework.data.mongodb.core.mapping.Document.class
-							);
-
-						String collectionName;
-
-						if (doc == null || doc.collection() == null || doc.collection().isBlank()) {
-							collectionName = clazz.getSimpleName() + "_remove";
-
-						} else {
-							collectionName = doc.collection() + "_remove";
-
-						}
-
-						// 백업 insert 완료 후 원래 DeleteResult를 그대로 반환
-						return reactiveMongoTemplate.insert( e, collectionName ).thenReturn( dr );
-
-					} );
-
-				} );
+			} );
 
 		}
 
-		/**
-		 * Deletes the given entity emitted by the publisher.
-		 * <p>When backup is enabled, the deleted entity is copied into a backup collection
-		 * named {@code {collection}_remove}.</p>
-		 *
-		 * @param eMono
-		 *            the publisher emitting the entity to delete
-		 * @param isBackup
-		 *            whether a backup snapshot should be stored before deletion
-		 * 
-		 * @return a {@link Mono} emitting the delete result
-		 */
 		public Mono<DeleteResult> delete(
 			Mono<E> eMono, boolean isBackup
 		) {
 
-			return eMono
-				.flatMap(
-					entity -> reactiveMongoTemplate
-						.remove( entity )
-						.flatMap( dr -> {
-							if (! isBackup)
-								return Mono.just( dr );
-
-							return executeClassMono.flatMap( clazz -> {
-								var doc = clazz.getDeclaredAnnotation( org.springframework.data.mongodb.core.mapping.Document.class );
-								String collectionName;
-
-								if (doc == null || doc.collection() == null || doc.collection().isBlank()) {
-									collectionName = clazz.getSimpleName() + "_remove";
-
-								} else {
-									collectionName = doc.collection() + "_remove";
-
-								}
-
-								// 백업 insert 완료 후 원래 DeleteResult를 그대로 반환
-								return reactiveMongoTemplate.insert( entity, collectionName ).thenReturn( dr );
-
-							} );
-
-						} )
-				);
+			return eMono.flatMap( entity -> delete( entity, isBackup ) );
 
 		}
 
@@ -1317,14 +972,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Creates a history snapshot of the given entity using the default prefix {@code history}.
-		 *
-		 * @param e
-		 *            the entity to snapshot
-		 * 
-		 * @return a {@link Mono} that completes when the snapshot has been inserted
-		 */
 		public Mono<Void> createHistory(
 			E e
 		) {
@@ -1333,16 +980,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Creates a history snapshot of the given entity using the specified collection suffix.
-		 *
-		 * @param e
-		 *            the entity to snapshot
-		 * @param prefix
-		 *            the history collection suffix; blank values fall back to {@code history}
-		 * 
-		 * @return a {@link Mono} that completes when the snapshot has been inserted
-		 */
 		public Mono<Void> createHistory(
 			E e, String prefix
 		) {
@@ -1351,17 +988,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Creates a history snapshot of the given entity using the provided object mapper.
-		 * <p>The snapshot is inserted into a collection using the default suffix {@code history}.</p>
-		 *
-		 * @param e
-		 *            the entity to snapshot
-		 * @param objectMapper
-		 *            the object mapper used for deep cloning
-		 * 
-		 * @return a {@link Mono} that completes when the snapshot has been inserted
-		 */
 		public Mono<Void> createHistory(
 			E e, ObjectMapper objectMapper
 		) {
@@ -1370,86 +996,26 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		/**
-		 * Creates a history snapshot of the given entity using the provided object mapper.
-		 * <p>The snapshot is inserted into a collection using the default suffix {@code history}.</p>
-		 *
-		 * @param e
-		 *            the entity to snapshot
-		 * @param objectMapper
-		 *            the object mapper used for deep cloning
-		 * 
-		 * @return a {@link Mono} that completes when the snapshot has been inserted
-		 */
 		public Mono<Void> createHistory(
 			E e, String prefix, ObjectMapper objectMapper
 		) {
 
-			Class<?> entityClass = e.getClass();
-			String _prefix = (prefix == null || prefix.isBlank())
+			Objects.requireNonNull( e, "entity must not be null" );
+			String suffix = prefix == null || prefix.isBlank()
 				? "history"
 				: (prefix.charAt( 0 ) == '_' ? prefix.substring( 1 ) : prefix);
-
-			String base;
-
-			if (! entityClass.isAnnotationPresent( org.springframework.data.mongodb.core.mapping.Document.class )) {
-				base = entityClass.getSimpleName();
-
-			} else {
-				var doc = entityClass.getAnnotation( org.springframework.data.mongodb.core.mapping.Document.class );
-				String cand = ! doc.collection().isBlank() ? doc.collection() : doc.value();
-				base = cand.isBlank() ? entityClass.getSimpleName() : cand;
-
-			}
-
-			String backupCollectionName = base + "_" + _prefix;
-
-			E snapshot = deepClone( e, objectMapper );
-
-			MongoMappingContext ctx = (MongoMappingContext) reactiveMongoTemplate.getConverter().getMappingContext();
-			MongoPersistentEntity<?> pe = ctx.getPersistentEntity( snapshot.getClass() );
-			boolean idCleared = false;
-
-			if (pe != null && pe.getIdProperty() != null) {
-				PersistentPropertyAccessor<?> accessor = pe.getPropertyAccessor( snapshot );
-				MongoPersistentProperty idProp = pe.getIdProperty();
-				accessor.setProperty( idProp, null );
-				idCleared = true;
-
-			}
-
-			if (! idCleared) {
-				Class<?> c = snapshot.getClass();
-
-				while (c != null && c != Object.class) {
-
-					try {
-						var f = c.getDeclaredField( "id" );
-						f.setAccessible( true );
-						f.set( snapshot, null );
-						break;
-
-					} catch (NoSuchFieldException ignore) {
-						c = c.getSuperclass();
-
-					} catch (IllegalAccessException ignore) {
-						break;
-
-					}
-
-				}
-
-			}
-
-			return reactiveMongoTemplate.insert( snapshot, backupCollectionName ).then();
+			Class<?> entityClass = e.getClass();
+			Document snapshot = mongoExecutionContext.write( deepClone( e, objectMapper ) );
+			snapshot.remove( "_id" );
+			return insertDocuments(
+				mongoExecutionContext,
+				entityClass,
+				mongoExecutionContext.getCollectionName( entityClass ) + "_" + suffix,
+				List.of( snapshot )
+			);
 
 		}
 
-		/**
-		 * Starts criteria construction with a root {@link LogicalOperator#AND} group.
-		 *
-		 * @return the field builder for composing criteria
-		 */
 		public FieldBuilder<E> fields() {
 
 			return fields( LogicalOperator.AND );
@@ -1553,66 +1119,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		protected Mono<Class<E>> extractEntityClass(
-			Class<? extends ReactiveCrudRepository<?, ?>> repositoryClass
-		) {
-
-			@SuppressWarnings("unchecked")
-			Class<E> cachedClass = (Class<E>) entityClassCache.get( repositoryClass );
-
-			if (cachedClass != null) { return Mono.just( cachedClass ); }
-
-			@SuppressWarnings("unchecked")
-			Mono<Class<E>> result = Mono.fromCallable( () -> {
-				// 리포지토리 클래스가 ReactiveCrudRepository를 구현하고 있는지 확인
-				Type[] genericInterfaces = repositoryClass.getGenericInterfaces();
-				ParameterizedType reactiveCrudRepoType = null;
-
-				for (Type type : genericInterfaces) {
-
-					if (type instanceof ParameterizedType) {
-						ParameterizedType paramType = (ParameterizedType) type;
-
-						if (paramType.getRawType() instanceof Class && ReactiveCrudRepository.class.isAssignableFrom( (Class<?>) paramType.getRawType() )) {
-							reactiveCrudRepoType = paramType;
-							break;
-
-						}
-
-					}
-
-				}
-
-				// ReactiveCrudRepository 인터페이스를 찾지 못한 경우 예외 발생
-				if (reactiveCrudRepoType == null) {
-					throw new IllegalArgumentException(
-						"The provided repository class '" + repositoryClass.getName() + "' does not implement ReactiveCrudRepository."
-					);
-
-				}
-
-				// 첫 번째 제너릭 타입 인수(T)를 추출
-				Type entityType = reactiveCrudRepoType.getActualTypeArguments()[0];
-
-				if (! (entityType instanceof Class<?>)) { throw new IllegalArgumentException(
-					"The entity type is not a class for repository '" + repositoryClass.getName() + "'."
-				); }
-
-				Class<?> entityClass = (Class<?>) entityType;
-
-				// 엔티티 클래스가 BaseEntity를 상속하는지 확인
-				// if (! BaseEntity.class.isAssignableFrom( entityClass )) { throw new IllegalArgumentException(
-				// "The entity class '" + entityClass.getName() + "' must extend 'BaseEntity'."
-				// ); }
-
-				return (Class<E>) entityClass;
-
-			} );
-			return result;// .onErrorMap( e -> new RuntimeException( "Failed to extract entity class: " + e.getMessage(), e )
-							// );
-
-		}
-
 		/**
 		 * Builder for aggregation-based grouping queries.
 		 * <p>This builder supports group keys, common accumulator operations,
@@ -1676,7 +1182,7 @@ public class ReactiveMongoDsl<K> {
 				};
 				this.valueConverter = (Document vv) -> {
 
-					return reactiveMongoTemplate.getConverter().read( this.valueType, vv );
+					return mongoExecutionContext.read( this.valueType, vv );
 
 				};
 
@@ -1717,7 +1223,7 @@ public class ReactiveMongoDsl<K> {
 			// };
 			// this.valueConverter = (Document vv) -> {
 			//
-			// return reactiveMongoTemplate.getConverter().read( this.valueType, vv );
+			// return mongoExecutionContext.read( this.valueType, vv );
 			//
 			// };
 			//
@@ -1976,7 +1482,7 @@ public class ReactiveMongoDsl<K> {
 
 			// 내부: 파이프라인 구성/실행
 			private <R2> Mono<Map<KK, V>> buildAndRun(
-				LookupCtx<R2> lookup, Sort dummy
+				LookupCtx<R2> lookup, MongoSort dummy
 			) {
 
 				if (keyFields.isEmpty())
@@ -1989,22 +1495,22 @@ public class ReactiveMongoDsl<K> {
 				return Mono
 					.zip( fieldBuilder.buildCriteria(), leftClassMono )
 					.flatMap( tuple -> {
-						Optional<Criteria> leftMatch = tuple.getT1();
+						Optional<MongoCriteria> leftMatch = tuple.getT1();
 						Class<E> leftClass = tuple.getT2();
 
 						String leftColl = (collectionName != null && ! collectionName.isBlank())
 							? collectionName
-							: reactiveMongoTemplate.getCollectionName( leftClass );
+							: mongoExecutionContext.getCollectionName( leftClass );
 
-						List<AggregationOperation> ops = new ArrayList<>();
-						leftMatch.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+						List<MongoAggregationOperation> ops = new ArrayList<>();
+						leftMatch.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
 
-						Mono<List<AggregationOperation>> opsMono = (lookup == null)
+						Mono<List<MongoAggregationOperation>> opsMono = (lookup == null)
 							? Mono.just( ops )
 							: lookup.rightClass().map( rightClass -> {
 								String rightColl = (lookup.rightCollectionName() != null && ! lookup.rightCollectionName().isBlank())
 									? lookup.rightCollectionName()
-									: reactiveMongoTemplate.getCollectionName( rightClass );
+									: mongoExecutionContext.getCollectionName( rightClass );
 
 								String rightAs = (lookup.spec.getAs() != null && ! lookup.spec.getAs().isBlank())
 									? lookup.spec.getAs()
@@ -2069,11 +1575,9 @@ public class ReactiveMongoDsl<K> {
 								groupBody.append( as, accumulators.get( as ) );
 							opList.add( ctx -> new Document( "$group", groupBody ) );
 
-							Aggregation agg = accessor.applyAggOptions( Aggregation.newAggregation( opList ) );
+							MongoAggregation agg = accessor.applyAggOptions( MongoAggregation.newAggregation( opList ) );
 
-							Flux<Document> flux = (collectionName != null && ! collectionName.isBlank())
-								? reactiveMongoTemplate.aggregate( agg, leftColl, Document.class )
-								: reactiveMongoTemplate.aggregate( agg, leftClass, Document.class );
+							Flux<Document> flux = aggregateDocuments( mongoExecutionContext, leftClass, leftColl, agg );
 
 							return flux.collect( LinkedHashMap::new, (LinkedHashMap<KK, V> map, Document d) -> {
 								KK key = this.keyConverter.apply( d );
@@ -2137,15 +1641,15 @@ public class ReactiveMongoDsl<K> {
 
 			protected Boolean isAllowDiskUse = null;
 
-			protected Consumer<Query> queryCustomizer = q -> {};
+			protected Consumer<MongoQuery> queryCustomizer = q -> {};
 
-			protected Consumer<AggregationOptions.Builder> aggOptionsCustomizer = b -> {};
+			protected Consumer<MongoAggregationOptions.Builder> aggOptionsCustomizer = b -> {};
 
 			public interface Runner {}
 
 			@SuppressWarnings("unchecked")
 			public final Q customizeQuery(
-				Consumer<Query> c
+				Consumer<MongoQuery> c
 			) {
 
 				if (c != null)
@@ -2156,7 +1660,7 @@ public class ReactiveMongoDsl<K> {
 
 			@SuppressWarnings("unchecked")
 			public final A customizeAggregation(
-				Consumer<AggregationOptions.Builder> c
+				Consumer<MongoAggregationOptions.Builder> c
 			) {
 
 				if (c != null)
@@ -2184,11 +1688,11 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			protected Aggregation applyAggOptions(
-				Aggregation agg
+			protected MongoAggregation applyAggOptions(
+				MongoAggregation agg
 			) {
 
-				AggregationOptions.Builder b = AggregationOptions.builder();
+				MongoAggregationOptions.Builder b = MongoAggregationOptions.builder();
 
 				if (isAllowDiskUse != null)
 					b.allowDiskUse( isAllowDiskUse );
@@ -2202,8 +1706,8 @@ public class ReactiveMongoDsl<K> {
 			}
 
 
-			protected Query applyQueryOptions(
-				Query q
+			protected MongoQuery applyQueryOptions(
+				MongoQuery q
 			) {
 
 				if (readPreference != null)
@@ -2232,7 +1736,7 @@ public class ReactiveMongoDsl<K> {
 				Class<?> clazz
 			) {
 
-				return reactiveMongoTemplate.getCollectionName( clazz );
+				return mongoExecutionContext.getCollectionName( clazz );
 
 			}
 
@@ -2249,7 +1753,7 @@ public class ReactiveMongoDsl<K> {
 
 			protected String getCollectionName() { return collectionName; }
 
-			protected Mono<Optional<Criteria>> getFieldBuilderCriteria() { return fieldBuilder.buildCriteria(); }
+			protected Mono<Optional<MongoCriteria>> getFieldBuilderCriteria() { return fieldBuilder.buildCriteria(); }
 
 
 			public interface FindAllExecute<E> extends Runner {
@@ -2404,7 +1908,7 @@ public class ReactiveMongoDsl<K> {
 					for (FieldsPair<?, ?> pair : fieldsPairs) {
 
 						if (pair != null) {
-							Criteria criteria = MongoCriteriaSupport.createSingleCriteria( pair );
+							MongoCriteria criteria = MongoCriteriaSupport.createSingleCriteria( pair );
 
 							if (criteria != null) {
 								criteriaStack.peek().criteriaList.add( criteria );
@@ -2568,23 +2072,23 @@ public class ReactiveMongoDsl<K> {
 				if (criteriaStack.size() <= 1) { return this; }
 
 				CriteriaGroup finishedGroup = criteriaStack.pop();
-				List<Criteria> validCriteria = finishedGroup.criteriaList
+				List<MongoCriteria> validCriteria = finishedGroup.criteriaList
 					.stream()
 					.filter( Objects::nonNull )
 					.collect( Collectors.toList() );
 
 				if (! validCriteria.isEmpty()) {
-					Criteria groupCriteria;
+					MongoCriteria groupCriteria;
 
 					switch (finishedGroup.operator) {
 						case AND:
-							groupCriteria = new Criteria().andOperator( validCriteria );
+							groupCriteria = new MongoCriteria().andOperator( validCriteria );
 							break;
 						case OR:
-							groupCriteria = new Criteria().orOperator( validCriteria );
+							groupCriteria = new MongoCriteria().orOperator( validCriteria );
 							break;
 						case NOR:
-							groupCriteria = new Criteria().norOperator( validCriteria );
+							groupCriteria = new MongoCriteria().norOperator( validCriteria );
 							break;
 						default:
 							throw new IllegalArgumentException( "Unsupported operator: " + finishedGroup.operator );
@@ -2616,27 +2120,27 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			private Mono<Optional<Criteria>> buildCriteria() {
+			private Mono<Optional<MongoCriteria>> buildCriteria() {
 
-				Mono<Optional<Criteria>> resultMono = Mono.fromCallable( () -> {
-					List<Criteria> allCriteria = new ArrayList<>();
+				Mono<Optional<MongoCriteria>> resultMono = Mono.fromCallable( () -> {
+					List<MongoCriteria> allCriteria = new ArrayList<>();
 					Deque<CriteriaGroup> tempStack = new ArrayDeque<>( criteriaStack );
 
 					while (! tempStack.isEmpty()) {
 						CriteriaGroup group = tempStack.pop();
 
 						if (! group.criteriaList.isEmpty()) {
-							Criteria combined = null;
+							MongoCriteria combined = null;
 
 							switch (group.operator) {
 								case AND:
-									combined = new Criteria().andOperator( group.criteriaList );
+									combined = new MongoCriteria().andOperator( group.criteriaList );
 									break;
 								case OR:
-									combined = new Criteria().orOperator( group.criteriaList );
+									combined = new MongoCriteria().orOperator( group.criteriaList );
 									break;
 								case NOR:
-									combined = new Criteria().norOperator( group.criteriaList );
+									combined = new MongoCriteria().norOperator( group.criteriaList );
 									break;
 
 							}
@@ -2654,11 +2158,12 @@ public class ReactiveMongoDsl<K> {
 
 					if (allCriteria.size() == 1) { return Optional.of( allCriteria.get( 0 ) ); }
 
-					return Optional.of( new Criteria().andOperator( allCriteria ) );
+					return Optional.of( new MongoCriteria().andOperator( allCriteria ) );
 
 				} );
 				return resultMono;
-				// .onErrorMap( e -> new RuntimeException( "Failed to build Criteria: " + e.getMessage(), e ) );
+				// .onErrorMap( e -> new RuntimeException( "Failed to build MongoCriteria: " + e.getMessage(), e )
+				// );
 
 
 			}
@@ -3681,9 +3186,9 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			private Criteria buildScoreMatchCriteria() {
+			private MongoCriteria buildScoreMatchCriteria() {
 
-				Criteria criteria = Criteria.where( "score" );
+				MongoCriteria criteria = MongoCriteria.where( "score" );
 
 				if (this.scoreGte != null) {
 					criteria.gte( this.scoreGte );
@@ -3755,15 +3260,15 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @return the aggregation operations
 			 */
-			private List<AggregationOperation> buildAggregationOps(
-				Optional<Criteria> postCriteria, boolean includePaging, boolean includeProjection, boolean includeCount, boolean includeMetaAdds
+			private List<MongoAggregationOperation> buildAggregationOps(
+				Optional<MongoCriteria> postCriteria, boolean includePaging, boolean includeProjection, boolean includeCount, boolean includeMetaAdds
 			) {
 
-				List<AggregationOperation> ops = new ArrayList<>();
+				List<MongoAggregationOperation> ops = new ArrayList<>();
 
 				ops.add( ctx -> new Document( "$search", buildSearchStageBody( includeCount ) ) );
 
-				postCriteria.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+				postCriteria.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
 
 				if ((includeMetaAdds && ! this.addFieldsDocs.isEmpty()) || hasScoreMatch()) {
 					Document addFields = new Document();
@@ -3791,18 +3296,18 @@ public class ReactiveMongoDsl<K> {
 				}
 
 				if (hasScoreMatch()) {
-					ops.add( Aggregation.match( buildScoreMatchCriteria() ) );
+					ops.add( MongoAggregation.match( buildScoreMatchCriteria() ) );
 
 				}
 
 				if (includePaging && this.pageNumber != null && this.pageSize != null) {
-					ops.add( Aggregation.skip( (long) this.pageNumber * this.pageSize ) );
-					ops.add( Aggregation.limit( this.pageSize ) );
+					ops.add( MongoAggregation.skip( (long) this.pageNumber * this.pageSize ) );
+					ops.add( MongoAggregation.limit( this.pageSize ) );
 
 				}
 
 				if (includeProjection && this.excludes != null && this.excludes.length > 0) {
-					ops.add( Aggregation.project().andExclude( this.excludes ) );
+					ops.add( MongoAggregation.project().andExclude( this.excludes ) );
 
 				}
 
@@ -3822,14 +3327,12 @@ public class ReactiveMongoDsl<K> {
 			 * @return the raw aggregation result stream
 			 */
 			private Flux<Document> aggregateDocuments(
-				Class<?> entityClass, List<AggregationOperation> ops
+				Class<?> entityClass, List<MongoAggregationOperation> ops
 			) {
 
-				Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+				MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
 
-				return (collectionName != null && ! collectionName.isBlank())
-					? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
-					: reactiveMongoTemplate.aggregate( agg, entityClass, Document.class );
+				return ReactiveMongoDsl.this.aggregateDocuments( mongoExecutionContext, entityClass, collectionName, agg );
 
 			}
 
@@ -4252,8 +3755,8 @@ public class ReactiveMongoDsl<K> {
 						.zip( executeClassMono, postFilterBuilder.buildCriteria() )
 						.flatMapMany( tuple -> {
 							Class<E> entityClass = tuple.getT1();
-							Optional<Criteria> criteriaOpt = tuple.getT2();
-							List<AggregationOperation> ops = buildAggregationOps(
+							Optional<MongoCriteria> criteriaOpt = tuple.getT2();
+							List<MongoAggregationOperation> ops = buildAggregationOps(
 								criteriaOpt,
 								true,
 								true,
@@ -4261,7 +3764,7 @@ public class ReactiveMongoDsl<K> {
 								true
 							);
 							return aggregateDocuments( entityClass, ops )
-								.map( doc -> reactiveMongoTemplate.getConverter().read( entityClass, doc ) );
+								.map( doc -> mongoExecutionContext.read( entityClass, doc ) );
 
 						} );
 
@@ -4358,9 +3861,9 @@ public class ReactiveMongoDsl<K> {
 						.zip( executeClassMono, postFilterBuilder.buildCriteria() )
 						.flatMap( tuple -> {
 							Class<E> entityClass = tuple.getT1();
-							Optional<Criteria> criteriaOpt = tuple.getT2();
+							Optional<MongoCriteria> criteriaOpt = tuple.getT2();
 
-							List<AggregationOperation> ops = buildAggregationOps(
+							List<MongoAggregationOperation> ops = buildAggregationOps(
 								criteriaOpt,
 								false,
 								false,
@@ -4396,13 +3899,11 @@ public class ReactiveMongoDsl<K> {
 
 					return executeClassMono.flatMap( entityClass -> {
 						Document body = buildSearchMetaStageBody( countType );
-						Aggregation agg = applyAggOptions(
-							Aggregation.newAggregation( ctx -> new Document( "$searchMeta", body ) )
+						MongoAggregation agg = applyAggOptions(
+							MongoAggregation.newAggregation( ctx -> new Document( "$searchMeta", body ) )
 						);
 
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( agg, entityClass, Document.class );
+						Flux<Document> docs = ReactiveMongoDsl.this.aggregateDocuments( mongoExecutionContext, entityClass, collectionName, agg );
 
 						return docs
 							.next()
@@ -4813,7 +4314,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Adds Mongo Query Language pre-filters that are rendered into the
+			 * Adds Mongo MongoQuery Language pre-filters that are rendered into the
 			 * {@code filter} field inside {@code $vectorSearch}.
 			 *
 			 * @param fieldsPairs
@@ -4831,7 +4332,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Adds Mongo Query Language pre-filters that are rendered into the
+			 * Adds Mongo MongoQuery Language pre-filters that are rendered into the
 			 * {@code filter} field inside {@code $vectorSearch}.
 			 *
 			 * @param fieldsPairs
@@ -5061,7 +4562,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			private Document buildVectorSearchStageBody(
-				Optional<Criteria> preFilterCriteria
+				Optional<MongoCriteria> preFilterCriteria
 			) {
 
 				validateVectorSearchBody();
@@ -5109,15 +4610,15 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			private List<AggregationOperation> buildAggregationOps(
-				Optional<Criteria> preFilterCriteria, Optional<Criteria> postFilterCriteria, boolean includeProjection, boolean includeMetaAdds
+			private List<MongoAggregationOperation> buildAggregationOps(
+				Optional<MongoCriteria> preFilterCriteria, Optional<MongoCriteria> postFilterCriteria, boolean includeProjection, boolean includeMetaAdds
 			) {
 
-				List<AggregationOperation> ops = new ArrayList<>();
+				List<MongoAggregationOperation> ops = new ArrayList<>();
 
 				ops.add( ctx -> new Document( "$vectorSearch", buildVectorSearchStageBody( preFilterCriteria ) ) );
 
-				postFilterCriteria.ifPresent( criteria -> ops.add( Aggregation.match( criteria ) ) );
+				postFilterCriteria.ifPresent( criteria -> ops.add( MongoAggregation.match( criteria ) ) );
 
 				if (includeMetaAdds && ! this.addFieldsDocs.isEmpty()) {
 					Document addFields = new Document();
@@ -5136,7 +4637,7 @@ public class ReactiveMongoDsl<K> {
 				}
 
 				if (includeProjection && this.excludes != null && this.excludes.length > 0) {
-					ops.add( Aggregation.project().andExclude( this.excludes ) );
+					ops.add( MongoAggregation.project().andExclude( this.excludes ) );
 
 				}
 
@@ -5145,14 +4646,12 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			private Flux<Document> aggregateDocuments(
-				Class<?> entityClass, List<AggregationOperation> ops
+				Class<?> entityClass, List<MongoAggregationOperation> ops
 			) {
 
-				Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+				MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
 
-				return (collectionName != null && ! collectionName.isBlank())
-					? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
-					: reactiveMongoTemplate.aggregate( agg, entityClass, Document.class );
+				return ReactiveMongoDsl.this.aggregateDocuments( mongoExecutionContext, entityClass, collectionName, agg );
 
 			}
 
@@ -5176,11 +4675,11 @@ public class ReactiveMongoDsl<K> {
 						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
 						.flatMapMany( tuple -> {
 							Class<E> entityClass = tuple.getT1();
-							Optional<Criteria> preCriteria = tuple.getT2();
-							Optional<Criteria> postCriteria = tuple.getT3();
-							List<AggregationOperation> ops = buildAggregationOps( preCriteria, postCriteria, true, true );
+							Optional<MongoCriteria> preCriteria = tuple.getT2();
+							Optional<MongoCriteria> postCriteria = tuple.getT3();
+							List<MongoAggregationOperation> ops = buildAggregationOps( preCriteria, postCriteria, true, true );
 							return aggregateDocuments( entityClass, ops )
-								.map( doc -> reactiveMongoTemplate.getConverter().read( entityClass, doc ) );
+								.map( doc -> mongoExecutionContext.read( entityClass, doc ) );
 
 						} );
 
@@ -5236,10 +4735,10 @@ public class ReactiveMongoDsl<K> {
 						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
 						.flatMap( tuple -> {
 							Class<E> entityClass = tuple.getT1();
-							Optional<Criteria> preCriteria = tuple.getT2();
-							Optional<Criteria> postCriteria = tuple.getT3();
+							Optional<MongoCriteria> preCriteria = tuple.getT2();
+							Optional<MongoCriteria> postCriteria = tuple.getT3();
 
-							List<AggregationOperation> ops = buildAggregationOps( preCriteria, postCriteria, false, false );
+							List<MongoAggregationOperation> ops = buildAggregationOps( preCriteria, postCriteria, false, false );
 							ops.add( ctx -> new Document( "$count", "count" ) );
 
 							return aggregateDocuments( entityClass, ops )
@@ -5286,7 +4785,7 @@ public class ReactiveMongoDsl<K> {
 
 			private Paging paging;
 
-			private Sort sort = Sort.unsorted();
+			private MongoSort sort = MongoSort.unsorted();
 
 			private String[] excludes = null;
 
@@ -5332,7 +4831,7 @@ public class ReactiveMongoDsl<K> {
 				Order... sorts
 			) {
 
-				this.sort = Sort.by( sorts );
+				this.sort = MongoSort.by( sorts );
 				return this;
 
 			}
@@ -5349,7 +4848,7 @@ public class ReactiveMongoDsl<K> {
 				Collection<Order> sorts
 			) {
 
-				this.sort = Sort.by( sorts.toArray( Order[]::new ) );
+				this.sort = MongoSort.by( sorts.toArray( Order[]::new ) );
 				return this;
 
 			}
@@ -5499,7 +4998,7 @@ public class ReactiveMongoDsl<K> {
 			public Flux<E> execute() {
 
 				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					Query query = new Query();
+					MongoQuery query = new MongoQuery();
 
 					if (criteriaOptional.isPresent()) {
 						query.addCriteria( criteriaOptional.get() );
@@ -5538,8 +5037,7 @@ public class ReactiveMongoDsl<K> {
 					.flatMapMany( tuple -> {
 						var entityClass = tuple.getT1();
 						var query = tuple.getT2();
-						Flux<? extends E> queryResult = collectionName != null && ! collectionName.isBlank() ? reactiveMongoTemplate.find( query, entityClass, collectionName )
-							: reactiveMongoTemplate.find( query, entityClass );
+						Flux<? extends E> queryResult = find( mongoExecutionContext, entityClass, collectionName, query );
 						return queryResult;
 
 					} );
@@ -5568,32 +5066,32 @@ public class ReactiveMongoDsl<K> {
 			 * This deliberately avoids {@code $facet} so documents can be emitted as
 			 * the cursor produces them.
 			 */
-			private List<AggregationOperation> buildFindAllAggregationOps(
-				Optional<Criteria> criteriaOptional, boolean includePaging, boolean includeProjection
+			private List<MongoAggregationOperation> buildFindAllAggregationOps(
+				Optional<MongoCriteria> criteriaOptional, boolean includePaging, boolean includeProjection
 			) {
 
-				List<AggregationOperation> operations = new ArrayList<>();
+				List<MongoAggregationOperation> operations = new ArrayList<>();
 
-				criteriaOptional.ifPresent( criteria -> operations.add( Aggregation.match( criteria ) ) );
+				criteriaOptional.ifPresent( criteria -> operations.add( MongoAggregation.match( criteria ) ) );
 
 				operations
 					.add(
-						Aggregation
+						MongoAggregation
 							.sort(
 								(this.sort != null && this.sort.isSorted())
 									? this.sort
-									: Sort.by( Sort.Direction.DESC, "_id" )
+									: MongoSort.by( MongoSort.Direction.DESC, "_id" )
 							)
 					);
 
 				if (includePaging && paging != null) {
-					operations.add( Aggregation.skip( (long) paging.pageNumber * paging.pageSize ) );
-					operations.add( Aggregation.limit( paging.pageSize ) );
+					operations.add( MongoAggregation.skip( (long) paging.pageNumber * paging.pageSize ) );
+					operations.add( MongoAggregation.limit( paging.pageSize ) );
 
 				}
 
 				if (includeProjection && excludes != null && excludes.length != 0) {
-					operations.add( Aggregation.project().andExclude( excludes ) );
+					operations.add( MongoAggregation.project().andExclude( excludes ) );
 
 				}
 
@@ -5611,19 +5109,17 @@ public class ReactiveMongoDsl<K> {
 			@Override
 			public Flux<E> executeAggregationStream() {
 
-				Mono<Aggregation> aggregationMono = fieldBuilder
+				Mono<MongoAggregation> aggregationMono = fieldBuilder
 					.buildCriteria()
-					.map( criteriaOptional -> applyAggOptions( Aggregation.newAggregation( buildFindAllAggregationOps( criteriaOptional, true, true ) ) ) );
+					.map( criteriaOptional -> applyAggOptions( MongoAggregation.newAggregation( buildFindAllAggregationOps( criteriaOptional, true, true ) ) ) );
 
 				return Mono
 					.zip( executeClassMono, aggregationMono )
 					.flatMapMany( tuple -> {
 						Class<E> entityClass = tuple.getT1();
-						Aggregation aggregation = tuple.getT2();
+						MongoAggregation aggregation = tuple.getT2();
 
-						return collectionName != null && ! collectionName.isBlank()
-							? reactiveMongoTemplate.aggregate( aggregation, collectionName, entityClass )
-							: reactiveMongoTemplate.aggregate( aggregation, entityClass, entityClass );
+						return aggregate( mongoExecutionContext, entityClass, collectionName, aggregation, entityClass );
 
 					} );
 
@@ -5680,7 +5176,7 @@ public class ReactiveMongoDsl<K> {
 				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
 
 
-				Mono<Aggregation> aggMono = Mono
+				Mono<MongoAggregation> aggMono = Mono
 					.zip(
 						fieldBuilder.buildCriteria(), // 왼쪽 match
 						rightBuilder.getFieldBuilderCriteria(),
@@ -5688,8 +5184,8 @@ public class ReactiveMongoDsl<K> {
 						rightClassMono
 					)
 					.map( tuple -> {
-						Optional<Criteria> leftCriteriaOpt = tuple.getT1();
-						Optional<Criteria> rightCriteriaOpt = tuple.getT2();
+						Optional<MongoCriteria> leftCriteriaOpt = tuple.getT1();
+						Optional<MongoCriteria> rightCriteriaOpt = tuple.getT2();
 						Class<E> leftClass = tuple.getT3();
 						Class<R2> rightClass = tuple.getT4();
 
@@ -5705,8 +5201,8 @@ public class ReactiveMongoDsl<K> {
 						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
 						String rightKey = simpleName( rightClass );
 
-						List<AggregationOperation> ops = new ArrayList<>();
-						leftCriteriaOpt.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+						List<MongoAggregationOperation> ops = new ArrayList<>();
+						leftCriteriaOpt.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
 
 						// $lookup 구성
 						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
@@ -5779,7 +5275,7 @@ public class ReactiveMongoDsl<K> {
 
 						}
 
-						AggregationOperation lookupOp = (ctx) -> new Document( "$lookup", lookupBody );
+						MongoAggregationOperation lookupOp = (ctx) -> new Document( "$lookup", lookupBody );
 						ops.add( lookupOp );
 
 						if (spec.isUnwind()) {
@@ -5802,11 +5298,11 @@ public class ReactiveMongoDsl<K> {
 						}
 
 						// 정렬/페이징(왼쪽 기준) 유지
-						ops.add( Aggregation.sort( (this.sort != null && this.sort.isSorted()) ? this.sort : Sort.by( Sort.Direction.DESC, "_id" ) ) );
+						ops.add( MongoAggregation.sort( (this.sort != null && this.sort.isSorted()) ? this.sort : MongoSort.by( MongoSort.Direction.DESC, "_id" ) ) );
 
 						if (this.paging != null) {
-							ops.add( Aggregation.skip( (long) this.paging.pageNumber * this.paging.pageSize ) );
-							ops.add( Aggregation.limit( this.paging.pageSize ) );
+							ops.add( MongoAggregation.skip( (long) this.paging.pageNumber * this.paging.pageSize ) );
+							ops.add( MongoAggregation.limit( this.paging.pageSize ) );
 
 						}
 
@@ -5819,7 +5315,7 @@ public class ReactiveMongoDsl<K> {
 						);
 						ops.add( ctx -> project );
 
-						Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+						MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
 
 						return agg;
 
@@ -5830,18 +5326,16 @@ public class ReactiveMongoDsl<K> {
 					.flatMapMany( tuple -> {
 						Class<E> leftClass = tuple.getT1();
 						Class<R2> rightClass = tuple.getT2();
-						Aggregation agg = tuple.getT3();
+						MongoAggregation agg = tuple.getT3();
 
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( agg, leftClass, Document.class );
+						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, leftClass, collectionName, agg );
 
 						String leftKey = simpleName( leftClass );
 						String rightKey = simpleName( rightClass );
 
 						return docs.map( d -> {
 							@SuppressWarnings("unchecked")
-							S leftVal = (S) reactiveMongoTemplate.getConverter().read( leftClass, (Document) d.get( leftKey ) );
+							S leftVal = (S) mongoExecutionContext.read( leftClass, (Document) d.get( leftKey ) );
 
 							@SuppressWarnings("unchecked")
 							List<Document> rightArr = (List<Document>) d.get( rightKey );
@@ -5849,7 +5343,7 @@ public class ReactiveMongoDsl<K> {
 							List<R2> rightVal = (rightArr == null) ? List.of()
 								: rightArr
 									.stream()
-									.map( x -> reactiveMongoTemplate.getConverter().read( rightClass, x ) )
+									.map( x -> mongoExecutionContext.read( rightClass, x ) )
 									.collect( Collectors.toList() );
 
 							return new ResultTuple<>( leftKey, leftVal, rightKey, rightVal );
@@ -5889,8 +5383,8 @@ public class ReactiveMongoDsl<K> {
 						rightClassMono
 					)
 					.flatMap( tuple -> {
-						Optional<Criteria> leftCriteriaOpt = tuple.getT1();
-						Optional<Criteria> rightCriteriaOpt = tuple.getT2();
+						Optional<MongoCriteria> leftCriteriaOpt = tuple.getT1();
+						Optional<MongoCriteria> rightCriteriaOpt = tuple.getT2();
 						Class<E> leftClass = tuple.getT3();
 						Class<R2> rightClass = tuple.getT4();
 
@@ -5907,8 +5401,8 @@ public class ReactiveMongoDsl<K> {
 						String rightKey = simpleName( rightClass );
 
 						// ===== 공통 스테이지 빌드 =====
-						List<AggregationOperation> common = new ArrayList<>();
-						leftCriteriaOpt.ifPresent( c -> common.add( Aggregation.match( c ) ) );
+						List<MongoAggregationOperation> common = new ArrayList<>();
+						leftCriteriaOpt.ifPresent( c -> common.add( MongoAggregation.match( c ) ) );
 
 						// $lookup
 						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
@@ -5981,7 +5475,7 @@ public class ReactiveMongoDsl<K> {
 
 						}
 
-						AggregationOperation lookupOp = (ctx) -> new Document( "$lookup", lookupBody );
+						MongoAggregationOperation lookupOp = (ctx) -> new Document( "$lookup", lookupBody );
 						common.add( lookupOp );
 
 						if (spec.isUnwind()) {
@@ -6004,18 +5498,18 @@ public class ReactiveMongoDsl<K> {
 						}
 
 						// ===== data 서브파이프라인 =====
-						List<AggregationOperation> dataOps = new ArrayList<>( common );
+						List<MongoAggregationOperation> dataOps = new ArrayList<>( common );
 						dataOps
 							.add(
-								Aggregation
+								MongoAggregation
 									.sort(
-										(this.sort != null && this.sort.isSorted()) ? this.sort : Sort.by( Sort.Direction.DESC, "_id" )
+										(this.sort != null && this.sort.isSorted()) ? this.sort : MongoSort.by( MongoSort.Direction.DESC, "_id" )
 									)
 							);
 
 						if (this.paging != null) {
-							dataOps.add( Aggregation.skip( (long) this.paging.pageNumber * this.paging.pageSize ) );
-							dataOps.add( Aggregation.limit( this.paging.pageSize ) );
+							dataOps.add( MongoAggregation.skip( (long) this.paging.pageNumber * this.paging.pageSize ) );
+							dataOps.add( MongoAggregation.limit( this.paging.pageSize ) );
 
 						}
 
@@ -6029,27 +5523,25 @@ public class ReactiveMongoDsl<K> {
 						dataOps.add( ctx -> project );
 
 						// ===== count 서브파이프라인 (isCounitng == true일 때만) =====
-						List<AggregationOperation> countOps = new ArrayList<>( common );
+						List<MongoAggregationOperation> countOps = new ArrayList<>( common );
 						// 정렬/페이징/프로젝션 없이, 동일 조건 기준으로 개수만 집계
-						countOps.add( Aggregation.count().as( "totalCount" ) );
+						countOps.add( MongoAggregation.count().as( "totalCount" ) );
 
 
 						// ===== $facet 구성 =====
-						FacetOperation facetOp = Aggregation
-							.facet( dataOps.toArray( new AggregationOperation[0] ) )
+						MongoAggregationOperation facetOp = MongoAggregation
+							.facet( dataOps.toArray( new MongoAggregationOperation[0] ) )
 							.as( "data" )
-							.and( countOps.toArray( new AggregationOperation[0] ) )
+							.and( countOps.toArray( new MongoAggregationOperation[0] ) )
 							.as( "count" );
 
-						Aggregation agg = applyAggOptions(
-							Aggregation
+						MongoAggregation agg = applyAggOptions(
+							MongoAggregation
 								.newAggregation( facetOp )
 						);
 
 
-						Mono<Document> facetDocMono = ((collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( agg, leftCollection, Document.class )
-							: reactiveMongoTemplate.aggregate( agg, leftClass, Document.class )).next(); // $facet 결과는 1문서
+						Mono<Document> facetDocMono = aggregateDocuments( mongoExecutionContext, leftClass, leftCollection, agg ).next(); // $facet 결과는 1문서
 
 						return facetDocMono.flatMap( facetDoc -> {
 							@SuppressWarnings("unchecked")
@@ -6058,7 +5550,7 @@ public class ReactiveMongoDsl<K> {
 							// data 매핑
 							List<ResultTuple<E, List<R2>>> data = dataArr.stream().map( d -> {
 								@SuppressWarnings("unchecked")
-								E leftVal = (E) reactiveMongoTemplate.getConverter().read( leftClass, (Document) d.get( leftKey ) );
+								E leftVal = (E) mongoExecutionContext.read( leftClass, (Document) d.get( leftKey ) );
 
 								Object rawRight = d.get( rightKey );
 								List<R2> rightVal;
@@ -6068,12 +5560,12 @@ public class ReactiveMongoDsl<K> {
 									List<Document> rightDocs = (List<Document>) rawList;
 									rightVal = rightDocs
 										.stream()
-										.map( x -> reactiveMongoTemplate.getConverter().read( rightClass, x ) )
+										.map( x -> mongoExecutionContext.read( rightClass, x ) )
 										.collect( Collectors.toList() );
 
 								} else if (rawRight instanceof Document rd) {
 									// unwind(true) 케이스: 단건을 리스트로 래핑
-									rightVal = List.of( reactiveMongoTemplate.getConverter().read( rightClass, rd ) );
+									rightVal = List.of( mongoExecutionContext.read( rightClass, rd ) );
 
 								} else {
 									rightVal = List.of();
@@ -6119,7 +5611,7 @@ public class ReactiveMongoDsl<K> {
 		 */
 		public class FindQueryBuilder<S extends E> extends QueryBuilderAccesser<FindExecute<E>, FindAggregation<E>> implements FindExecute<E>, FindAggregation<E> {
 
-			private Sort sort = Sort.unsorted();
+			private MongoSort sort = MongoSort.unsorted();
 
 			private String[] excludes = null;
 
@@ -6136,7 +5628,7 @@ public class ReactiveMongoDsl<K> {
 				Order... sorts
 			) {
 
-				this.sort = Sort.by( sorts );
+				this.sort = MongoSort.by( sorts );
 				return this;
 
 			}
@@ -6153,7 +5645,7 @@ public class ReactiveMongoDsl<K> {
 				Collection<Order> sorts
 			) {
 
-				this.sort = Sort.by( sorts.toArray( Order[]::new ) );
+				this.sort = MongoSort.by( sorts.toArray( Order[]::new ) );
 				return this;
 
 			}
@@ -6201,7 +5693,7 @@ public class ReactiveMongoDsl<K> {
 			public Mono<E> execute() {
 
 				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					Query query = new Query();
+					MongoQuery query = new MongoQuery();
 
 					if (criteriaOptional.isPresent()) {
 						query.addCriteria( criteriaOptional.get() );
@@ -6231,10 +5723,7 @@ public class ReactiveMongoDsl<K> {
 					.flatMap( tuple -> {
 						var entityClass = tuple.getT1();
 						var query = tuple.getT2();
-						if (collectionName != null && ! collectionName.isBlank())
-							return reactiveMongoTemplate.findOne( query, entityClass, collectionName );
-						else
-							return reactiveMongoTemplate.findOne( query, entityClass );
+						return findOne( mongoExecutionContext, entityClass, collectionName, query );
 
 
 					} );
@@ -6251,7 +5740,7 @@ public class ReactiveMongoDsl<K> {
 			public Mono<E> executeFirst() {
 
 				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					Query query = new Query();
+					MongoQuery query = new MongoQuery();
 
 					if (criteriaOptional.isPresent()) {
 						query.addCriteria( criteriaOptional.get() );
@@ -6281,10 +5770,7 @@ public class ReactiveMongoDsl<K> {
 					.flatMap( tuple -> {
 						var entityClass = tuple.getT1();
 						var query = tuple.getT2();
-						if (collectionName != null && ! collectionName.isBlank())
-							return reactiveMongoTemplate.findOne( query, entityClass, collectionName );
-						else
-							return reactiveMongoTemplate.findOne( query, entityClass );
+						return findOne( mongoExecutionContext, entityClass, collectionName, query );
 
 
 					} );
@@ -6305,33 +5791,33 @@ public class ReactiveMongoDsl<K> {
 			@Override
 			public Mono<E> executeAggregation() {
 
-				Mono<Aggregation> aggregationMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					List<AggregationOperation> ops = new ArrayList<>();
+				Mono<MongoAggregation> aggregationMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
+					List<MongoAggregationOperation> ops = new ArrayList<>();
 
 					// where 절 ($match)
-					criteriaOptional.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+					criteriaOptional.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
 
 					// 정렬
 					ops
 						.add(
-							Aggregation
+							MongoAggregation
 								.sort(
 									(this.sort != null && this.sort.isSorted())
 										? this.sort
-										: Sort.by( Sort.Direction.DESC, "_id" )
+										: MongoSort.by( MongoSort.Direction.DESC, "_id" )
 								)
 						);
 
 					// 단건만
-					ops.add( Aggregation.limit( 1 ) );
+					ops.add( MongoAggregation.limit( 1 ) );
 
 					// 프로젝트 (exclude)
 					if (excludes != null && excludes.length > 0) {
-						ops.add( Aggregation.project().andExclude( excludes ) );
+						ops.add( MongoAggregation.project().andExclude( excludes ) );
 
 					}
 
-					Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+					MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
 
 					return agg;
 
@@ -6341,14 +5827,12 @@ public class ReactiveMongoDsl<K> {
 					.zip( executeClassMono, aggregationMono )
 					.flatMap( tuple -> {
 						Class<E> entityClass = tuple.getT1();
-						Aggregation aggregation = tuple.getT2();
+						MongoAggregation aggregation = tuple.getT2();
 
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( aggregation, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( aggregation, entityClass, Document.class );
+						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, entityClass, collectionName, aggregation );
 
 						// 첫 문서를 엔티티로 매핑 (없으면 empty Mono)
-						return docs.next().map( doc -> reactiveMongoTemplate.getConverter().read( entityClass, doc ) );
+						return docs.next().map( doc -> mongoExecutionContext.read( entityClass, doc ) );
 
 					} );
 
@@ -6375,7 +5859,7 @@ public class ReactiveMongoDsl<K> {
 				Mono<Class<E>> leftClassMono = executeClassMono;
 				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
 
-				Mono<Aggregation> aggMono = Mono
+				Mono<MongoAggregation> aggMono = Mono
 					.zip(
 						fieldBuilder.buildCriteria(),
 						rightBuilder.getFieldBuilderCriteria(),
@@ -6383,8 +5867,8 @@ public class ReactiveMongoDsl<K> {
 						rightClassMono
 					)
 					.map( tuple -> {
-						Optional<Criteria> leftCriteriaOpt = tuple.getT1();
-						Optional<Criteria> rightCriteriaOpt = tuple.getT2();
+						Optional<MongoCriteria> leftCriteriaOpt = tuple.getT1();
+						Optional<MongoCriteria> rightCriteriaOpt = tuple.getT2();
 						Class<E> leftClass = tuple.getT3();
 						Class<R2> rightClass = tuple.getT4();
 
@@ -6400,8 +5884,8 @@ public class ReactiveMongoDsl<K> {
 						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
 						String rightKey = simpleName( rightClass );
 
-						List<AggregationOperation> ops = new ArrayList<>();
-						leftCriteriaOpt.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+						List<MongoAggregationOperation> ops = new ArrayList<>();
+						leftCriteriaOpt.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
 
 						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
 
@@ -6497,8 +5981,8 @@ public class ReactiveMongoDsl<K> {
 						}
 
 						// sort + limit(1)
-						ops.add( Aggregation.sort( (this.sort != null && this.sort.isSorted()) ? this.sort : Sort.by( Sort.Direction.DESC, "_id" ) ) );
-						ops.add( Aggregation.limit( 1 ) );
+						ops.add( MongoAggregation.sort( (this.sort != null && this.sort.isSorted()) ? this.sort : MongoSort.by( MongoSort.Direction.DESC, "_id" ) ) );
+						ops.add( MongoAggregation.limit( 1 ) );
 
 						Document project = new Document(
 							"$project",
@@ -6508,10 +5992,10 @@ public class ReactiveMongoDsl<K> {
 						);
 						ops.add( ctx -> project );
 
-						Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+						MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
 
 
-						// agg.withOptions( Aggregation.newAggregationOptions().allowDiskUse( false ).build() );
+						// agg.withOptions( MongoAggregation.newAggregationOptions().allowDiskUse( false ).build() );
 						return agg;
 
 					} );
@@ -6521,27 +6005,25 @@ public class ReactiveMongoDsl<K> {
 					.flatMap( tuple -> {
 						Class<E> leftClass = tuple.getT1();
 						Class<R2> rightClass = tuple.getT2();
-						Aggregation agg = tuple.getT3();
+						MongoAggregation agg = tuple.getT3();
 
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( agg, leftClass, Document.class );
+						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, leftClass, collectionName, agg );
 
 						String leftKey = simpleName( leftClass );
 						String rightKey = simpleName( rightClass );
 
 						return docs.next().map( d -> {
 							@SuppressWarnings("unchecked")
-							S leftVal = (S) reactiveMongoTemplate.getConverter().read( leftClass, (Document) d.get( leftKey ) );
+							S leftVal = (S) mongoExecutionContext.read( leftClass, (Document) d.get( leftKey ) );
 
 							Object raw = d.get( rightKey );
 							R2 rightVal = null;
 
 							if (raw instanceof Document rd) {
-								rightVal = reactiveMongoTemplate.getConverter().read( rightClass, rd );
+								rightVal = mongoExecutionContext.read( rightClass, rd );
 
 							} else if (raw instanceof List<?> rl && ! rl.isEmpty() && rl.get( 0 ) instanceof Document r0) {
-								rightVal = reactiveMongoTemplate.getConverter().read( rightClass, r0 ); // 첫 원소
+								rightVal = mongoExecutionContext.read( rightClass, r0 ); // 첫 원소
 
 							}
 
@@ -6570,7 +6052,7 @@ public class ReactiveMongoDsl<K> {
 			public Mono<Long> execute() {
 
 				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					Query query = new Query();
+					MongoQuery query = new MongoQuery();
 
 					if (criteriaOptional.isPresent()) {
 						query.addCriteria( criteriaOptional.get() );
@@ -6588,10 +6070,7 @@ public class ReactiveMongoDsl<K> {
 
 						var entityClass = tuple.getT1();
 						var query = tuple.getT2();
-						if (collectionName != null && ! collectionName.isBlank())
-							return reactiveMongoTemplate.count( query, entityClass, collectionName );
-						else
-							return reactiveMongoTemplate.count( query, entityClass );
+						return count( mongoExecutionContext, entityClass, collectionName, query );
 
 					} )
 				// .onErrorMap( e -> new RuntimeException( "Failed to count documents: " + e.getMessage(), e ) )
@@ -6607,16 +6086,16 @@ public class ReactiveMongoDsl<K> {
 			@Override
 			public Mono<Long> executeAggregation() {
 
-				Mono<Aggregation> aggMono = fieldBuilder.buildCriteria().map( criteriaOpt -> {
-					List<AggregationOperation> ops = new ArrayList<>();
+				Mono<MongoAggregation> aggMono = fieldBuilder.buildCriteria().map( criteriaOpt -> {
+					List<MongoAggregationOperation> ops = new ArrayList<>();
 
 					// where 절($match)
-					criteriaOpt.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+					criteriaOpt.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
 
 					// 카운트
 					ops.add( ctx -> new Document( "$count", "count" ) );
 
-					Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+					MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
 
 					return agg;
 
@@ -6626,11 +6105,9 @@ public class ReactiveMongoDsl<K> {
 					.zip( executeClassMono, aggMono )
 					.flatMap( tuple -> {
 						Class<E> entityClass = tuple.getT1();
-						Aggregation aggregation = tuple.getT2();
+						MongoAggregation aggregation = tuple.getT2();
 
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( aggregation, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( aggregation, entityClass, Document.class );
+						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, entityClass, collectionName, aggregation );
 
 						return docs
 							.singleOrEmpty()
@@ -6665,7 +6142,7 @@ public class ReactiveMongoDsl<K> {
 				Mono<Class<E>> leftClassMono = executeClassMono;
 				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
 
-				Mono<Aggregation> aggMono = Mono
+				Mono<MongoAggregation> aggMono = Mono
 					.zip(
 						fieldBuilder.buildCriteria(),
 						rightBuilder.getFieldBuilderCriteria(),
@@ -6673,8 +6150,8 @@ public class ReactiveMongoDsl<K> {
 						rightClassMono
 					)
 					.map( tp -> {
-						Optional<Criteria> leftMatch = tp.getT1();
-						Optional<Criteria> rightMatch = tp.getT2();
+						Optional<MongoCriteria> leftMatch = tp.getT1();
+						Optional<MongoCriteria> rightMatch = tp.getT2();
 						Class<E> leftClass = tp.getT3();
 						Class<R2> rightClass = tp.getT4();
 
@@ -6686,8 +6163,8 @@ public class ReactiveMongoDsl<K> {
 						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
 						// String rightKey = simpleName( rightClass ); // 이름만 쓸거라 키로도 사용
 
-						List<AggregationOperation> ops = new ArrayList<>();
-						leftMatch.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+						List<MongoAggregationOperation> ops = new ArrayList<>();
+						leftMatch.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
 
 						// $lookup
 						Document lk = new Document( "from", rightColl ).append( "as", rightAs );
@@ -6828,9 +6305,9 @@ public class ReactiveMongoDsl<K> {
 
 						}
 
-						Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+						MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
 
-						// agg.withOptions( Aggregation.newAggregationOptions().allowDiskUse( false ).build() );
+						// agg.withOptions( MongoAggregation.newAggregationOptions().allowDiskUse( false ).build() );
 						return agg;
 
 					} );
@@ -6840,11 +6317,9 @@ public class ReactiveMongoDsl<K> {
 					.flatMap( tp -> {
 						Class<E> leftClass = tp.getT1();
 						Class<R2> rightClass = tp.getT2();
-						Aggregation agg = tp.getT3();
+						MongoAggregation agg = tp.getT3();
 
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( agg, leftClass, Document.class );
+						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, leftClass, collectionName, agg );
 
 						String leftName = simpleName( leftClass );
 						String rightName = simpleName( rightClass );
@@ -6879,7 +6354,7 @@ public class ReactiveMongoDsl<K> {
 			public Mono<DeleteResult> execute() {
 
 				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					Query query = new Query();
+					MongoQuery query = new MongoQuery();
 
 					if (criteriaOptional.isPresent()) {
 						query.addCriteria( criteriaOptional.get() );
@@ -6894,10 +6369,7 @@ public class ReactiveMongoDsl<K> {
 					.flatMap( tuple -> {
 						var entityClass = tuple.getT1();
 						var query = tuple.getT2();
-						if (collectionName != null && ! collectionName.isBlank())
-							return reactiveMongoTemplate.remove( query, entityClass, collectionName );
-						else
-							return reactiveMongoTemplate.remove( query, entityClass );
+						return deleteByFilter( mongoExecutionContext, entityClass, collectionName, query.filter(), true );
 
 					} )
 				// .onErrorMap( e -> new RuntimeException( "Failed to delete documents: " + e.getMessage(), e ) )
@@ -6921,7 +6393,7 @@ public class ReactiveMongoDsl<K> {
 			public Mono<Boolean> execute() {
 
 				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					Query query = new Query();
+					MongoQuery query = new MongoQuery();
 
 					if (criteriaOptional.isPresent()) {
 						query.addCriteria( criteriaOptional.get() );
@@ -6938,10 +6410,7 @@ public class ReactiveMongoDsl<K> {
 					.flatMap( tuple -> {
 						var entityClass = tuple.getT1();
 						var query = tuple.getT2();
-						if (collectionName != null && ! collectionName.isBlank())
-							return reactiveMongoTemplate.exists( query, entityClass, collectionName );
-						else
-							return reactiveMongoTemplate.exists( query, entityClass );
+						return exists( mongoExecutionContext, entityClass, collectionName, query );
 
 					} )
 				// .onErrorMap( e -> new RuntimeException( "Failed to check existence: " + e.getMessage(), e ) )
@@ -6958,11 +6427,11 @@ public class ReactiveMongoDsl<K> {
 			@Override
 			public Mono<Boolean> executeAggregation() {
 
-				Mono<Aggregation> aggMono = fieldBuilder.buildCriteria().map( criteriaOpt -> {
-					List<AggregationOperation> ops = new ArrayList<>();
-					criteriaOpt.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
-					ops.add( Aggregation.limit( 1 ) ); // 한 건만 있으면 true
-					Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+				Mono<MongoAggregation> aggMono = fieldBuilder.buildCriteria().map( criteriaOpt -> {
+					List<MongoAggregationOperation> ops = new ArrayList<>();
+					criteriaOpt.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
+					ops.add( MongoAggregation.limit( 1 ) ); // 한 건만 있으면 true
+					MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
 					return agg;
 
 				} );
@@ -6971,11 +6440,9 @@ public class ReactiveMongoDsl<K> {
 					.zip( executeClassMono, aggMono )
 					.flatMap( tp -> {
 						Class<E> entityClass = tp.getT1();
-						Aggregation agg = tp.getT2();
+						MongoAggregation agg = tp.getT2();
 
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( agg, entityClass, Document.class );
+						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, entityClass, collectionName, agg );
 
 						return docs.hasElements(); // 있으면 true
 
@@ -7003,7 +6470,7 @@ public class ReactiveMongoDsl<K> {
 				Mono<Class<E>> leftClassMono = executeClassMono;
 				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
 
-				Mono<Aggregation> aggMono = Mono
+				Mono<MongoAggregation> aggMono = Mono
 					.zip(
 						fieldBuilder.buildCriteria(),
 						rightBuilder.getFieldBuilderCriteria(),
@@ -7011,8 +6478,8 @@ public class ReactiveMongoDsl<K> {
 						rightClassMono
 					)
 					.map( tp -> {
-						Optional<Criteria> leftMatch = tp.getT1();
-						Optional<Criteria> rightMatch = tp.getT2();
+						Optional<MongoCriteria> leftMatch = tp.getT1();
+						Optional<MongoCriteria> rightMatch = tp.getT2();
 						// Class<E> leftClass = tp.getT3();
 						Class<R2> rightClass = tp.getT4();
 
@@ -7022,8 +6489,8 @@ public class ReactiveMongoDsl<K> {
 
 						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
 
-						List<AggregationOperation> ops = new ArrayList<>();
-						leftMatch.ifPresent( c -> ops.add( Aggregation.match( c ) ) );
+						List<MongoAggregationOperation> ops = new ArrayList<>();
+						leftMatch.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
 
 						Document lk = new Document( "from", rightColl ).append( "as", rightAs );
 
@@ -7139,11 +6606,11 @@ public class ReactiveMongoDsl<K> {
 								)
 							);
 
-						ops.add( Aggregation.limit( 1 ) ); // 왼쪽 존재여부 판정
+						ops.add( MongoAggregation.limit( 1 ) ); // 왼쪽 존재여부 판정
 
-						Aggregation agg = applyAggOptions( Aggregation.newAggregation( ops ) );
+						MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
 
-						agg.withOptions( Aggregation.newAggregationOptions().allowDiskUse( false ).build() );
+						agg.withOptions( MongoAggregation.newAggregationOptions().allowDiskUse( false ).build() );
 						return agg;
 
 					} );
@@ -7153,11 +6620,9 @@ public class ReactiveMongoDsl<K> {
 					.flatMap( tp -> {
 						Class<E> leftClass = tp.getT1();
 						Class<R2> rightClass = tp.getT2();
-						Aggregation agg = tp.getT3();
+						MongoAggregation agg = tp.getT3();
 
-						Flux<Document> docs = (collectionName != null && ! collectionName.isBlank())
-							? reactiveMongoTemplate.aggregate( agg, collectionName, Document.class )
-							: reactiveMongoTemplate.aggregate( agg, leftClass, Document.class );
+						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, leftClass, collectionName, agg );
 
 						String leftName = simpleName( leftClass );
 						String rightName = simpleName( rightClass );
@@ -7180,7 +6645,7 @@ public class ReactiveMongoDsl<K> {
 
 		/**
 		 * Builder for atomic update operations using either document-based updates
-		 * ({@link Update}) or pipeline-based updates ({@link AggregationUpdate}).
+		 * ({@link MongoUpdate}) or pipeline-based updates ({@link MongoAggregationUpdate}).
 		 * <p>Auditing annotations such as {@code @CreatedDate} and {@code @LastModifiedDate}
 		 * are not applied automatically during atomic update operations. Set auditing fields
 		 * explicitly when needed.</p>
@@ -7191,9 +6656,7 @@ public class ReactiveMongoDsl<K> {
 			 * Execution mode for an atomic update.
 			 */
 			private enum AtomicUpdateMode {
-				FIRST,
-				MULTI,
-				UPSERT_ONE
+				FIRST, MULTI, UPSERT_ONE
 			}
 
 			/**
@@ -7257,7 +6720,7 @@ public class ReactiveMongoDsl<K> {
 				private final AtomicUpdateMode mode;
 
 				protected AtomicUpdateTypedBuilder(
-					AtomicUpdateMode mode
+													AtomicUpdateMode mode
 				) {
 
 					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
@@ -7317,7 +6780,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Document-update builder for regular {@link Update} operators.
+			 * Document-update builder for regular {@link MongoUpdate} operators.
 			 */
 			public class AtomicDocumentUpdateBuilder {
 
@@ -7326,7 +6789,7 @@ public class ReactiveMongoDsl<K> {
 				protected final DocumentSpec doc = new DocumentSpec();
 
 				protected AtomicDocumentUpdateBuilder(
-					AtomicUpdateMode mode
+														AtomicUpdateMode mode
 				) {
 
 					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
@@ -7456,7 +6919,7 @@ public class ReactiveMongoDsl<K> {
 					if (doc.isEmpty())
 						return Mono.error( new IllegalStateException( "No document update specified." ) );
 
-					UpdateDefinition updateDefinition = doc.build();
+					MongoUpdateDefinition updateDefinition = doc.build();
 					return doExecute( mode, updateDefinition );
 
 				}
@@ -7559,7 +7022,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Pipeline-update builder for {@link AggregationUpdate} operators.
+			 * Pipeline-update builder for {@link MongoAggregationUpdate} operators.
 			 */
 			public class AtomicPipelineUpdateBuilder {
 
@@ -7568,7 +7031,7 @@ public class ReactiveMongoDsl<K> {
 				private final PipelineSpec pipe = new PipelineSpec();
 
 				private AtomicPipelineUpdateBuilder(
-					AtomicUpdateMode mode
+													AtomicUpdateMode mode
 				) {
 
 					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
@@ -7669,7 +7132,7 @@ public class ReactiveMongoDsl<K> {
 					if (pipe.isEmpty())
 						return Mono.error( new IllegalStateException( "No pipeline update specified." ) );
 
-					UpdateDefinition updateDefinition = pipe.build();
+					MongoUpdateDefinition updateDefinition = pipe.build();
 					return doExecute( mode, updateDefinition );
 
 				}
@@ -7677,11 +7140,11 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			private Mono<UpdateResult> doExecute(
-				AtomicUpdateMode mode, UpdateDefinition updateDef
+				AtomicUpdateMode mode, MongoUpdateDefinition updateDef
 			) {
 
-				Mono<Query> queryMono = fieldBuilder.buildCriteria().map( opt -> {
-					Query q = new Query();
+				Mono<MongoQuery> queryMono = fieldBuilder.buildCriteria().map( opt -> {
+					MongoQuery q = new MongoQuery();
 					opt.ifPresent( q::addCriteria );
 					// applyQueryOptions( q );
 					return q;
@@ -7692,23 +7155,13 @@ public class ReactiveMongoDsl<K> {
 					.zip( executeClassMono, queryMono )
 					.flatMap( tp -> {
 						Class<E> entityClass = tp.getT1();
-						Query query = tp.getT2();
-
-						boolean hasCollection = (collectionName != null && ! collectionName.isBlank());
-
-						if (hasCollection) {
-							return switch (mode) {
-								case UPSERT_ONE -> reactiveMongoTemplate.upsert( query, updateDef, entityClass, collectionName );
-								case MULTI -> reactiveMongoTemplate.updateMulti( query, updateDef, entityClass, collectionName );
-								case FIRST -> reactiveMongoTemplate.updateFirst( query, updateDef, entityClass, collectionName );
-							};
-
-						}
+						MongoQuery query = tp.getT2();
 
 						return switch (mode) {
-							case UPSERT_ONE -> reactiveMongoTemplate.upsert( query, updateDef, entityClass );
-							case MULTI -> reactiveMongoTemplate.updateMulti( query, updateDef, entityClass );
-							case FIRST -> reactiveMongoTemplate.updateFirst( query, updateDef, entityClass );
+							case UPSERT_ONE -> update( mongoExecutionContext, entityClass, collectionName, query, updateDef, false, true );
+							case MULTI -> update( mongoExecutionContext, entityClass, collectionName, query, updateDef, true, false );
+							case FIRST -> update( mongoExecutionContext, entityClass, collectionName, query, updateDef, false, false );
+
 						};
 
 					} );
@@ -7717,7 +7170,7 @@ public class ReactiveMongoDsl<K> {
 
 			private class DocumentSpec {
 
-				private final Update update = new Update();
+				private final MongoUpdate update = new MongoUpdate();
 
 				void inc(
 					String f, Number d
@@ -7775,7 +7228,7 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				UpdateDefinition build() {
+				MongoUpdateDefinition build() {
 
 					return update;
 
@@ -7787,7 +7240,7 @@ public class ReactiveMongoDsl<K> {
 
 			private class PipelineSpec {
 
-				private final List<AggregationOperation> pipeline = new ArrayList<>();
+				private final List<MongoAggregationOperation> pipeline = new ArrayList<>();
 
 				private Document pendingSet = new Document();
 
@@ -7836,10 +7289,10 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				UpdateDefinition build() {
+				MongoUpdateDefinition build() {
 
 					flushSet();
-					return AggregationUpdate.from( pipeline );
+					return MongoAggregationUpdate.from( pipeline );
 
 				}
 
@@ -7881,30 +7334,6 @@ public class ReactiveMongoDsl<K> {
 	}
 
 	/**
-	 * Execution-context builder that resolves the target entity type from a reactive repository class.
-	 *
-	 * @param <E>
-	 *            the resolved entity type
-	 */
-	public class ExecuteRepositoryBuilder<E> extends AbstractQueryBuilder<E, ExecuteRepositoryBuilder<E>> implements ExecuteBuilder {
-
-		// private final Class<? extends ReactiveCrudRepository<?, ?>> repositoryClass;
-
-		ExecuteRepositoryBuilder(
-									K key,
-									Class<? extends ReactiveCrudRepository<?, ?>> repositoryClass
-		) {
-
-			this.repositoryClass = repositoryClass;
-			this.reactiveMongoTemplate = ReactiveMongoDsl.this.getMongoTemplate( key );
-			this.executeClassMono = extractEntityClass( repositoryClass );
-			this.executeBuilder = this;
-
-		}
-
-	}
-
-	/**
 	 * Execution-context builder for mapped Mongo entity classes.
 	 *
 	 * @param <E>
@@ -7923,7 +7352,7 @@ public class ReactiveMongoDsl<K> {
 						.getGenericSuperclass()).getActualTypeArguments()[0]
 				);
 
-			this.reactiveMongoTemplate = ReactiveMongoDsl.this.getMongoTemplate( key );
+			this.mongoExecutionContext = ReactiveMongoDsl.this.getMongoTemplate( key );
 			this.executeBuilder = this;
 
 		}
@@ -7934,7 +7363,7 @@ public class ReactiveMongoDsl<K> {
 		) {
 
 			this.executeClassMono = Mono.just( executeClass );
-			this.reactiveMongoTemplate = ReactiveMongoDsl.this.getMongoTemplate( key );
+			this.mongoExecutionContext = ReactiveMongoDsl.this.getMongoTemplate( key );
 			this.executeBuilder = this;
 
 		}
@@ -7961,7 +7390,7 @@ public class ReactiveMongoDsl<K> {
 						.getGenericSuperclass()).getActualTypeArguments()[0]
 				);
 
-			this.reactiveMongoTemplate = ReactiveMongoDsl.this.getMongoTemplate( key );
+			this.mongoExecutionContext = ReactiveMongoDsl.this.getMongoTemplate( key );
 			this.collectionName = collectionName;
 			this.executeBuilder = this;
 
@@ -7974,7 +7403,7 @@ public class ReactiveMongoDsl<K> {
 		) {
 
 			this.executeClassMono = Mono.just( executeClass );
-			this.reactiveMongoTemplate = ReactiveMongoDsl.this.getMongoTemplate( key );
+			this.mongoExecutionContext = ReactiveMongoDsl.this.getMongoTemplate( key );
 			this.collectionName = collectionName;
 			this.executeBuilder = this;
 
@@ -7983,31 +7412,10 @@ public class ReactiveMongoDsl<K> {
 	}
 
 	/**
-	 * Creates an execution context by resolving the entity type from the given reactive repository
-	 * class.
-	 *
-	 * @param key
-	 *            the logical template key
-	 * @param repositoryClass
-	 *            the reactive repository class
-	 * @param <E>
-	 *            the resolved entity type
-	 * 
-	 * @return an execution builder bound to the resolved entity type
-	 */
-	public <E> ExecuteRepositoryBuilder<E> executeRepository(
-		K key, Class<? extends ReactiveCrudRepository<?, ?>> repositoryClass
-	) {
-
-		return new ExecuteRepositoryBuilder<>( key, repositoryClass );
-
-	}
-
-	/**
 	 * Creates an execution context for an entity type inferred from the anonymous builder subclass.
 	 *
 	 * @param key
-	 *            the logical template key
+	 *            the logical Mongo execution-context key
 	 * @param <E>
 	 *            the entity type
 	 * 
@@ -8027,7 +7435,7 @@ public class ReactiveMongoDsl<K> {
 	 * @param executeEntity
 	 *            the target entity class
 	 * @param key
-	 *            the logical template key
+	 *            the logical Mongo execution-context key
 	 * @param <E>
 	 *            the entity type
 	 * 
@@ -8048,7 +7456,7 @@ public class ReactiveMongoDsl<K> {
 	 * @param executeCustomClass
 	 *            the mapped result class
 	 * @param key
-	 *            the logical template key
+	 *            the logical Mongo execution-context key
 	 * @param collectionName
 	 *            the target collection name
 	 * @param <E>
@@ -8069,7 +7477,7 @@ public class ReactiveMongoDsl<K> {
 	 * inferred from the anonymous builder subclass.
 	 *
 	 * @param key
-	 *            the logical template key
+	 *            the logical Mongo execution-context key
 	 * @param collectionName
 	 *            the target collection name
 	 * @param <E>
