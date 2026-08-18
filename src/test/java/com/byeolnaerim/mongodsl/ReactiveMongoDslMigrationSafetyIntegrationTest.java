@@ -430,7 +430,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			.fields()
 			.end()
 			.findAll()
-			.sort(Sorts.descending("account_name"))
+			.sorts(spec -> spec.driver(Sorts.descending("account_name")))
 			.paging(0, 2)
 			.excludes("status")
 			.execute()
@@ -442,7 +442,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			.fields()
 			.end()
 			.findAll()
-			.sort(Sorts.descending("account_name"))
+			.sorts(spec -> spec.driver(Sorts.descending("account_name")))
 			.paging(0, 2)
 			.excludes("status")
 			.executeAggregationStream()
@@ -473,7 +473,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			.pageSize(2)
 			.pageNumber(0)
 			.and()
-			.sort(Sorts.descending("account_name"))
+			.sorts(spec -> spec.driver(Sorts.descending("account_name")))
 			.executeAggregation()
 			.block();
 

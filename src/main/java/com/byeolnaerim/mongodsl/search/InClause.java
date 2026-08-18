@@ -1,22 +1,23 @@
 package com.byeolnaerim.mongodsl.search;
 
+
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
-import org.bson.Document;
 import org.bson.types.ObjectId;
+import com.mongodb.client.model.search.FieldSearchPath;
+import com.mongodb.client.model.search.SearchOperator;
+import com.mongodb.client.model.search.SearchScore;
+
 
 /**
- * Strongly typed Atlas Search {@code in} operator.
- *
- * @param <K>
- *            the logical path type
+ * DSL-friendly Atlas Search {@code in} operator backed by MongoDB driver's search API.
  */
-public final class InClause<K> extends AbstractSearchOperator {
+public final class InClause extends AbstractSearchOperator {
 
-	private String path;
+	private FieldSearchPath path;
 
 	private final List<Object> values = new ArrayList<>();
 
@@ -28,11 +29,43 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> path(
-		K path
+	public InClause path(
+		String path
 	) {
-		this.path = SearchPathResolver.resolve( path );
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
 		return this;
+
+	}
+
+	public InClause path(
+		Enum<?> path
+	) {
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
+		return this;
+
+	}
+
+	public InClause path(
+		FieldSearchPath path
+	) {
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
+		return this;
+
+	}
+
+	/**
+	 * Fallback for custom path wrappers. Common callers should prefer String, Enum, or FieldSearchPath.
+	 */
+	public InClause path(
+		Object path
+	) {
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
+		return this;
+
 	}
 
 	/**
@@ -43,9 +76,14 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> valuesStrings(
+	public InClause valuesStrings(
 		Collection<String> values
-	) { this.values.addAll( values ); return this; }
+	) {
+
+		this.values.addAll( values );
+		return this;
+
+	}
 
 	/**
 	 * Adds boolean values.
@@ -55,9 +93,14 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> valuesBooleans(
+	public InClause valuesBooleans(
 		Collection<Boolean> values
-	) { this.values.addAll( values ); return this; }
+	) {
+
+		this.values.addAll( values );
+		return this;
+
+	}
 
 	/**
 	 * Adds integer values.
@@ -67,9 +110,14 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> valuesIntegers(
+	public InClause valuesIntegers(
 		Collection<Integer> values
-	) { this.values.addAll( values ); return this; }
+	) {
+
+		this.values.addAll( values );
+		return this;
+
+	}
 
 	/**
 	 * Adds long values.
@@ -79,9 +127,14 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> valuesLongs(
+	public InClause valuesLongs(
 		Collection<Long> values
-	) { this.values.addAll( values ); return this; }
+	) {
+
+		this.values.addAll( values );
+		return this;
+
+	}
 
 	/**
 	 * Adds double values.
@@ -91,9 +144,14 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> valuesDoubles(
+	public InClause valuesDoubles(
 		Collection<Double> values
-	) { this.values.addAll( values ); return this; }
+	) {
+
+		this.values.addAll( values );
+		return this;
+
+	}
 
 	/**
 	 * Adds instant values.
@@ -103,9 +161,14 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> valuesInstants(
+	public InClause valuesInstants(
 		Collection<Instant> values
-	) { this.values.addAll( values ); return this; }
+	) {
+
+		this.values.addAll( values );
+		return this;
+
+	}
 
 	/**
 	 * Adds object-id values.
@@ -115,9 +178,14 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> valuesObjectIds(
+	public InClause valuesObjectIds(
 		Collection<ObjectId> values
-	) { this.values.addAll( values ); return this; }
+	) {
+
+		this.values.addAll( values );
+		return this;
+
+	}
 
 	/**
 	 * Adds UUID values.
@@ -127,9 +195,14 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> valuesUuids(
+	public InClause valuesUuids(
 		Collection<UUID> values
-	) { this.values.addAll( values ); return this; }
+	) {
+
+		this.values.addAll( values );
+		return this;
+
+	}
 
 	/**
 	 * Adds raw values for cases where the caller has already normalized them.
@@ -139,9 +212,14 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> valuesRaw(
+	public InClause valuesRaw(
 		Collection<?> values
-	) { this.values.addAll( values ); return this; }
+	) {
+
+		this.values.addAll( values );
+		return this;
+
+	}
 
 	/**
 	 * Sets the score specification.
@@ -151,37 +229,40 @@ public final class InClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public InClause<K> score(
+	public InClause score(
 		SearchScoreSpec score
 	) {
+
+		this.score = score == null ? null : score.toSearchScore();
+		return this;
+
+	}
+
+	public InClause score(
+		SearchScore score
+	) {
+
 		this.score = score;
 		return this;
+
 	}
 
 	@Override
 	public String operatorName() {
+
 		return "in";
+
 	}
 
 	@Override
-	public Document toDocument() {
+	public SearchOperator toSearchOperator() {
 
-		if (this.path == null || this.path.isBlank()) {
-			throw new IllegalStateException( "in.path is required" );
+		if (this.path == null) { throw new IllegalStateException( "in.path is required" ); }
 
-		}
+		if (this.values.isEmpty()) { throw new IllegalStateException( "in.value is required" ); }
 
-		if (this.values.isEmpty()) {
-			throw new IllegalStateException( "in.value is required" );
-
-		}
-
-		Document body = new Document()
-			.append( "path", this.path )
-			.append( "value", new ArrayList<>( this.values ) );
-
-		applyScore( body );
-		return new Document( operatorName(), body );
+		return applyScore( SearchOperator.in( this.path, this.values ) );
 
 	}
+
 }

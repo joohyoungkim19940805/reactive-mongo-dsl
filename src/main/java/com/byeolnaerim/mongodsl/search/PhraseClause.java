@@ -1,21 +1,25 @@
 package com.byeolnaerim.mongodsl.search;
 
+
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
-import org.bson.Document;
+import com.mongodb.client.model.search.PhraseSearchOperator;
+import com.mongodb.client.model.search.SearchOperator;
+import com.mongodb.client.model.search.SearchPath;
+import com.mongodb.client.model.search.SearchScore;
+
 
 /**
- * Strongly typed Atlas Search {@code phrase} operator.
- *
- * @param <K>
- *            the logical path type
+ * DSL-friendly Atlas Search {@code phrase} operator backed by MongoDB driver's search API.
  */
-public final class PhraseClause<K> extends AbstractSearchOperator {
+public final class PhraseClause extends AbstractSearchOperator {
 
-	private Object path;
+	private List<SearchPath> paths;
 
-	private Object query;
+	private List<String> queries;
 
 	private Integer slop;
 
@@ -29,11 +33,102 @@ public final class PhraseClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseClause<K> path(
-		K path
+	public PhraseClause path(
+		String path
 	) {
-		this.path = SearchPathResolver.resolve( path );
+
+		this.paths = List.of( SearchPathResolver.resolveSearchPath( path ) );
 		return this;
+
+	}
+
+	public PhraseClause path(
+		Enum<?> path
+	) {
+
+		this.paths = List.of( SearchPathResolver.resolveSearchPath( path ) );
+		return this;
+
+	}
+
+	public PhraseClause path(
+		SearchPath path
+	) {
+
+		this.paths = List.of( SearchPathResolver.resolveSearchPath( path ) );
+		return this;
+
+	}
+
+	/** Fallback for custom path wrappers. Common callers should prefer String, Enum, or SearchPath. */
+	public PhraseClause path(
+		Object path
+	) {
+
+		this.paths = List.of( SearchPathResolver.resolveSearchPath( path ) );
+		return this;
+
+	}
+
+	public PhraseClause paths(
+		String path, String... paths
+	) {
+
+		return paths(
+			java.util.stream.Stream
+				.concat(
+					java.util.stream.Stream.of( path ),
+					Arrays.stream( paths )
+				)
+				.toList()
+		);
+
+	}
+
+	public PhraseClause paths(
+		Enum<?> path, Enum<?>... paths
+	) {
+
+		return paths(
+			java.util.stream.Stream
+				.concat(
+					java.util.stream.Stream.of( path ),
+					Arrays.stream( paths )
+				)
+				.toList()
+		);
+
+	}
+
+	public PhraseClause paths(
+		SearchPath path, SearchPath... paths
+	) {
+
+		return paths(
+			java.util.stream.Stream
+				.concat(
+					java.util.stream.Stream.of( path ),
+					Arrays.stream( paths )
+				)
+				.toList()
+		);
+
+	}
+
+	/** Fallback for mixed/custom path wrappers. */
+	public PhraseClause paths(
+		Object path, Object... paths
+	) {
+
+		return paths(
+			java.util.stream.Stream
+				.concat(
+					java.util.stream.Stream.of( path ),
+					Arrays.stream( paths )
+				)
+				.toList()
+		);
+
 	}
 
 	/**
@@ -44,11 +139,13 @@ public final class PhraseClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseClause<K> paths(
-		Collection<K> paths
+	public PhraseClause paths(
+		Collection<?> paths
 	) {
-		this.path = SearchPathResolver.resolveAll( paths );
+
+		this.paths = SearchPathResolver.resolveSearchPaths( paths );
 		return this;
+
 	}
 
 	/**
@@ -59,11 +156,13 @@ public final class PhraseClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseClause<K> query(
+	public PhraseClause query(
 		String query
 	) {
-		this.query = Objects.requireNonNull( query, "query" );
+
+		this.queries = List.of( Objects.requireNonNull( query, "query" ) );
 		return this;
+
 	}
 
 	/**
@@ -74,17 +173,15 @@ public final class PhraseClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseClause<K> queries(
+	public PhraseClause queries(
 		Collection<String> queries
 	) {
 
-		if (queries == null || queries.isEmpty()) {
-			throw new IllegalArgumentException( "queries must not be empty" );
+		if (queries == null || queries.isEmpty()) { throw new IllegalArgumentException( "queries must not be empty" ); }
 
-		}
-
-		this.query = new ArrayList<>( queries );
+		this.queries = new ArrayList<>( queries );
 		return this;
+
 	}
 
 	/**
@@ -95,17 +192,15 @@ public final class PhraseClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseClause<K> slop(
+	public PhraseClause slop(
 		int slop
 	) {
 
-		if (slop < 0) {
-			throw new IllegalArgumentException( "slop must be >= 0" );
-
-		}
+		if (slop < 0) { throw new IllegalArgumentException( "slop must be >= 0" ); }
 
 		this.slop = slop;
 		return this;
+
 	}
 
 	/**
@@ -116,11 +211,13 @@ public final class PhraseClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseClause<K> synonyms(
+	public PhraseClause synonyms(
 		String synonyms
 	) {
+
 		this.synonyms = synonyms;
 		return this;
+
 	}
 
 	/**
@@ -131,47 +228,52 @@ public final class PhraseClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public PhraseClause<K> score(
+	public PhraseClause score(
 		SearchScoreSpec score
 	) {
+
+		this.score = score == null ? null : score.toSearchScore();
+		return this;
+
+	}
+
+	public PhraseClause score(
+		SearchScore score
+	) {
+
 		this.score = score;
 		return this;
+
 	}
 
 	@Override
 	public String operatorName() {
+
 		return "phrase";
+
 	}
 
 	@Override
-	public Document toDocument() {
+	public SearchOperator toSearchOperator() {
 
-		if (this.path == null) {
-			throw new IllegalStateException( "phrase.path is required" );
+		if (this.paths == null || this.paths.isEmpty()) { throw new IllegalStateException( "phrase.path is required" ); }
 
-		}
+		if (this.queries == null || this.queries.isEmpty()) { throw new IllegalStateException( "phrase.query is required" ); }
 
-		if (this.query == null) {
-			throw new IllegalStateException( "phrase.query is required" );
-
-		}
-
-		Document body = new Document()
-			.append( "path", this.path )
-			.append( "query", this.query );
+		PhraseSearchOperator operator = SearchOperator.phrase( this.paths, this.queries );
 
 		if (this.slop != null) {
-			body.append( "slop", this.slop );
+			operator = operator.slop( this.slop );
 
 		}
 
 		if (this.synonyms != null && ! this.synonyms.isBlank()) {
-			body.append( "synonyms", this.synonyms );
+			operator = operator.synonyms( this.synonyms );
 
 		}
 
-		applyScore( body );
-		return new Document( operatorName(), body );
+		return applyScore( operator );
 
 	}
+
 }

@@ -1,23 +1,30 @@
 package com.byeolnaerim.mongodsl.search;
 
+
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
 import org.bson.Document;
+import com.byeolnaerim.mongodsl.internal.MongoBsonSupport;
+import com.mongodb.client.model.search.FuzzySearchOptions;
+import com.mongodb.client.model.search.SearchOperator;
+import com.mongodb.client.model.search.SearchPath;
+import com.mongodb.client.model.search.SearchScore;
+import com.mongodb.client.model.search.TextSearchOperator;
+
 
 /**
- * Strongly typed Atlas Search {@code text} operator.
- *
- * @param <K>
- *            the logical path type
+ * DSL-friendly Atlas Search {@code text} operator backed by MongoDB driver's search API.
  */
-public final class TextClause<K> extends AbstractSearchOperator {
+public final class TextClause extends AbstractSearchOperator {
 
-	private Object path;
+	private List<SearchPath> paths;
 
-	private Object query;
+	private List<String> queries;
 
-	private SearchFuzzy fuzzy;
+	private FuzzySearchOptions fuzzy;
 
 	private SearchMatchCriteria matchCriteria;
 
@@ -31,11 +38,102 @@ public final class TextClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextClause<K> path(
-		K path
+	public TextClause path(
+		String path
 	) {
-		this.path = SearchPathResolver.resolve( path );
+
+		this.paths = List.of( SearchPathResolver.resolveSearchPath( path ) );
 		return this;
+
+	}
+
+	public TextClause path(
+		Enum<?> path
+	) {
+
+		this.paths = List.of( SearchPathResolver.resolveSearchPath( path ) );
+		return this;
+
+	}
+
+	public TextClause path(
+		SearchPath path
+	) {
+
+		this.paths = List.of( SearchPathResolver.resolveSearchPath( path ) );
+		return this;
+
+	}
+
+	/** Fallback for custom path wrappers. Common callers should prefer String, Enum, or SearchPath. */
+	public TextClause path(
+		Object path
+	) {
+
+		this.paths = List.of( SearchPathResolver.resolveSearchPath( path ) );
+		return this;
+
+	}
+
+	public TextClause paths(
+		String path, String... paths
+	) {
+
+		return paths(
+			java.util.stream.Stream
+				.concat(
+					java.util.stream.Stream.of( path ),
+					Arrays.stream( paths )
+				)
+				.toList()
+		);
+
+	}
+
+	public TextClause paths(
+		Enum<?> path, Enum<?>... paths
+	) {
+
+		return paths(
+			java.util.stream.Stream
+				.concat(
+					java.util.stream.Stream.of( path ),
+					Arrays.stream( paths )
+				)
+				.toList()
+		);
+
+	}
+
+	public TextClause paths(
+		SearchPath path, SearchPath... paths
+	) {
+
+		return paths(
+			java.util.stream.Stream
+				.concat(
+					java.util.stream.Stream.of( path ),
+					Arrays.stream( paths )
+				)
+				.toList()
+		);
+
+	}
+
+	/** Fallback for mixed/custom path wrappers. */
+	public TextClause paths(
+		Object path, Object... paths
+	) {
+
+		return paths(
+			java.util.stream.Stream
+				.concat(
+					java.util.stream.Stream.of( path ),
+					Arrays.stream( paths )
+				)
+				.toList()
+		);
+
 	}
 
 	/**
@@ -46,11 +144,13 @@ public final class TextClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextClause<K> paths(
-		Collection<K> paths
+	public TextClause paths(
+		Collection<?> paths
 	) {
-		this.path = SearchPathResolver.resolveAll( paths );
+
+		this.paths = SearchPathResolver.resolveSearchPaths( paths );
 		return this;
+
 	}
 
 	/**
@@ -61,11 +161,13 @@ public final class TextClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextClause<K> query(
+	public TextClause query(
 		String query
 	) {
-		this.query = Objects.requireNonNull( query, "query" );
+
+		this.queries = List.of( Objects.requireNonNull( query, "query" ) );
 		return this;
+
 	}
 
 	/**
@@ -76,17 +178,15 @@ public final class TextClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextClause<K> queries(
+	public TextClause queries(
 		Collection<String> queries
 	) {
 
-		if (queries == null || queries.isEmpty()) {
-			throw new IllegalArgumentException( "queries must not be empty" );
+		if (queries == null || queries.isEmpty()) { throw new IllegalArgumentException( "queries must not be empty" ); }
 
-		}
-
-		this.query = new ArrayList<>( queries );
+		this.queries = new ArrayList<>( queries );
 		return this;
+
 	}
 
 	/**
@@ -101,13 +201,23 @@ public final class TextClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextClause<K> fuzzy(
-		int maxEdits,
-		int prefixLength,
-		int maxExpansions
+	public TextClause fuzzy(
+		int maxEdits, int prefixLength, int maxExpansions
 	) {
-		this.fuzzy = SearchFuzzy.of( maxEdits, prefixLength, maxExpansions );
+
+		if (maxEdits < 1 || maxEdits > 2) { throw new IllegalArgumentException( "maxEdits must be 1 or 2" ); }
+
+		if (prefixLength < 0) { throw new IllegalArgumentException( "prefixLength must be >= 0" ); }
+
+		if (maxExpansions <= 0) { throw new IllegalArgumentException( "maxExpansions must be > 0" ); }
+
+		this.fuzzy = FuzzySearchOptions
+			.fuzzySearchOptions()
+			.maxEdits( maxEdits )
+			.prefixLength( prefixLength )
+			.maxExpansions( maxExpansions );
 		return this;
+
 	}
 
 	/**
@@ -118,11 +228,13 @@ public final class TextClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextClause<K> matchCriteria(
+	public TextClause matchCriteria(
 		SearchMatchCriteria matchCriteria
 	) {
+
 		this.matchCriteria = matchCriteria;
 		return this;
+
 	}
 
 	/**
@@ -133,11 +245,13 @@ public final class TextClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextClause<K> synonyms(
+	public TextClause synonyms(
 		String synonyms
 	) {
+
 		this.synonyms = synonyms;
 		return this;
+
 	}
 
 	/**
@@ -148,57 +262,63 @@ public final class TextClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public TextClause<K> score(
+	public TextClause score(
 		SearchScoreSpec score
 	) {
+
+		this.score = score == null ? null : score.toSearchScore();
+		return this;
+
+	}
+
+	public TextClause score(
+		SearchScore score
+	) {
+
 		this.score = score;
 		return this;
+
 	}
 
 	@Override
 	public String operatorName() {
+
 		return "text";
+
 	}
 
 	@Override
-	public Document toDocument() {
+	public SearchOperator toSearchOperator() {
 
-		if (this.path == null) {
-			throw new IllegalStateException( "text.path is required" );
+		if (this.paths == null || this.paths.isEmpty()) { throw new IllegalStateException( "text.path is required" ); }
 
-		}
+		if (this.queries == null || this.queries.isEmpty()) { throw new IllegalStateException( "text.query is required" ); }
 
-		if (this.query == null) {
-			throw new IllegalStateException( "text.query is required" );
+		if (this.fuzzy != null && this.synonyms != null && ! this.synonyms.isBlank()) { throw new IllegalStateException( "text.fuzzy and text.synonyms cannot be used together" ); }
 
-		}
-
-		if (this.fuzzy != null && this.synonyms != null && ! this.synonyms.isBlank()) {
-			throw new IllegalStateException( "text.fuzzy and text.synonyms cannot be used together" );
-
-		}
-
-		Document body = new Document()
-			.append( "path", this.path )
-			.append( "query", this.query );
+		TextSearchOperator operator = SearchOperator.text( this.paths, this.queries );
 
 		if (this.fuzzy != null) {
-			body.append( "fuzzy", this.fuzzy.toDocument() );
-
-		}
-
-		if (this.matchCriteria != null) {
-			body.append( "matchCriteria", this.matchCriteria.getValue() );
+			operator = operator.fuzzy( this.fuzzy );
 
 		}
 
 		if (this.synonyms != null && ! this.synonyms.isBlank()) {
-			body.append( "synonyms", this.synonyms );
+			operator = operator.synonyms( this.synonyms );
 
 		}
 
-		applyScore( body );
-		return new Document( operatorName(), body );
+		SearchOperator rendered = applyScore( operator );
+
+		if (this.matchCriteria == null) { return rendered; }
+
+		// Driver 5.9.x does not expose matchCriteria on TextSearchOperator yet. Keep this one
+		// driver-gap bridge narrow: let the driver render everything it knows, add only the
+		// missing option, then wrap it back as a driver SearchOperator.
+		Document document = MongoBsonSupport.toDocument( rendered );
+		document.get( "text", Document.class ).append( "matchCriteria", this.matchCriteria.getValue() );
+		return SearchOperator.of( document );
 
 	}
+
 }

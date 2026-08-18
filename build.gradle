@@ -5,7 +5,7 @@ plugins {
 }
 
 group = 'com.byeolnaerim'
-version = '1.0.0-alpha.1'
+version = '1.0.0-alpha.2'
 jar {
     archiveBaseName = 'reactive-mongo-dsl'
 }
@@ -48,22 +48,26 @@ tasks.named('test', Test) {
 }
 
 tasks.register('mongoMigrationTest', Test) {
+
     group = 'verification'
+
     description = 'Runs the MongoDB v1 migration safety integration tests. TEST_CLUSTER_NAME, TEST_USERNAME, TEST_PASSWORD, and TEST_URL are required.'
 
     dependsOn tasks.named('testClasses')
 
     testClassesDirs = sourceSets.test.output.classesDirs
+
     classpath = sourceSets.test.runtimeClasspath
 
     useJUnitPlatform()
 
-    include '**/*MigrationSafetyIntegrationTest.class'
+    include '**/ReactiveMongoDslMigrationSafetyIntegrationTest.class'
 
     systemProperty 'mongo.integration.required', 'true'
 
     // migration gate는 항상 실제 DB에 다시 붙어서 검증
     outputs.upToDateWhen { false }
+
 }
 
 tasks.withType(JavaExec) {

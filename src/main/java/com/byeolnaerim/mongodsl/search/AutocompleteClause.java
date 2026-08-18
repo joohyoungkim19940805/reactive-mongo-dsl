@@ -1,29 +1,29 @@
 package com.byeolnaerim.mongodsl.search;
 
+
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
-import org.bson.Document;
+import com.mongodb.client.model.search.AutocompleteSearchOperator;
+import com.mongodb.client.model.search.FieldSearchPath;
+import com.mongodb.client.model.search.FuzzySearchOptions;
+import com.mongodb.client.model.search.SearchOperator;
+import com.mongodb.client.model.search.SearchScore;
+
 
 /**
- * Strongly typed Atlas Search {@code autocomplete} operator.
- *
- * <p>Unlike {@code text} and {@code phrase}, Atlas Search expects a single path
- * for {@code autocomplete}, so this builder intentionally exposes only
- * {@link #path(Object)}.</p>
- *
- * @param <K>
- *            the logical path type
+ * DSL-friendly Atlas Search {@code autocomplete} operator backed by MongoDB driver's search API.
  */
-public final class AutocompleteClause<K> extends AbstractSearchOperator {
+public final class AutocompleteClause extends AbstractSearchOperator {
 
-	private String path;
+	private FieldSearchPath path;
 
-	private Object query;
+	private List<String> queries;
 
 	private SearchTokenOrder tokenOrder;
 
-	private SearchFuzzy fuzzy;
+	private FuzzySearchOptions fuzzy;
 
 	/**
 	 * Sets the autocomplete path.
@@ -33,11 +33,43 @@ public final class AutocompleteClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteClause<K> path(
-		K path
+	public AutocompleteClause path(
+		String path
 	) {
-		this.path = SearchPathResolver.resolve( path );
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
 		return this;
+
+	}
+
+	public AutocompleteClause path(
+		Enum<?> path
+	) {
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
+		return this;
+
+	}
+
+	public AutocompleteClause path(
+		FieldSearchPath path
+	) {
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
+		return this;
+
+	}
+
+	/**
+	 * Fallback for custom path wrappers. Common callers should prefer String, Enum, or FieldSearchPath.
+	 */
+	public AutocompleteClause path(
+		Object path
+	) {
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
+		return this;
+
 	}
 
 	/**
@@ -48,11 +80,13 @@ public final class AutocompleteClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteClause<K> query(
+	public AutocompleteClause query(
 		String query
 	) {
-		this.query = Objects.requireNonNull( query, "query" );
+
+		this.queries = List.of( Objects.requireNonNull( query, "query" ) );
 		return this;
+
 	}
 
 	/**
@@ -63,17 +97,15 @@ public final class AutocompleteClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteClause<K> queries(
+	public AutocompleteClause queries(
 		Collection<String> queries
 	) {
 
-		if (queries == null || queries.isEmpty()) {
-			throw new IllegalArgumentException( "queries must not be empty" );
+		if (queries == null || queries.isEmpty()) { throw new IllegalArgumentException( "queries must not be empty" ); }
 
-		}
-
-		this.query = new ArrayList<>( queries );
+		this.queries = new ArrayList<>( queries );
 		return this;
+
 	}
 
 	/**
@@ -84,11 +116,13 @@ public final class AutocompleteClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteClause<K> tokenOrder(
+	public AutocompleteClause tokenOrder(
 		SearchTokenOrder tokenOrder
 	) {
+
 		this.tokenOrder = tokenOrder;
 		return this;
+
 	}
 
 	/**
@@ -103,13 +137,23 @@ public final class AutocompleteClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteClause<K> fuzzy(
-		int maxEdits,
-		int prefixLength,
-		int maxExpansions
+	public AutocompleteClause fuzzy(
+		int maxEdits, int prefixLength, int maxExpansions
 	) {
-		this.fuzzy = SearchFuzzy.of( maxEdits, prefixLength, maxExpansions );
+
+		if (maxEdits < 1 || maxEdits > 2) { throw new IllegalArgumentException( "maxEdits must be 1 or 2" ); }
+
+		if (prefixLength < 0) { throw new IllegalArgumentException( "prefixLength must be >= 0" ); }
+
+		if (maxExpansions <= 0) { throw new IllegalArgumentException( "maxExpansions must be > 0" ); }
+
+		this.fuzzy = FuzzySearchOptions
+			.fuzzySearchOptions()
+			.maxEdits( maxEdits )
+			.prefixLength( prefixLength )
+			.maxExpansions( maxExpansions );
 		return this;
+
 	}
 
 	/**
@@ -120,47 +164,55 @@ public final class AutocompleteClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public AutocompleteClause<K> score(
+	public AutocompleteClause score(
 		SearchScoreSpec score
 	) {
+
+		this.score = score == null ? null : score.toSearchScore();
+		return this;
+
+	}
+
+	public AutocompleteClause score(
+		SearchScore score
+	) {
+
 		this.score = score;
 		return this;
+
 	}
 
 	@Override
 	public String operatorName() {
+
 		return "autocomplete";
+
 	}
 
 	@Override
-	public Document toDocument() {
+	public SearchOperator toSearchOperator() {
 
-		if (this.path == null || this.path.isBlank()) {
-			throw new IllegalStateException( "autocomplete.path is required" );
+		if (this.path == null) { throw new IllegalStateException( "autocomplete.path is required" ); }
 
-		}
+		if (this.queries == null || this.queries.isEmpty()) { throw new IllegalStateException( "autocomplete.query is required" ); }
 
-		if (this.query == null) {
-			throw new IllegalStateException( "autocomplete.query is required" );
+		AutocompleteSearchOperator operator = SearchOperator.autocomplete( this.path, this.queries );
 
-		}
+		if (this.tokenOrder == SearchTokenOrder.ANY) {
+			operator = operator.anyTokenOrder();
 
-		Document body = new Document()
-			.append( "path", this.path )
-			.append( "query", this.query );
-
-		if (this.tokenOrder != null) {
-			body.append( "tokenOrder", this.tokenOrder.getValue() );
+		} else if (this.tokenOrder == SearchTokenOrder.SEQUENTIAL) {
+			operator = operator.sequentialTokenOrder();
 
 		}
 
 		if (this.fuzzy != null) {
-			body.append( "fuzzy", this.fuzzy.toDocument() );
+			operator = operator.fuzzy( this.fuzzy );
 
 		}
 
-		applyScore( body );
-		return new Document( operatorName(), body );
+		return applyScore( operator );
 
 	}
+
 }

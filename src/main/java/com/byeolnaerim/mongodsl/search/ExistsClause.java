@@ -1,16 +1,17 @@
 package com.byeolnaerim.mongodsl.search;
 
-import org.bson.Document;
+
+import com.mongodb.client.model.search.FieldSearchPath;
+import com.mongodb.client.model.search.SearchOperator;
+import com.mongodb.client.model.search.SearchScore;
+
 
 /**
- * Strongly typed Atlas Search {@code exists} operator.
- *
- * @param <K>
- *            the logical path type
+ * DSL-friendly Atlas Search {@code exists} operator backed by MongoDB driver's search API.
  */
-public final class ExistsClause<K> extends AbstractSearchOperator {
+public final class ExistsClause extends AbstractSearchOperator {
 
-	private String path;
+	private FieldSearchPath path;
 
 	/**
 	 * Sets the target path.
@@ -20,11 +21,43 @@ public final class ExistsClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public ExistsClause<K> path(
-		K path
+	public ExistsClause path(
+		String path
 	) {
-		this.path = SearchPathResolver.resolve( path );
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
 		return this;
+
+	}
+
+	public ExistsClause path(
+		Enum<?> path
+	) {
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
+		return this;
+
+	}
+
+	public ExistsClause path(
+		FieldSearchPath path
+	) {
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
+		return this;
+
+	}
+
+	/**
+	 * Fallback for custom path wrappers. Common callers should prefer String, Enum, or FieldSearchPath.
+	 */
+	public ExistsClause path(
+		Object path
+	) {
+
+		this.path = SearchPathResolver.resolveFieldPath( path );
+		return this;
+
 	}
 
 	/**
@@ -35,29 +68,38 @@ public final class ExistsClause<K> extends AbstractSearchOperator {
 	 *
 	 * @return this builder
 	 */
-	public ExistsClause<K> score(
+	public ExistsClause score(
 		SearchScoreSpec score
 	) {
+
+		this.score = score == null ? null : score.toSearchScore();
+		return this;
+
+	}
+
+	public ExistsClause score(
+		SearchScore score
+	) {
+
 		this.score = score;
 		return this;
+
 	}
 
 	@Override
 	public String operatorName() {
+
 		return "exists";
+
 	}
 
 	@Override
-	public Document toDocument() {
+	public SearchOperator toSearchOperator() {
 
-		if (this.path == null || this.path.isBlank()) {
-			throw new IllegalStateException( "exists.path is required" );
+		if (this.path == null) { throw new IllegalStateException( "exists.path is required" ); }
 
-		}
-
-		Document body = new Document( "path", this.path );
-		applyScore( body );
-		return new Document( operatorName(), body );
+		return applyScore( SearchOperator.exists( this.path ) );
 
 	}
+
 }

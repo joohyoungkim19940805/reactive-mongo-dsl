@@ -1,5 +1,6 @@
 package com.byeolnaerim.mongodsl.search;
 
+
 /**
  * Match criteria for Atlas Search operators that support token matching mode.
  */
@@ -18,9 +19,11 @@ public enum SearchMatchCriteria {
 	private final String value;
 
 	SearchMatchCriteria(
-		String value
+						String value
 	) {
+
 		this.value = value;
+
 	}
 
 	/**
@@ -28,7 +31,6 @@ public enum SearchMatchCriteria {
 	 *
 	 * @return the Atlas Search wire value
 	 */
-	public String getValue() {
-		return this.value;
-	}
+	public String getValue() { return this.value; }
+
 }

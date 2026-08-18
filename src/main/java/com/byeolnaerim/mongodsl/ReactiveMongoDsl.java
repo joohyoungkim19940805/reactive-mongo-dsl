@@ -1,8 +1,6 @@
 package com.byeolnaerim.mongodsl;
 
 
-import java.lang.reflect.Field;
-import java.lang.reflect.ParameterizedType;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -17,6 +15,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import org.bson.BinaryVector;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.reactivestreams.Publisher;
@@ -47,32 +46,42 @@ import com.byeolnaerim.mongodsl.search.RangeClause;
 import com.byeolnaerim.mongodsl.search.SearchCountType;
 import com.byeolnaerim.mongodsl.search.SearchHighlightSpec;
 import com.byeolnaerim.mongodsl.search.SearchOperators;
+import com.byeolnaerim.mongodsl.search.SearchPathResolver;
 import com.byeolnaerim.mongodsl.search.SearchScoreSpec;
-import com.byeolnaerim.mongodsl.search.SearchSortSpec;
 import com.byeolnaerim.mongodsl.search.TextClause;
+import com.byeolnaerim.mongodsl.sort.SortSpec;
 import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
 import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
-import com.byeolnaerim.mongodsl.vector.VectorPathResolver;
-import com.byeolnaerim.mongodsl.vector.VectorQueryVector;
-import com.byeolnaerim.mongodsl.vector.VectorTextQueryShape;
 import com.mongodb.ReadPreference;
 import com.mongodb.bulk.BulkWriteResult;
+import com.mongodb.client.model.Accumulators;
 import com.mongodb.client.model.Aggregates;
+import com.mongodb.client.model.BsonField;
 import com.mongodb.client.model.BulkWriteOptions;
-import com.mongodb.client.model.Projections;
-import com.mongodb.client.model.Sorts;
-import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.CountOptions;
-import com.mongodb.client.model.Facet;
 import com.mongodb.client.model.DeleteOneModel;
+import com.mongodb.client.model.Facet;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.InsertOneModel;
+import com.mongodb.client.model.Projections;
 import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.Sorts;
+import com.mongodb.client.model.UnwindOptions;
 import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.model.UpdateOptions;
-import com.mongodb.client.model.UnwindOptions;
+import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.Variable;
 import com.mongodb.client.model.WriteModel;
+import com.mongodb.client.model.search.CompoundSearchOperator;
+import com.mongodb.client.model.search.FieldSearchPath;
+import com.mongodb.client.model.search.SearchHighlight;
+import com.mongodb.client.model.search.SearchOperator;
+import com.mongodb.client.model.search.SearchOptions;
+import com.mongodb.client.model.search.SearchScore;
+import com.mongodb.client.model.search.ShouldCompoundSearchOperator;
+import com.mongodb.client.model.search.TextVectorSearchQuery;
+import com.mongodb.client.model.search.VectorSearchOptions;
+import com.mongodb.client.model.search.VectorSearchQuery;
 import com.mongodb.client.result.DeleteResult;
 import com.mongodb.client.result.UpdateResult;
 import com.mongodb.reactivestreams.client.AggregatePublisher;
@@ -91,6 +100,10 @@ import tools.jackson.databind.json.JsonMapper;
  * bulk operations, and atomic updates in a reactive style.</p>
  * <p>Mongo execution-context resolution is delegated to {@link MongoTemplateResolver},
  * which makes this DSL suitable for multi-database or multi-tenant use cases.</p>
+ * <p>The DSL is intentionally an application-level convenience layer, not a replacement for the
+ * MongoDB Java Driver. Convenience methods delegate MongoDB syntax and serialization to driver
+ * builders whenever a typed driver API exists, while driver-native {@link Bson} escape hatches
+ * remain available for advanced or newly introduced MongoDB features.</p>
  *
  * @param <K>
  *            the logical key type used to resolve the target Mongo execution context
@@ -105,7 +118,8 @@ public class ReactiveMongoDsl<K> {
 
 	/**
 	 * Creates a new DSL instance using the given resolver and a default {@link ObjectMapper}.
-	 * The mapper is retained for source/API compatibility; history snapshots use the active Mongo execution context mapping.
+	 * The mapper is retained for source/API compatibility; history snapshots use the active Mongo
+	 * execution context mapping.
 	 *
 	 * @param resolver
 	 *            the Mongo execution-context resolver
@@ -226,12 +240,14 @@ public class ReactiveMongoDsl<K> {
 
 		if (value instanceof Document document)
 			return copyDocument( document );
+
 		if (value instanceof Map<?, ?> map) {
 			Document copy = new Document();
 			map.forEach( (key, nestedValue) -> copy.put( String.valueOf( key ), copyDocumentValue( nestedValue ) ) );
 			return copy;
 
 		}
+
 		if (value instanceof Collection<?> collection)
 			return collection.stream().map( ReactiveMongoDsl::copyDocumentValue ).toList();
 		if (value instanceof byte[] bytes)
@@ -242,29 +258,39 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
-	private static Object readDocumentPath(Document document, String path) {
+	private static Object readDocumentPath(
+		Document document, String path
+	) {
 
 		Object current = document;
-		for (String segment : path.split("\\.")) {
-			if (!(current instanceof Document currentDocument))
+
+		for (String segment : path.split( "\\." )) {
+			if (! (current instanceof Document currentDocument))
 				return null;
-			current = currentDocument.get(segment);
+			current = currentDocument.get( segment );
+
 		}
+
 		return current;
 
 	}
 
-	private static void removeDocumentPath(Document document, String path) {
+	private static void removeDocumentPath(
+		Document document, String path
+	) {
 
-		String[] segments = path.split("\\.");
+		String[] segments = path.split( "\\." );
 		Document current = document;
+
 		for (int i = 0; i < segments.length - 1; i++) {
-			Object nested = current.get(segments[i]);
-			if (!(nested instanceof Document nestedDocument))
+			Object nested = current.get( segments[i] );
+			if (! (nested instanceof Document nestedDocument))
 				return;
 			current = nestedDocument;
+
 		}
-		current.remove(segments[segments.length - 1]);
+
+		current.remove( segments[segments.length - 1] );
 
 	}
 
@@ -274,7 +300,7 @@ public class ReactiveMongoDsl<K> {
 
 		if (rawValue instanceof Document document)
 			return List.of( executionContext.read( targetClass, document ) );
-		if (!(rawValue instanceof Collection<?> collection))
+		if (! (rawValue instanceof Collection<?> collection))
 			return List.of();
 		return collection
 			.stream()
@@ -293,18 +319,21 @@ public class ReactiveMongoDsl<K> {
 		rightCriteria.ifPresent( criteria -> pipeline.add( Aggregates.match( criteria ) ) );
 
 		Document let = spec.getLetDoc() == null ? new Document() : new Document( spec.getLetDoc() );
+
 		if (spec.getLocalField() != null && spec.getForeignField() != null && (! pipeline.isEmpty() || ! let.isEmpty() || ! spec.getPipelineDocs().isEmpty())) {
 			String localVariable = "vlf";
 			let.put( localVariable, "$" + spec.getLocalField() );
-			pipeline.add(
-				new Document(
-					"$match",
-					new Document(
-						"$expr",
-						new Document( "$eq", List.of( "$" + spec.getForeignField(), "$$" + localVariable ) )
-					)
-				)
-			);
+			pipeline
+				.add(
+					Aggregates
+						.match(
+							new Document(
+								"$expr",
+								new Document( "$eq", List.of( "$" + spec.getForeignField(), "$$" + localVariable ) )
+							)
+						)
+				);
+
 		}
 
 		pipeline.addAll( spec.getPipelineDocs() );
@@ -326,67 +355,110 @@ public class ReactiveMongoDsl<K> {
 		}
 
 		if (spec.isUnwind()) {
-			operations.add(
-				Aggregates.unwind(
-					"$" + rightAs,
-					new UnwindOptions().preserveNullAndEmptyArrays( spec.isPreserveNullAndEmptyArrays() )
-				)
-			);
+			operations
+				.add(
+					Aggregates
+						.unwind(
+							"$" + rightAs,
+							new UnwindOptions().preserveNullAndEmptyArrays( spec.isPreserveNullAndEmptyArrays() )
+						)
+				);
+
 		}
 
 		operations.addAll( spec.getOuterStages() );
+
 	}
 
 	private static final class FindSpec {
 
 		private Bson filter = new Document();
+
 		private Bson sort;
+
 		private Bson projection;
+
 		private long skip;
+
 		private int limit;
+
 		private ReadPreference readPreference;
+
 		private Boolean allowDiskUse;
+
 		private Consumer<FindPublisher<Document>> customizer = ignored -> {};
 
-		FindSpec filter(Bson filter) {
+		FindSpec filter(
+			Bson filter
+		) {
+
 			this.filter = filter == null ? new Document() : filter;
 			return this;
+
 		}
 
-		FindSpec sort(Bson sort) {
+		FindSpec sort(
+			Bson sort
+		) {
+
 			this.sort = sort;
 			return this;
+
 		}
 
-		FindSpec projection(Bson projection) {
+		FindSpec projection(
+			Bson projection
+		) {
+
 			this.projection = projection;
 			return this;
+
 		}
 
-		FindSpec skip(long skip) {
+		FindSpec skip(
+			long skip
+		) {
+
 			this.skip = skip;
 			return this;
+
 		}
 
-		FindSpec limit(int limit) {
+		FindSpec limit(
+			int limit
+		) {
+
 			this.limit = limit;
 			return this;
+
 		}
 
-		FindSpec readPreference(ReadPreference readPreference) {
+		FindSpec readPreference(
+			ReadPreference readPreference
+		) {
+
 			this.readPreference = readPreference;
 			return this;
+
 		}
 
-		FindSpec allowDiskUse(Boolean allowDiskUse) {
+		FindSpec allowDiskUse(
+			Boolean allowDiskUse
+		) {
+
 			this.allowDiskUse = allowDiskUse;
 			return this;
+
 		}
 
-		FindSpec customize(Consumer<FindPublisher<Document>> customizer) {
+		FindSpec customize(
+			Consumer<FindPublisher<Document>> customizer
+		) {
+
 			if (customizer != null)
-				this.customizer = this.customizer.andThen(customizer);
+				this.customizer = this.customizer.andThen( customizer );
 			return this;
+
 		}
 
 	}
@@ -395,28 +467,47 @@ public class ReactiveMongoDsl<K> {
 	private static final class AggregationSpec {
 
 		private final List<Bson> pipeline;
+
 		private ReadPreference readPreference;
+
 		private Boolean allowDiskUse;
+
 		private Consumer<AggregatePublisher<Document>> customizer = ignored -> {};
 
-		private AggregationSpec(List<? extends Bson> pipeline) {
-			this.pipeline = List.copyOf(pipeline);
+		private AggregationSpec(
+								List<? extends Bson> pipeline
+		) {
+
+			this.pipeline = List.copyOf( pipeline );
+
 		}
 
-		AggregationSpec readPreference(ReadPreference readPreference) {
+		AggregationSpec readPreference(
+			ReadPreference readPreference
+		) {
+
 			this.readPreference = readPreference;
 			return this;
+
 		}
 
-		AggregationSpec allowDiskUse(Boolean allowDiskUse) {
+		AggregationSpec allowDiskUse(
+			Boolean allowDiskUse
+		) {
+
 			this.allowDiskUse = allowDiskUse;
 			return this;
+
 		}
 
-		AggregationSpec customize(Consumer<AggregatePublisher<Document>> customizer) {
+		AggregationSpec customize(
+			Consumer<AggregatePublisher<Document>> customizer
+		) {
+
 			if (customizer != null)
-				this.customizer = this.customizer.andThen(customizer);
+				this.customizer = this.customizer.andThen( customizer );
 			return this;
+
 		}
 
 	}
@@ -424,24 +515,36 @@ public class ReactiveMongoDsl<K> {
 	private static final class UpdateSpec {
 
 		private final Bson update;
+
 		private final List<Bson> pipeline;
 
-		private UpdateSpec(Bson update, List<Bson> pipeline) {
+		private UpdateSpec(
+							Bson update,
+							List<Bson> pipeline
+		) {
+
 			this.update = update;
 			this.pipeline = pipeline;
+
 		}
 
-		static UpdateSpec document(Bson update) {
-			return new UpdateSpec(Objects.requireNonNull(update, "update must not be null"), List.of());
+		static UpdateSpec document(
+			Bson update
+		) {
+
+			return new UpdateSpec( Objects.requireNonNull( update, "update must not be null" ), List.of() );
+
 		}
 
-		static UpdateSpec pipeline(List<? extends Bson> pipeline) {
-			return new UpdateSpec(null, List.copyOf(pipeline));
+		static UpdateSpec pipeline(
+			List<? extends Bson> pipeline
+		) {
+
+			return new UpdateSpec( null, List.copyOf( pipeline ) );
+
 		}
 
-		boolean isPipeline() {
-			return !pipeline.isEmpty();
-		}
+		boolean isPipeline() { return ! pipeline.isEmpty(); }
 
 	}
 
@@ -449,11 +552,12 @@ public class ReactiveMongoDsl<K> {
 		Function<ClientSession, ? extends Publisher<T>> withSession, Supplier<? extends Publisher<T>> withoutSession
 	) {
 
-		return Mono.deferContextual(
-			context -> context.hasKey(CLIENT_SESSION_CONTEXT_KEY)
-				? Mono.from(withSession.apply(context.get(CLIENT_SESSION_CONTEXT_KEY)))
-				: Mono.from(withoutSession.get())
-		);
+		return Mono
+			.deferContextual(
+				context -> context.hasKey( CLIENT_SESSION_CONTEXT_KEY )
+					? Mono.from( withSession.apply( context.get( CLIENT_SESSION_CONTEXT_KEY ) ) )
+					: Mono.from( withoutSession.get() )
+			);
 
 	}
 
@@ -461,11 +565,12 @@ public class ReactiveMongoDsl<K> {
 		Function<ClientSession, ? extends Publisher<T>> withSession, Supplier<? extends Publisher<T>> withoutSession
 	) {
 
-		return Flux.deferContextual(
-			context -> context.hasKey(CLIENT_SESSION_CONTEXT_KEY)
-				? Flux.from(withSession.apply(context.get(CLIENT_SESSION_CONTEXT_KEY)))
-				: Flux.from(withoutSession.get())
-		);
+		return Flux
+			.deferContextual(
+				context -> context.hasKey( CLIENT_SESSION_CONTEXT_KEY )
+					? Flux.from( withSession.apply( context.get( CLIENT_SESSION_CONTEXT_KEY ) ) )
+					: Flux.from( withoutSession.get() )
+			);
 
 	}
 
@@ -473,13 +578,16 @@ public class ReactiveMongoDsl<K> {
 		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName
 	) {
 
-		return executionContext.getDatabase().map(
-			database -> database.getCollection(
-				explicitCollectionName != null && !explicitCollectionName.isBlank()
-					? explicitCollectionName
-					: executionContext.getCollectionName(entityClass)
-			)
-		);
+		return executionContext
+			.getDatabase()
+			.map(
+				database -> database
+					.getCollection(
+						explicitCollectionName != null && ! explicitCollectionName.isBlank()
+							? explicitCollectionName
+							: executionContext.getCollectionName( entityClass )
+					)
+			);
 
 	}
 
@@ -489,22 +597,22 @@ public class ReactiveMongoDsl<K> {
 
 		MongoCollection<Document> target = query.readPreference == null
 			? collection
-			: collection.withReadPreference(query.readPreference);
+			: collection.withReadPreference( query.readPreference );
 		FindPublisher<Document> publisher = session == null
-			? target.find(query.filter)
-			: target.find(session, query.filter);
+			? target.find( query.filter )
+			: target.find( session, query.filter );
 
 		if (query.sort != null)
-			publisher = publisher.sort(query.sort);
+			publisher = publisher.sort( query.sort );
 		if (query.projection != null)
-			publisher = publisher.projection(query.projection);
+			publisher = publisher.projection( query.projection );
 		if (query.skip > 0)
-			publisher = publisher.skip(Math.toIntExact(query.skip));
+			publisher = publisher.skip( Math.toIntExact( query.skip ) );
 		if (query.limit > 0)
-			publisher = publisher.limit(query.limit);
+			publisher = publisher.limit( query.limit );
 		if (query.allowDiskUse != null)
-			publisher = publisher.allowDiskUse(query.allowDiskUse);
-		query.customizer.accept(publisher);
+			publisher = publisher.allowDiskUse( query.allowDiskUse );
+		query.customizer.accept( publisher );
 		return publisher;
 
 	}
@@ -513,14 +621,14 @@ public class ReactiveMongoDsl<K> {
 		MongoExecutionContext executionContext, Class<T> entityClass, String explicitCollectionName, FindSpec query
 	) {
 
-		return resolveCollection(executionContext, entityClass, explicitCollectionName)
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMapMany(
 				collection -> executeFluxWithSession(
-					session -> applyQuery(collection, query, session),
-					() -> applyQuery(collection, query, null)
+					session -> applyQuery( collection, query, session ),
+					() -> applyQuery( collection, query, null )
 				)
 			)
-			.map(document -> executionContext.read(entityClass, document));
+			.map( document -> executionContext.read( entityClass, document ) );
 
 	}
 
@@ -528,14 +636,14 @@ public class ReactiveMongoDsl<K> {
 		MongoExecutionContext executionContext, Class<T> entityClass, String explicitCollectionName, FindSpec query
 	) {
 
-		return resolveCollection(executionContext, entityClass, explicitCollectionName)
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
-					session -> applyQuery(collection, query, session).first(),
-					() -> applyQuery(collection, query, null).first()
+					session -> applyQuery( collection, query, session ).first(),
+					() -> applyQuery( collection, query, null ).first()
 				)
 			)
-			.map(document -> executionContext.read(entityClass, document));
+			.map( document -> executionContext.read( entityClass, document ) );
 
 	}
 
@@ -545,44 +653,37 @@ public class ReactiveMongoDsl<K> {
 
 		MongoCollection<Document> target = aggregation.readPreference == null
 			? collection
-			: collection.withReadPreference(aggregation.readPreference);
+			: collection.withReadPreference( aggregation.readPreference );
 		AggregatePublisher<Document> publisher = session == null
-			? target.aggregate(aggregation.pipeline)
-			: target.aggregate(session, aggregation.pipeline);
+			? target.aggregate( aggregation.pipeline )
+			: target.aggregate( session, aggregation.pipeline );
 		if (aggregation.allowDiskUse != null)
-			publisher = publisher.allowDiskUse(aggregation.allowDiskUse);
-		aggregation.customizer.accept(publisher);
+			publisher = publisher.allowDiskUse( aggregation.allowDiskUse );
+		aggregation.customizer.accept( publisher );
 		return publisher;
 
 	}
 
 	private Flux<Document> aggregateDocuments(
-		MongoExecutionContext executionContext,
-		Class<?> entityClass,
-		String explicitCollectionName,
-		AggregationSpec aggregation
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, AggregationSpec aggregation
 	) {
 
-		return resolveCollection(executionContext, entityClass, explicitCollectionName)
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMapMany(
 				collection -> executeFluxWithSession(
-					session -> applyAggregation(collection, aggregation, session),
-					() -> applyAggregation(collection, aggregation, null)
+					session -> applyAggregation( collection, aggregation, session ),
+					() -> applyAggregation( collection, aggregation, null )
 				)
 			);
 
 	}
 
 	private <T> Flux<T> aggregate(
-		MongoExecutionContext executionContext,
-		Class<?> sourceClass,
-		String explicitCollectionName,
-		AggregationSpec aggregation,
-		Class<T> targetClass
+		MongoExecutionContext executionContext, Class<?> sourceClass, String explicitCollectionName, AggregationSpec aggregation, Class<T> targetClass
 	) {
 
-		return aggregateDocuments(executionContext, sourceClass, explicitCollectionName, aggregation)
-			.map(document -> executionContext.read(targetClass, document));
+		return aggregateDocuments( executionContext, sourceClass, explicitCollectionName, aggregation )
+			.map( document -> executionContext.read( targetClass, document ) );
 
 	}
 
@@ -590,23 +691,28 @@ public class ReactiveMongoDsl<K> {
 		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, T entity
 	) {
 
-		Document document = executionContext.write(entity);
-		Object id = executionContext.getId(entity);
-		return resolveCollection(executionContext, entityClass, explicitCollectionName).flatMap(collection -> {
+		Document document = executionContext.write( entity );
+		Object id = executionContext.getId( entity );
+		return resolveCollection( executionContext, entityClass, explicitCollectionName ).flatMap( collection -> {
+
 			if (id == null) {
 				return executeWithSession(
-					session -> collection.insertOne(session, document),
-					() -> collection.insertOne(document)
-				).doOnSuccess(ignored -> {
-					if (document.get("_id") != null)
-						executionContext.setId(entity, document.get("_id"));
-				}).thenReturn(entity);
+					session -> collection.insertOne( session, document ),
+					() -> collection.insertOne( document )
+				).doOnSuccess( ignored -> {
+					if (document.get( "_id" ) != null)
+						executionContext.setId( entity, document.get( "_id" ) );
+
+				} ).thenReturn( entity );
+
 			}
+
 			return executeWithSession(
-				session -> collection.replaceOne(session, new Document("_id", id), document, new ReplaceOptions().upsert(true)),
-				() -> collection.replaceOne(new Document("_id", id), document, new ReplaceOptions().upsert(true))
-			).thenReturn(entity);
-		});
+				session -> collection.replaceOne( session, new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) ),
+				() -> collection.replaceOne( new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) )
+			).thenReturn( entity );
+
+		} );
 
 	}
 
@@ -616,22 +722,25 @@ public class ReactiveMongoDsl<K> {
 
 		if (entities.isEmpty())
 			return Flux.empty();
-		List<Document> documents = entities.stream().map(executionContext::write).toList();
-		return resolveCollection(executionContext, entityClass, explicitCollectionName)
+		List<Document> documents = entities.stream().map( executionContext::write ).toList();
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
-					session -> collection.insertMany(session, documents),
-					() -> collection.insertMany(documents)
+					session -> collection.insertMany( session, documents ),
+					() -> collection.insertMany( documents )
 				)
 			)
-			.doOnSuccess(ignored -> {
+			.doOnSuccess( ignored -> {
+
 				for (int i = 0; i < entities.size(); i++) {
-					Object generatedId = documents.get(i).get("_id");
-					if (generatedId != null && executionContext.getId(entities.get(i)) == null)
-						executionContext.setId(entities.get(i), generatedId);
+					Object generatedId = documents.get( i ).get( "_id" );
+					if (generatedId != null && executionContext.getId( entities.get( i ) ) == null)
+						executionContext.setId( entities.get( i ), generatedId );
+
 				}
-			})
-			.thenMany(Flux.fromIterable(entities));
+
+			} )
+			.thenMany( Flux.fromIterable( entities ) );
 
 	}
 
@@ -641,11 +750,11 @@ public class ReactiveMongoDsl<K> {
 
 		if (documents.isEmpty())
 			return Mono.empty();
-		return resolveCollection(executionContext, entityClass, explicitCollectionName)
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
-					session -> collection.insertMany(session, documents),
-					() -> collection.insertMany(documents)
+					session -> collection.insertMany( session, documents ),
+					() -> collection.insertMany( documents )
 				)
 			)
 			.then();
@@ -653,37 +762,30 @@ public class ReactiveMongoDsl<K> {
 	}
 
 	private Mono<BulkWriteResult> bulkWrite(
-		MongoExecutionContext executionContext,
-		Class<?> entityClass,
-		String explicitCollectionName,
-		List<? extends WriteModel<Document>> writes
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<? extends WriteModel<Document>> writes
 	) {
 
 		if (writes.isEmpty())
 			return Mono.empty();
-		return resolveCollection(executionContext, entityClass, explicitCollectionName)
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
-					session -> collection.bulkWrite(session, writes, new BulkWriteOptions().ordered(false)),
-					() -> collection.bulkWrite(writes, new BulkWriteOptions().ordered(false))
+					session -> collection.bulkWrite( session, writes, new BulkWriteOptions().ordered( false ) ),
+					() -> collection.bulkWrite( writes, new BulkWriteOptions().ordered( false ) )
 				)
 			);
 
 	}
 
 	private Mono<DeleteResult> deleteByFilter(
-		MongoExecutionContext executionContext,
-		Class<?> entityClass,
-		String explicitCollectionName,
-		Bson filter,
-		boolean many
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, Bson filter, boolean many
 	) {
 
-		return resolveCollection(executionContext, entityClass, explicitCollectionName)
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
-					session -> many ? collection.deleteMany(session, filter) : collection.deleteOne(session, filter),
-					() -> many ? collection.deleteMany(filter) : collection.deleteOne(filter)
+					session -> many ? collection.deleteMany( session, filter ) : collection.deleteOne( session, filter ),
+					() -> many ? collection.deleteMany( filter ) : collection.deleteOne( filter )
 				)
 			);
 
@@ -693,20 +795,21 @@ public class ReactiveMongoDsl<K> {
 		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, FindSpec query
 	) {
 
-		return resolveCollection(executionContext, entityClass, explicitCollectionName).flatMap(collection -> {
+		return resolveCollection( executionContext, entityClass, explicitCollectionName ).flatMap( collection -> {
 			MongoCollection<Document> target = query.readPreference == null
 				? collection
-				: collection.withReadPreference(query.readPreference);
+				: collection.withReadPreference( query.readPreference );
 			CountOptions options = new CountOptions();
 			if (query.skip > 0)
-				options.skip(Math.toIntExact(query.skip));
+				options.skip( Math.toIntExact( query.skip ) );
 			if (query.limit > 0)
-				options.limit(query.limit);
+				options.limit( query.limit );
 			return executeWithSession(
-				session -> target.countDocuments(session, query.filter, options),
-				() -> target.countDocuments(query.filter, options)
+				session -> target.countDocuments( session, query.filter, options ),
+				() -> target.countDocuments( query.filter, options )
 			);
-		});
+
+		} );
 
 	}
 
@@ -714,54 +817,53 @@ public class ReactiveMongoDsl<K> {
 		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, FindSpec query
 	) {
 
-		query.limit(1);
-		return resolveCollection(executionContext, entityClass, explicitCollectionName)
+		query.limit( 1 );
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
-					session -> applyQuery(collection, query, session).first(),
-					() -> applyQuery(collection, query, null).first()
+					session -> applyQuery( collection, query, session ).first(),
+					() -> applyQuery( collection, query, null ).first()
 				).hasElement()
 			);
 
 	}
 
 	private Mono<UpdateResult> update(
-		MongoExecutionContext executionContext,
-		Class<?> entityClass,
-		String explicitCollectionName,
-		Bson filter,
-		UpdateSpec updateSpec,
-		boolean multi,
-		boolean upsert
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, Bson filter, UpdateSpec updateSpec, boolean multi, boolean upsert
 	) {
 
-		return resolveCollection(executionContext, entityClass, explicitCollectionName)
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
 					session -> {
-					UpdateOptions options = new UpdateOptions().upsert(upsert);
-					if (updateSpec.isPipeline()) {
+						UpdateOptions options = new UpdateOptions().upsert( upsert );
+
+						if (updateSpec.isPipeline()) {
+							return multi
+								? collection.updateMany( session, filter, updateSpec.pipeline, options )
+								: collection.updateOne( session, filter, updateSpec.pipeline, options );
+
+						}
+
 						return multi
-							? collection.updateMany(session, filter, updateSpec.pipeline, options)
-							: collection.updateOne(session, filter, updateSpec.pipeline, options);
-					}
-					return multi
-						? collection.updateMany(session, filter, updateSpec.update, options)
-						: collection.updateOne(session, filter, updateSpec.update, options);
-				},
-				() -> {
-					UpdateOptions options = new UpdateOptions().upsert(upsert);
-					if (updateSpec.isPipeline()) {
+							? collection.updateMany( session, filter, updateSpec.update, options )
+							: collection.updateOne( session, filter, updateSpec.update, options );
+
+					},
+					() -> {
+						UpdateOptions options = new UpdateOptions().upsert( upsert );
+
+						if (updateSpec.isPipeline()) { return multi
+							? collection.updateMany( filter, updateSpec.pipeline, options )
+							: collection.updateOne( filter, updateSpec.pipeline, options ); }
+
 						return multi
-							? collection.updateMany(filter, updateSpec.pipeline, options)
-							: collection.updateOne(filter, updateSpec.pipeline, options);
+							? collection.updateMany( filter, updateSpec.update, options )
+							: collection.updateOne( filter, updateSpec.update, options );
+
 					}
-					return multi
-						? collection.updateMany(filter, updateSpec.update, options)
-						: collection.updateOne(filter, updateSpec.update, options);
-				}
-			)
-		);
+				)
+			);
 
 	}
 
@@ -993,16 +1095,21 @@ public class ReactiveMongoDsl<K> {
 
 					for (String key : keys) {
 						Object value = readDocumentPath( document, key );
+
 						if (value == null) {
 							missingKey = true;
 							break;
+
 						}
+
 						keyDocument.append( key, value );
+
 					}
 
 					if (missingKey) {
 						writes.add( new InsertOneModel<>( document ) );
 						continue;
+
 					}
 
 					document.remove( "_id" );
@@ -1013,16 +1120,19 @@ public class ReactiveMongoDsl<K> {
 					if (! document.isEmpty())
 						updateDocument.append( "$set", document );
 
-					writes.add(
-						new UpdateOneModel<>(
-							keyDocument,
-							updateDocument,
-							new UpdateOptions().upsert( true )
-						)
-					);
+					writes
+						.add(
+							new UpdateOneModel<>(
+								keyDocument,
+								updateDocument,
+								new UpdateOptions().upsert( true )
+							)
+						);
+
 				}
 
 				return bulkWrite( mongoExecutionContext, entityClass, collectionName, writes );
+
 			} );
 
 		}
@@ -1261,6 +1371,24 @@ public class ReactiveMongoDsl<K> {
 		}
 
 		/**
+		 * Starts criteria construction with a MongoDB driver-native filter. Use this
+		 * escape hatch when the driver supports a filter that does not need a dedicated
+		 * {@link FieldsPair.Condition} convenience mapping.
+		 *
+		 * @param filter
+		 *            the driver-native filter
+		 *
+		 * @return the field builder for composing additional criteria
+		 */
+		public FieldBuilder<E> driverFilter(
+			Bson filter
+		) {
+
+			return createFirstOperator( LogicalOperator.AND ).driverFilter( filter );
+
+		}
+
+		/**
 		 * Starts criteria construction with the given root logical operator.
 		 *
 		 * @param logicalOperator
@@ -1321,7 +1449,7 @@ public class ReactiveMongoDsl<K> {
 
 			private final List<String> keyFields = new ArrayList<>();
 
-			private final Document accumulators = new Document(); // as -> {$op: ...}
+			private final List<BsonField> accumulators = new ArrayList<>();
 
 			private boolean hasAccumulator = false; // 아무것도 지정 안 하면 count 기본
 
@@ -1375,47 +1503,6 @@ public class ReactiveMongoDsl<K> {
 				};
 
 			}
-			// @SuppressWarnings("unchecked")
-			// public Grouping() {
-			//
-			// Type genericSuperclass = getClass().getGenericSuperclass();
-			//
-			// if (! (genericSuperclass instanceof ParameterizedType)) {
-			// // 상세한 오류 메시지 생성
-			//
-			// throw new IllegalStateException(
-			// String
-			// .format(
-			// "Class '%s' inherits from Grouping without specifying generic parameters. " + "To check type
-			// information at runtime, you must inherit using the format 'extends Grouping<ConcreteKeyType,
-			// ConcreteValueType>'.",
-			// getClass().getName()
-			// )
-			// );
-			//
-			// }
-			//
-			// ParameterizedType parameterizedType = (ParameterizedType) genericSuperclass;
-			// Type[] typeArguments = parameterizedType.getActualTypeArguments();
-			//
-			// System.out.println( Arrays.asList( typeArguments ) );
-			//
-			// this.keyType = (Class<K>) typeArguments[0];
-			// this.valueType = (Class<V>) typeArguments[1];
-			//
-			// this.keyConverter = (Document kk) -> {
-			// Object key = kk.get( "_id" );
-			//
-			// return (K) key;
-			//
-			// };
-			// this.valueConverter = (Document vv) -> {
-			//
-			// return mongoExecutionContext.read( this.valueType, vv );
-			//
-			// };
-			//
-			// }
 
 			/**
 			 * Sets a custom converter for the aggregation group key document.
@@ -1509,9 +1596,7 @@ public class ReactiveMongoDsl<K> {
 				String as
 			) {
 
-				accumulators.put( as, new Document( "$sum", 1 ) );
-				hasAccumulator = true;
-				return this;
+				return accumulator( Accumulators.sum( as, 1 ) );
 
 			}
 
@@ -1529,9 +1614,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$sum", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
-				hasAccumulator = true;
-				return this;
+				return accumulator( Accumulators.sum( as, "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 
 			}
 
@@ -1549,9 +1632,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$avg", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
-				hasAccumulator = true;
-				return this;
+				return accumulator( Accumulators.avg( as, "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 
 			}
 
@@ -1569,9 +1650,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$min", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
-				hasAccumulator = true;
-				return this;
+				return accumulator( Accumulators.min( as, "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 
 			}
 
@@ -1589,9 +1668,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$max", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
-				hasAccumulator = true;
-				return this;
+				return accumulator( Accumulators.max( as, "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 
 			}
 
@@ -1609,9 +1686,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$addToSet", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
-				hasAccumulator = true;
-				return this;
+				return accumulator( Accumulators.addToSet( as, "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 
 			}
 
@@ -1629,8 +1704,25 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$push", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
-				hasAccumulator = true;
+				return accumulator( Accumulators.push( as, "$" + MongoFieldNameSupport.toMongoField( field ) ) );
+
+			}
+
+			/**
+			 * Adds a MongoDB driver-native accumulator. This is the extension point for
+			 * accumulator operators that do not need a dedicated DSL convenience method.
+			 *
+			 * @param accumulator
+			 *            the driver-native accumulator field
+			 *
+			 * @return this builder
+			 */
+			public Grouping<KK, V> accumulator(
+				BsonField accumulator
+			) {
+
+				this.accumulators.add( Objects.requireNonNull( accumulator, "accumulator" ) );
+				this.hasAccumulator = true;
 				return this;
 
 			}
@@ -1705,6 +1797,7 @@ public class ReactiveMongoDsl<K> {
 									: rightClass.getSimpleName();
 								appendLookupStages( ops, rightColl, rightAs, rightTuple.getT2(), lookup.spec );
 								return ops;
+
 							} );
 
 						return opsMono.flatMap( opList -> {
@@ -1720,10 +1813,7 @@ public class ReactiveMongoDsl<K> {
 
 							}
 
-							Document groupBody = new Document( "_id", groupId );
-							for (String as : accumulators.keySet())
-								groupBody.append( as, accumulators.get( as ) );
-							opList.add( new Document( "$group", groupBody ) );
+							opList.add( Aggregates.group( groupId, this.accumulators ) );
 
 							AggregationSpec aggregation = accessor.applyAggOptions( opList );
 
@@ -1821,21 +1911,27 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			public QueryBuilderAccesser<Q, A> readPreference( ReadPreference rp ) {
+			public QueryBuilderAccesser<Q, A> readPreference(
+				ReadPreference rp
+			) {
 
 				this.readPreference = rp;
 				return this;
 
 			}
 
-			public QueryBuilderAccesser<Q, A> isAllowDiskUse( Boolean allow ) {
+			public QueryBuilderAccesser<Q, A> isAllowDiskUse(
+				Boolean allow
+			) {
 
 				this.isAllowDiskUse = allow;
 				return this;
 
 			}
 
-			protected AggregationSpec applyAggOptions( List<? extends Bson> pipeline ) {
+			protected AggregationSpec applyAggOptions(
+				List<? extends Bson> pipeline
+			) {
 
 				return new AggregationSpec( pipeline )
 					.readPreference( readPreference )
@@ -1844,7 +1940,9 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			protected FindSpec applyQueryOptions( FindSpec query ) {
+			protected FindSpec applyQueryOptions(
+				FindSpec query
+			) {
 
 				return query
 					.readPreference( readPreference )
@@ -2049,6 +2147,27 @@ public class ReactiveMongoDsl<K> {
 						}
 
 					}
+
+				}
+
+				return this;
+
+			}
+
+			/**
+			 * Adds a MongoDB driver-native filter to the current logical group.
+			 *
+			 * @param filter
+			 *            the driver-native filter
+			 *
+			 * @return this builder
+			 */
+			public FieldBuilder<S> driverFilter(
+				Bson filter
+			) {
+
+				if (filter != null) {
+					criteriaStack.peek().criteriaList.add( filter );
 
 				}
 
@@ -2469,7 +2588,7 @@ public class ReactiveMongoDsl<K> {
 
 			private Double scoreLte;
 
-			private final List<SearchSortSpec<?>> searchSortSpecs = new ArrayList<>();
+			private final List<Bson> searchSorts = new ArrayList<>();
 
 			private Integer pageNumber;
 
@@ -2477,7 +2596,9 @@ public class ReactiveMongoDsl<K> {
 
 			private String[] excludes;
 
-			private SearchHighlightSpec highlightSpec;
+			private SearchHighlight highlight;
+
+			private final List<Function<SearchOptions, SearchOptions>> driverOptionCustomizers = new ArrayList<>();
 
 			SearchBuilder(
 							String index
@@ -2642,55 +2763,65 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Appends one or more Atlas Search sort specifications.
+			 * Starts ordered Atlas Search sorting.
+			 * <p>Use {@link SortSpec#asc(String, String...)}, {@link SortSpec#desc(String, String...)},
+			 * or {@link SortSpec#driver(Bson)} and finish with {@link SortSpec#end()} to continue
+			 * with this search builder. Search-score ordering can be placed before or after the
+			 * sort block by calling {@link #scoreDesc()} / {@link #scoreAsc()} before or after it.</p>
 			 *
-			 * @param specs
-			 *            the sort specifications
-			 *
-			 * @return this builder
+			 * @return the ordered sort DSL
 			 */
-			public SearchBuilder<S> sorts(
-				SearchSortSpec<?>... specs
-			) {
+			public SortSpec<SearchBuilder<S>> sorts() {
 
-				if (specs != null) {
-					this.searchSortSpecs.addAll( Arrays.asList( specs ) );
+				return new SortSpec<SearchBuilder<S>>( this ) {
 
-				}
+					@Override
+					protected void apply() {
 
-				return this;
+						if (! isEmpty()) {
+							SearchBuilder.this.searchSorts.add( this );
+
+						}
+
+					}
+
+				};
 
 			}
 
 			/**
-			 * Appends one or more Atlas Search sort specifications.
+			 * Configures ordered Atlas Search sorting in one callback and returns this builder.
 			 *
-			 * @param specs
-			 *            the sort specifications
+			 * @param spec
+			 *            the ordered sort configuration
 			 *
 			 * @return this builder
 			 */
 			public SearchBuilder<S> sorts(
-				Collection<SearchSortSpec<?>> specs
+				Consumer<SortSpec<SearchBuilder<S>>> spec
 			) {
 
-				if (specs != null) {
-					this.searchSortSpecs.addAll( specs );
+				SortSpec<SearchBuilder<S>> sort = sorts();
+				Objects.requireNonNull( spec, "spec" ).accept( sort );
+				return sort.end();
 
-				}
+			}
 
+			/** Appends a descending Atlas Search score sort at the current sort priority. */
+			public SearchBuilder<S> scoreDesc() {
+
+				this.searchSorts.add( new Document( "score", new Document( "$meta", "searchScore" ) ) );
 				return this;
 
 			}
 
-			/**
-			 * Inserts a score-descending sort as the first Atlas Search sort rule.
-			 *
-			 * @return this builder
-			 */
-			public SearchBuilder<S> firstSortScore() {
+			/** Appends an ascending Atlas Search score sort at the current sort priority. */
+			public SearchBuilder<S> scoreAsc() {
 
-				this.searchSortSpecs.add( 0, SearchSortSpec.scoreDesc() );
+				this.searchSorts
+					.add(
+						new Document( "score", new Document( "$meta", "searchScore" ).append( "order", 1 ) )
+					);
 				return this;
 
 			}
@@ -2720,7 +2851,7 @@ public class ReactiveMongoDsl<K> {
 				String alias
 			) {
 
-				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "searchScore" ) ) );
+				this.addFieldsDocs.add( MongoBsonSupport.toDocument( Projections.metaSearchScore( alias ) ) );
 				return this;
 
 			}
@@ -2840,7 +2971,7 @@ public class ReactiveMongoDsl<K> {
 			) {
 
 				this.scoreDetails = true;
-				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "searchScoreDetails" ) ) );
+				this.addFieldsDocs.add( MongoBsonSupport.toDocument( Projections.meta( alias, "searchScoreDetails" ) ) );
 				return this;
 
 			}
@@ -2870,7 +3001,7 @@ public class ReactiveMongoDsl<K> {
 				String alias
 			) {
 
-				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "searchSequenceToken" ) ) );
+				this.addFieldsDocs.add( MongoBsonSupport.toDocument( Projections.meta( alias, "searchSequenceToken" ) ) );
 				return this;
 
 			}
@@ -2893,20 +3024,54 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
+			 * Sets a MongoDB driver-native root search operator. This is the advanced escape
+			 * hatch for operators the convenience DSL does not expose yet.
+			 *
+			 * @param operator
+			 *            the driver-native search operator
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> operator(
+				SearchOperator operator
+			) {
+
+				this.rootOperator = AtlasSearchOperator.of( "driver", Objects.requireNonNull( operator, "operator" ) );
+				return this;
+
+			}
+
+			/**
+			 * Applies an advanced MongoDB driver-native search option customizer after the
+			 * convenience DSL options have been assembled.
+			 *
+			 * @param customizer
+			 *            the driver option customizer
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> driverOptions(
+				Function<SearchOptions, SearchOptions> customizer
+			) {
+
+				this.driverOptionCustomizers.add( Objects.requireNonNull( customizer, "customizer" ) );
+				return this;
+
+			}
+
+			/**
 			 * Builds the root operator as a {@code text} search operator.
 			 *
 			 * @param spec
 			 *            the operator configuration callback
-			 * @param <K2>
-			 *            the logical path type
 			 *
 			 * @return this builder
 			 */
-			public <K2> SearchBuilder<S> text(
-				Consumer<TextClause<K2>> spec
+			public SearchBuilder<S> text(
+				Consumer<TextClause> spec
 			) {
 
-				TextClause<K2> op = SearchOperators.<K2>text();
+				TextClause op = SearchOperators.text();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -2918,16 +3083,14 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @param spec
 			 *            the operator configuration callback
-			 * @param <K2>
-			 *            the logical path type
 			 *
 			 * @return this builder
 			 */
-			public <K2> SearchBuilder<S> phrase(
-				Consumer<PhraseClause<K2>> spec
+			public SearchBuilder<S> phrase(
+				Consumer<PhraseClause> spec
 			) {
 
-				PhraseClause<K2> op = SearchOperators.<K2>phrase();
+				PhraseClause op = SearchOperators.phrase();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -2939,16 +3102,14 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @param spec
 			 *            the operator configuration callback
-			 * @param <K2>
-			 *            the logical path type
 			 *
 			 * @return this builder
 			 */
-			public <K2> SearchBuilder<S> autocomplete(
-				Consumer<AutocompleteClause<K2>> spec
+			public SearchBuilder<S> autocomplete(
+				Consumer<AutocompleteClause> spec
 			) {
 
-				AutocompleteClause<K2> op = SearchOperators.<K2>autocomplete();
+				AutocompleteClause op = SearchOperators.autocomplete();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -2960,16 +3121,14 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @param spec
 			 *            the operator configuration callback
-			 * @param <K2>
-			 *            the logical path type
 			 *
 			 * @return this builder
 			 */
-			public <K2> SearchBuilder<S> equals(
-				Consumer<EqualsClause<K2>> spec
+			public SearchBuilder<S> equals(
+				Consumer<EqualsClause> spec
 			) {
 
-				EqualsClause<K2> op = SearchOperators.<K2>equals();
+				EqualsClause op = SearchOperators.equals();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -2981,16 +3140,14 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @param spec
 			 *            the operator configuration callback
-			 * @param <K2>
-			 *            the logical path type
 			 *
 			 * @return this builder
 			 */
-			public <K2> SearchBuilder<S> exists(
-				Consumer<ExistsClause<K2>> spec
+			public SearchBuilder<S> exists(
+				Consumer<ExistsClause> spec
 			) {
 
-				ExistsClause<K2> op = SearchOperators.<K2>exists();
+				ExistsClause op = SearchOperators.exists();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -3002,16 +3159,14 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @param spec
 			 *            the operator configuration callback
-			 * @param <K2>
-			 *            the logical path type
 			 *
 			 * @return this builder
 			 */
-			public <K2> SearchBuilder<S> in(
-				Consumer<InClause<K2>> spec
+			public SearchBuilder<S> in(
+				Consumer<InClause> spec
 			) {
 
-				InClause<K2> op = SearchOperators.<K2>in();
+				InClause op = SearchOperators.in();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -3023,16 +3178,14 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @param spec
 			 *            the operator configuration callback
-			 * @param <K2>
-			 *            the logical path type
 			 *
 			 * @return this builder
 			 */
-			public <K2> SearchBuilder<S> range(
-				Consumer<RangeClause<K2>> spec
+			public SearchBuilder<S> range(
+				Consumer<RangeClause> spec
 			) {
 
-				RangeClause<K2> op = SearchOperators.<K2>range();
+				RangeClause op = SearchOperators.range();
 				spec.accept( op );
 				this.rootOperator = op;
 				return this;
@@ -3114,7 +3267,23 @@ public class ReactiveMongoDsl<K> {
 				SearchHighlightSpec highlightSpec
 			) {
 
-				this.highlightSpec = Objects.requireNonNull( highlightSpec, "highlightSpec" );
+				return highlight( Objects.requireNonNull( highlightSpec, "highlightSpec" ).toSearchHighlight() );
+
+			}
+
+			/**
+			 * Sets MongoDB driver-native Atlas Search highlight options directly.
+			 *
+			 * @param highlight
+			 *            the driver-native highlight specification
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> highlight(
+				SearchHighlight highlight
+			) {
+
+				this.highlight = Objects.requireNonNull( highlight, "highlight" );
 				return this;
 
 			}
@@ -3133,8 +3302,7 @@ public class ReactiveMongoDsl<K> {
 
 				SearchHighlightSpec.Builder builder = SearchHighlightSpec.builder();
 				spec.accept( builder );
-				this.highlightSpec = builder.build();
-				return this;
+				return highlight( builder.build() );
 
 			}
 
@@ -3161,7 +3329,7 @@ public class ReactiveMongoDsl<K> {
 				String alias
 			) {
 
-				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "searchHighlights" ) ) );
+				this.addFieldsDocs.add( MongoBsonSupport.toDocument( Projections.metaSearchHighlights( alias ) ) );
 				return this;
 
 			}
@@ -3223,94 +3391,77 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Builds the body for a {@code $search} stage.
-			 *
-			 * @param includeCount
-			 *            whether the stage should include an Atlas Search {@code count}
-			 *            clause
-			 *
-			 * @return the rendered {@code $search} body
+			 * Builds MongoDB driver's stage-level search options. Typed driver options are used
+			 * when available; generic driver options are reserved for stage options that do not
+			 * currently have a dedicated builder method.
 			 */
-			private Document buildSearchStageBody(
-				boolean includeCount
+			private SearchOptions buildSearchOptions(
+				boolean includeCount, boolean includeResultOptions
 			) {
 
-				validateRootOperator();
-
-				Document body = new Document();
+				SearchOptions options = SearchOptions.searchOptions();
 
 				if (this.index != null && ! this.index.isBlank()) {
-					body.append( "index", this.index );
+					options = options.index( this.index );
 
 				}
 
-				Document root = this.rootOperator.toDocument();
-
-				for (Map.Entry<String, Object> entry : root.entrySet()) {
-					body.append( entry.getKey(), entry.getValue() );
-
-				}
-
-				if (this.highlightSpec != null) {
-					body.append( "highlight", this.highlightSpec.toDocument() );
+				if (this.highlight != null && includeResultOptions) {
+					options = options.highlight( this.highlight );
 
 				}
 
 				if (includeCount && this.searchCountType != null) {
-					body.append( "count", new Document( "type", this.searchCountType.getValue() ) );
+					options = options.count( this.searchCountType.toSearchCount() );
 
 				}
 
-				if (this.searchAfterToken != null && ! this.searchAfterToken.isBlank()) {
-					body.append( "searchAfter", this.searchAfterToken );
+				if (includeResultOptions && this.searchAfterToken != null && ! this.searchAfterToken.isBlank()) {
+					options = options.option( "searchAfter", this.searchAfterToken );
 
 				}
 
-				if (this.searchBeforeToken != null && ! this.searchBeforeToken.isBlank()) {
-					body.append( "searchBefore", this.searchBeforeToken );
+				if (includeResultOptions && this.searchBeforeToken != null && ! this.searchBeforeToken.isBlank()) {
+					options = options.option( "searchBefore", this.searchBeforeToken );
 
 				}
 
-				if (this.scoreDetails) {
-					body.append( "scoreDetails", true );
+				if (includeResultOptions && this.scoreDetails) {
+					options = options.option( "scoreDetails", true );
 
 				}
 
-				Document sortDoc = new Document();
-
-				for (SearchSortSpec<?> spec : this.searchSortSpecs) {
-					if (spec == null)
-						continue;
-
-					Document d = spec.toDocument();
-
-					for (Map.Entry<String, Object> entry : d.entrySet()) {
-						sortDoc.append( entry.getKey(), entry.getValue() );
-
-					}
+				if (includeResultOptions && ! this.searchSorts.isEmpty()) {
+					options = options
+						.option(
+							"sort",
+							MongoBsonSupport.toDocument( Sorts.orderBy( this.searchSorts ) )
+						);
 
 				}
 
-				if (! sortDoc.isEmpty()) {
-					body.append( "sort", sortDoc );
+				for (Function<SearchOptions, SearchOptions> customizer : this.driverOptionCustomizers) {
+					options = Objects.requireNonNull( customizer.apply( options ), "driver search option customizer result" );
 
 				}
 
-				return body;
+				return options;
 
 			}
 
-			/**
-			 * Builds the body for a {@code $searchMeta} stage.
-			 * <p>This intentionally omits options that are specific to {@code $search}
-			 * result streaming such as sort, scoreDetails, searchAfter, and
-			 * searchBefore.</p>
-			 *
-			 * @param countType
-			 *            the Atlas Search count mode
-			 *
-			 * @return the rendered {@code $searchMeta} body
-			 */
+			private Bson buildSearchStage(
+				boolean includeCount
+			) {
+
+				validateRootOperator();
+				return Aggregates
+					.search(
+						this.rootOperator.toSearchOperator(),
+						buildSearchOptions( includeCount, true )
+					);
+
+			}
+
 			private boolean hasScoreMatch() {
 
 				return this.scoreGte != null || this.scoreLte != null;
@@ -3338,29 +3489,13 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			private Document buildSearchMetaStageBody(
+			private Bson buildSearchMetaStage(
 				SearchCountType countType
 			) {
 
 				validateRootOperator();
-
-				Document body = new Document();
-
-				if (this.index != null && ! this.index.isBlank()) {
-					body.append( "index", this.index );
-
-				}
-
-				Document root = this.rootOperator.toDocument();
-
-				for (Map.Entry<String, Object> entry : root.entrySet()) {
-					body.append( entry.getKey(), entry.getValue() );
-
-				}
-
-				body.append( "count", new Document( "type", countType.getValue() ) );
-
-				return body;
+				SearchOptions options = buildSearchOptions( false, false ).count( countType.toSearchCount() );
+				return Aggregates.searchMeta( this.rootOperator.toSearchOperator(), options );
 
 			}
 
@@ -3389,7 +3524,7 @@ public class ReactiveMongoDsl<K> {
 
 				List<Bson> ops = new ArrayList<>();
 
-				ops.add( new Document( "$search", buildSearchStageBody( includeCount ) ) );
+				ops.add( buildSearchStage( includeCount ) );
 
 				postCriteria.ifPresent( c -> ops.add( Aggregates.match( c ) ) );
 
@@ -3410,11 +3545,21 @@ public class ReactiveMongoDsl<K> {
 					}
 
 					if (hasScoreMatch() && ! addFields.containsKey( "score" )) {
-						addFields.append( "score", new Document( "$meta", "searchScore" ) );
+						addFields.putAll( MongoBsonSupport.toDocument( Projections.metaSearchScore( "score" ) ) );
 
 					}
 
-					ops.add( new Document( "$addFields", addFields ) );
+					ops
+						.add(
+							Aggregates
+								.addFields(
+									addFields
+										.entrySet()
+										.stream()
+										.map( entry -> new com.mongodb.client.model.Field<>( entry.getKey(), entry.getValue() ) )
+										.toArray( com.mongodb.client.model.Field<?>[]::new )
+								)
+						);
 
 				}
 
@@ -3453,9 +3598,13 @@ public class ReactiveMongoDsl<K> {
 				Class<?> entityClass, List<Bson> ops
 			) {
 
-				return ReactiveMongoDsl.this.aggregateDocuments(
-					mongoExecutionContext, entityClass, collectionName, applyAggOptions( ops )
-				);
+				return ReactiveMongoDsl.this
+					.aggregateDocuments(
+						mongoExecutionContext,
+						entityClass,
+						collectionName,
+						applyAggOptions( ops )
+					);
 
 			}
 
@@ -3477,7 +3626,7 @@ public class ReactiveMongoDsl<K> {
 
 				private Integer minimumShouldMatch;
 
-				private SearchScoreSpec score;
+				private SearchScore score;
 
 				/**
 				 * Sets the minimum number of {@code should} clauses that must match.
@@ -3508,6 +3657,15 @@ public class ReactiveMongoDsl<K> {
 				 */
 				public SearchCompoundBuilder<T> score(
 					SearchScoreSpec score
+				) {
+
+					this.score = score == null ? null : score.toSearchScore();
+					return this;
+
+				}
+
+				public SearchCompoundBuilder<T> score(
+					SearchScore score
 				) {
 
 					this.score = score;
@@ -3584,176 +3742,160 @@ public class ReactiveMongoDsl<K> {
 				}
 
 				/**
-				 * Adds a typed {@code text} operator to {@code must}.
+				 * Adds a convenience {@code text} operator to {@code must}.
 				 *
 				 * @param path
 				 *            the search path
 				 * @param spec
 				 *            the operator configuration callback
-				 * @param <K2>
-				 *            the logical path type
 				 *
 				 * @return this builder
 				 */
-				public <K2> SearchCompoundBuilder<T> mustText(
-					K2 path, Consumer<TextClause<K2>> spec
+				public SearchCompoundBuilder<T> mustText(
+					Object path, Consumer<TextClause> spec
 				) {
 
-					TextClause<K2> op = SearchOperators.<K2>text().path( path );
+					TextClause op = SearchOperators.text().path( path );
 					spec.accept( op );
 					return must( op );
 
 				}
 
 				/**
-				 * Adds a typed {@code text} operator to {@code should}.
+				 * Adds a convenience {@code text} operator to {@code should}.
 				 *
 				 * @param path
 				 *            the search path
 				 * @param spec
 				 *            the operator configuration callback
-				 * @param <K2>
-				 *            the logical path type
 				 *
 				 * @return this builder
 				 */
-				public <K2> SearchCompoundBuilder<T> shouldText(
-					K2 path, Consumer<TextClause<K2>> spec
+				public SearchCompoundBuilder<T> shouldText(
+					Object path, Consumer<TextClause> spec
 				) {
 
-					TextClause<K2> op = SearchOperators.<K2>text().path( path );
+					TextClause op = SearchOperators.text().path( path );
 					spec.accept( op );
 					return should( op );
 
 				}
 
 				/**
-				 * Adds a typed {@code text} operator to {@code filter}.
+				 * Adds a convenience {@code text} operator to {@code filter}.
 				 *
 				 * @param path
 				 *            the search path
 				 * @param spec
 				 *            the operator configuration callback
-				 * @param <K2>
-				 *            the logical path type
 				 *
 				 * @return this builder
 				 */
-				public <K2> SearchCompoundBuilder<T> filterText(
-					K2 path, Consumer<TextClause<K2>> spec
+				public SearchCompoundBuilder<T> filterText(
+					Object path, Consumer<TextClause> spec
 				) {
 
-					TextClause<K2> op = SearchOperators.<K2>text().path( path );
+					TextClause op = SearchOperators.text().path( path );
 					spec.accept( op );
 					return filter( op );
 
 				}
 
 				/**
-				 * Adds a typed {@code phrase} operator to {@code must}.
+				 * Adds a convenience {@code phrase} operator to {@code must}.
 				 *
 				 * @param path
 				 *            the search path
 				 * @param spec
 				 *            the operator configuration callback
-				 * @param <K2>
-				 *            the logical path type
 				 *
 				 * @return this builder
 				 */
-				public <K2> SearchCompoundBuilder<T> mustPhrase(
-					K2 path, Consumer<PhraseClause<K2>> spec
+				public SearchCompoundBuilder<T> mustPhrase(
+					Object path, Consumer<PhraseClause> spec
 				) {
 
-					PhraseClause<K2> op = SearchOperators.<K2>phrase().path( path );
+					PhraseClause op = SearchOperators.phrase().path( path );
 					spec.accept( op );
 					return must( op );
 
 				}
 
 				/**
-				 * Adds a typed {@code autocomplete} operator to {@code should}.
+				 * Adds a convenience {@code autocomplete} operator to {@code should}.
 				 *
 				 * @param path
 				 *            the search path
 				 * @param spec
 				 *            the operator configuration callback
-				 * @param <K2>
-				 *            the logical path type
 				 *
 				 * @return this builder
 				 */
-				public <K2> SearchCompoundBuilder<T> shouldAutocomplete(
-					K2 path, Consumer<AutocompleteClause<K2>> spec
+				public SearchCompoundBuilder<T> shouldAutocomplete(
+					Object path, Consumer<AutocompleteClause> spec
 				) {
 
-					AutocompleteClause<K2> op = SearchOperators.<K2>autocomplete().path( path );
+					AutocompleteClause op = SearchOperators.autocomplete().path( path );
 					spec.accept( op );
 					return should( op );
 
 				}
 
 				/**
-				 * Adds a typed {@code equals} operator to {@code filter}.
+				 * Adds a convenience {@code equals} operator to {@code filter}.
 				 *
 				 * @param path
 				 *            the search path
 				 * @param spec
 				 *            the operator configuration callback
-				 * @param <K2>
-				 *            the logical path type
 				 *
 				 * @return this builder
 				 */
-				public <K2> SearchCompoundBuilder<T> filterEquals(
-					K2 path, Consumer<EqualsClause<K2>> spec
+				public SearchCompoundBuilder<T> filterEquals(
+					Object path, Consumer<EqualsClause> spec
 				) {
 
-					EqualsClause<K2> op = SearchOperators.<K2>equals().path( path );
+					EqualsClause op = SearchOperators.equals().path( path );
 					spec.accept( op );
 					return filter( op );
 
 				}
 
 				/**
-				 * Adds a typed {@code in} operator to {@code filter}.
+				 * Adds a convenience {@code in} operator to {@code filter}.
 				 *
 				 * @param path
 				 *            the search path
 				 * @param spec
 				 *            the operator configuration callback
-				 * @param <K2>
-				 *            the logical path type
 				 *
 				 * @return this builder
 				 */
-				public <K2> SearchCompoundBuilder<T> filterIn(
-					K2 path, Consumer<InClause<K2>> spec
+				public SearchCompoundBuilder<T> filterIn(
+					Object path, Consumer<InClause> spec
 				) {
 
-					InClause<K2> op = SearchOperators.<K2>in().path( path );
+					InClause op = SearchOperators.in().path( path );
 					spec.accept( op );
 					return filter( op );
 
 				}
 
 				/**
-				 * Adds a typed {@code range} operator to {@code filter}.
+				 * Adds a convenience {@code range} operator to {@code filter}.
 				 *
 				 * @param path
 				 *            the search path
 				 * @param spec
 				 *            the operator configuration callback
-				 * @param <K2>
-				 *            the logical path type
 				 *
 				 * @return this builder
 				 */
-				public <K2> SearchCompoundBuilder<T> filterRange(
-					K2 path, Consumer<RangeClause<K2>> spec
+				public SearchCompoundBuilder<T> filterRange(
+					Object path, Consumer<RangeClause> spec
 				) {
 
-					RangeClause<K2> op = SearchOperators.<K2>range().path( path );
+					RangeClause op = SearchOperators.range().path( path );
 					spec.accept( op );
 					return filter( op );
 
@@ -3764,16 +3906,14 @@ public class ReactiveMongoDsl<K> {
 				 *
 				 * @param path
 				 *            the search path
-				 * @param <K2>
-				 *            the logical path type
 				 *
 				 * @return this builder
 				 */
-				public <K2> SearchCompoundBuilder<T> mustNotExists(
-					K2 path
+				public SearchCompoundBuilder<T> mustNotExists(
+					Object path
 				) {
 
-					return mustNot( SearchOperators.<K2>exists().path( path ) );
+					return mustNot( SearchOperators.exists().path( path ) );
 
 				}
 
@@ -3784,75 +3924,64 @@ public class ReactiveMongoDsl<K> {
 				 */
 				AtlasSearchOperator build() {
 
-					Document body = new Document();
+					CompoundSearchOperator compound = null;
 
-					appendOperators( body, "must", this.must );
-					appendOperators( body, "mustNot", this.mustNot );
-					appendOperators( body, "should", this.should );
-					appendOperators( body, "filter", this.filter );
-
-					if (this.minimumShouldMatch != null) {
-						body.append( "minimumShouldMatch", this.minimumShouldMatch );
+					if (! this.must.isEmpty()) {
+						compound = SearchOperator.compound().must( toSearchOperators( this.must ) );
 
 					}
 
-					if (this.score != null) {
-						body.append( "score", this.score.toDocument() );
+					if (! this.mustNot.isEmpty()) {
+						compound = compound == null
+							? SearchOperator.compound().mustNot( toSearchOperators( this.mustNot ) )
+							: compound.mustNot( toSearchOperators( this.mustNot ) );
 
 					}
 
-					if (body.isEmpty()) {
+					if (! this.filter.isEmpty()) {
+						compound = compound == null
+							? SearchOperator.compound().filter( toSearchOperators( this.filter ) )
+							: compound.filter( toSearchOperators( this.filter ) );
+
+					}
+
+					if (! this.should.isEmpty()) {
+						ShouldCompoundSearchOperator shouldCompound = compound == null
+							? SearchOperator.compound().should( toSearchOperators( this.should ) )
+							: compound.should( toSearchOperators( this.should ) );
+
+						compound = this.minimumShouldMatch == null
+							? shouldCompound
+							: shouldCompound.minimumShouldMatch( this.minimumShouldMatch );
+
+					} else if (this.minimumShouldMatch != null) {
+						throw new IllegalStateException( "minimumShouldMatch requires at least one should clause" );
+
+					}
+
+					if (compound == null) {
 						throw new IllegalStateException( "compound requires at least one clause" );
 
 					}
 
-					return new AtlasSearchOperator() {
+					if (this.score != null) {
+						compound = compound.score( this.score );
 
-						@Override
-						public String operatorName() {
+					}
 
-							return "compound";
-
-						}
-
-						@Override
-						public Document toDocument() {
-
-							return new Document( "compound", new Document( body ) );
-
-						}
-
-					};
+					return AtlasSearchOperator.of( "compound", compound );
 
 				}
 
-				/**
-				 * Appends Atlas Search operators to a compound clause array.
-				 *
-				 * @param target
-				 *            the compound body
-				 * @param key
-				 *            the clause key
-				 * @param operators
-				 *            the operators to append
-				 */
-				private void appendOperators(
-					Document target, String key, List<AtlasSearchOperator> operators
+				private List<SearchOperator> toSearchOperators(
+					List<AtlasSearchOperator> operators
 				) {
 
-					if (operators == null || operators.isEmpty())
-						return;
-
-					List<Document> docs = operators
+					return operators
 						.stream()
 						.filter( Objects::nonNull )
-						.map( AtlasSearchOperator::toDocument )
-						.collect( Collectors.toList() );
-
-					if (! docs.isEmpty()) {
-						target.append( key, docs );
-
-					}
+						.map( AtlasSearchOperator::toSearchOperator )
+						.toList();
 
 				}
 
@@ -4021,8 +4150,8 @@ public class ReactiveMongoDsl<K> {
 						: searchCountType;
 
 					return executeClassMono.flatMap( entityClass -> {
-						Document body = buildSearchMetaStageBody( countType );
-						AggregationSpec aggregation = applyAggOptions( List.of( new Document( "$searchMeta", body ) ) );
+						Bson searchMetaStage = buildSearchMetaStage( countType );
+						AggregationSpec aggregation = applyAggOptions( List.of( searchMetaStage ) );
 
 						Flux<Document> docs = ReactiveMongoDsl.this.aggregateDocuments( mongoExecutionContext, entityClass, collectionName, aggregation );
 
@@ -4094,22 +4223,28 @@ public class ReactiveMongoDsl<K> {
 
 			private final FieldBuilder<E> postFilterBuilder = new FieldBuilder<>( LogicalOperator.AND );
 
-			private String path;
+			private FieldSearchPath path;
 
 
-			private VectorQueryVector queryVector;
+			private List<Double> queryVector;
+
+			private BinaryVector driverBinaryVector;
 
 			private String queryText;
 
 			private String model;
 
-			private VectorTextQueryShape textQueryShape = VectorTextQueryShape.STRING;
+
 
 			private Long limit;
 
 			private Long numCandidates;
 
 			private Boolean exact;
+
+			private VectorSearchQuery driverQuery;
+
+			private final List<Function<VectorSearchOptions, VectorSearchOptions>> driverOptionCustomizers = new ArrayList<>();
 
 			private final List<Document> addFieldsDocs = new ArrayList<>();
 
@@ -4165,38 +4300,42 @@ public class ReactiveMongoDsl<K> {
 			 * Sets the field path used by {@code $vectorSearch}.
 			 * <p>For manual vector indexes this is the embedding vector field. For
 			 * Automated Embedding indexes this is the indexed text field.</p>
-			 *
-			 * @param path
-			 *            the logical path input
-			 * @param <K2>
-			 *            the logical path type
-			 *
-			 * @return this builder
 			 */
-			public <K2> VectorSearchBuilder<S> path(
-				K2 path
+			public VectorSearchBuilder<S> path(
+				String path
 			) {
 
-				this.path = VectorPathResolver.resolve( path );
+				this.path = SearchPathResolver.resolveFieldPath( path );
 				return this;
 
 			}
 
-			/**
-			 * Sets the query vector.
-			 *
-			 * @param queryVector
-			 *            the query vector wrapper
-			 *
-			 * @return this builder
-			 */
-			public VectorSearchBuilder<S> queryVector(
-				VectorQueryVector queryVector
+			/** Enum paths use {@link Enum#toString()}, allowing explicit physical field values. */
+			public VectorSearchBuilder<S> path(
+				Enum<?> path
 			) {
 
-				this.queryVector = Objects.requireNonNull( queryVector, "queryVector" );
-				this.queryText = null;
-				this.model = null;
+				this.path = SearchPathResolver.resolveFieldPath( path );
+				return this;
+
+			}
+
+			/** Uses a MongoDB driver-native field path directly. */
+			public VectorSearchBuilder<S> path(
+				FieldSearchPath path
+			) {
+
+				this.path = SearchPathResolver.resolveFieldPath( path );
+				return this;
+
+			}
+
+			/** Fallback for custom path wrappers. */
+			public VectorSearchBuilder<S> path(
+				Object path
+			) {
+
+				this.path = SearchPathResolver.resolveFieldPath( path );
 				return this;
 
 			}
@@ -4213,7 +4352,19 @@ public class ReactiveMongoDsl<K> {
 				float[] values
 			) {
 
-				return queryVector( VectorQueryVector.ofFloatArray( values ) );
+				Objects.requireNonNull( values, "values" );
+
+				if (values.length == 0) { throw new IllegalArgumentException( "values must not be empty" ); }
+
+				this.queryVector = java.util.stream.IntStream
+					.range( 0, values.length )
+					.mapToObj( index -> (double) values[index] )
+					.toList();
+				this.driverBinaryVector = null;
+				this.driverQuery = null;
+				this.queryText = null;
+				this.model = null;
+				return this;
 
 			}
 
@@ -4229,7 +4380,16 @@ public class ReactiveMongoDsl<K> {
 				double[] values
 			) {
 
-				return queryVector( VectorQueryVector.ofDoubleArray( values ) );
+				Objects.requireNonNull( values, "values" );
+
+				if (values.length == 0) { throw new IllegalArgumentException( "values must not be empty" ); }
+
+				this.queryVector = Arrays.stream( values ).boxed().toList();
+				this.driverBinaryVector = null;
+				this.driverQuery = null;
+				this.queryText = null;
+				this.model = null;
+				return this;
 
 			}
 
@@ -4245,14 +4405,48 @@ public class ReactiveMongoDsl<K> {
 				Collection<Double> values
 			) {
 
-				return queryVector( VectorQueryVector.ofDoubleList( values ) );
+				Objects.requireNonNull( values, "values" );
+
+				if (values.isEmpty()) { throw new IllegalArgumentException( "values must not be empty" ); }
+
+				if (values.stream().anyMatch( Objects::isNull )) { throw new IllegalArgumentException( "values must not contain null" ); }
+
+				this.queryVector = List.copyOf( values );
+				this.driverBinaryVector = null;
+				this.driverQuery = null;
+				this.queryText = null;
+				this.model = null;
+				return this;
+
+			}
+
+			/**
+			 * Sets a MongoDB driver-native binary query vector. This advanced path keeps
+			 * the driver's compact vector representation available without changing the
+			 * beginner-friendly array/list overloads.
+			 *
+			 * @param queryVector
+			 *            the driver-native binary vector
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> queryVector(
+				BinaryVector queryVector
+			) {
+
+				this.driverBinaryVector = Objects.requireNonNull( queryVector, "queryVector" );
+				this.queryVector = null;
+				this.driverQuery = null;
+				this.queryText = null;
+				this.model = null;
+				return this;
 
 			}
 
 			/**
 			 * Sets the text query used for a MongoDB Automated Embedding vector index.
 			 * <p>This renders the official {@code $vectorSearch.query} field. Use
-			 * {@link #queryVector(VectorQueryVector)} for application-provided vectors.</p>
+			 * {@link #queryVector(Collection)} for application-provided vectors.</p>
 			 *
 			 * @param query
 			 *            the source text that should be embedded by MongoDB
@@ -4269,27 +4463,33 @@ public class ReactiveMongoDsl<K> {
 				}
 
 				this.queryText = query;
+				this.driverQuery = null;
+				this.driverBinaryVector = null;
 				this.queryVector = null;
 				return this;
 
 			}
 
 			/**
-			 * Backward-compatible alias for {@link #query(String)}.
+			 * Sets a MongoDB driver-native vector search query. This keeps the application-level
+			 * DSL usable when the driver adds a new query type before this library adds a
+			 * convenience overload.
 			 *
-			 * @param queryText
-			 *            the source text that should be embedded by MongoDB
+			 * @param query
+			 *            the driver-native vector search query
 			 *
 			 * @return this builder
-			 *
-			 * @deprecated Use {@link #query(String)} for MongoDB Automated Embedding.
 			 */
-			@Deprecated
-			public VectorSearchBuilder<S> queryText(
-				String queryText
+			public VectorSearchBuilder<S> query(
+				VectorSearchQuery query
 			) {
 
-				return query( queryText );
+				this.driverQuery = Objects.requireNonNull( query, "query" );
+				this.queryText = null;
+				this.driverBinaryVector = null;
+				this.queryVector = null;
+				this.model = null;
+				return this;
 
 			}
 
@@ -4317,19 +4517,19 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Sets the BSON shape used to render text queries for MongoDB Automated
-			 * Embedding. The default is {@link VectorTextQueryShape#STRING}.
+			 * Applies an advanced MongoDB driver-native vector search option customizer after
+			 * the convenience options have been assembled.
 			 *
-			 * @param textQueryShape
-			 *            the text-query BSON shape
+			 * @param customizer
+			 *            the driver option customizer
 			 *
 			 * @return this builder
 			 */
-			public VectorSearchBuilder<S> textQueryShape(
-				VectorTextQueryShape textQueryShape
+			public VectorSearchBuilder<S> driverOptions(
+				Function<VectorSearchOptions, VectorSearchOptions> customizer
 			) {
 
-				this.textQueryShape = Objects.requireNonNull( textQueryShape, "textQueryShape" );
+				this.driverOptionCustomizers.add( Objects.requireNonNull( customizer, "customizer" ) );
 				return this;
 
 			}
@@ -4370,11 +4570,6 @@ public class ReactiveMongoDsl<K> {
 
 				if (numCandidates <= 0L) {
 					throw new IllegalArgumentException( "numCandidates must be > 0" );
-
-				}
-
-				if (numCandidates > 10000L) {
-					throw new IllegalArgumentException( "numCandidates must be <= 10000" );
 
 				}
 
@@ -4559,7 +4754,7 @@ public class ReactiveMongoDsl<K> {
 				String alias
 			) {
 
-				this.addFieldsDocs.add( new Document( alias, new Document( "$meta", "vectorSearchScore" ) ) );
+				this.addFieldsDocs.add( MongoBsonSupport.toDocument( Projections.metaVectorSearchScore( alias ) ) );
 				return this;
 
 			}
@@ -4635,7 +4830,7 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				if (this.path == null || this.path.isBlank()) {
+				if (this.path == null) {
 					throw new IllegalStateException( "vectorSearch.path is required" );
 
 				}
@@ -4645,18 +4840,21 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				if (this.queryVector == null && (this.queryText == null || this.queryText.isBlank())) {
+				int queryModes = (this.queryVector == null ? 0 : 1) + (this.driverBinaryVector == null ? 0 : 1) + (this.queryText == null || this.queryText.isBlank() ? 0
+					: 1) + (this.driverQuery == null ? 0 : 1);
+
+				if (queryModes == 0) {
 					throw new IllegalStateException( "vectorSearch.queryVector or vectorSearch.query is required" );
 
 				}
 
-				if (this.queryVector != null && this.queryText != null && ! this.queryText.isBlank()) {
-					throw new IllegalStateException( "vectorSearch.queryVector and vectorSearch.query cannot be used together" );
+				if (queryModes > 1) {
+					throw new IllegalStateException( "Only one vector search query mode can be configured" );
 
 				}
 
-				if (this.queryVector != null && this.model != null && ! this.model.isBlank()) {
-					throw new IllegalStateException( "vectorSearch.model can be used only with automated text query, not queryVector" );
+				if ((this.queryVector != null || this.driverBinaryVector != null || this.driverQuery != null) && this.model != null && ! this.model.isBlank()) {
+					throw new IllegalStateException( "vectorSearch.model can be used only with query(String)" );
 
 				}
 
@@ -4670,64 +4868,67 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				if (this.numCandidates != null && this.numCandidates < this.limit) {
-					throw new IllegalStateException( "vectorSearch.numCandidates must be >= limit" );
+			}
+
+			private VectorSearchOptions buildVectorSearchOptions(
+				Optional<Bson> preFilterCriteria
+			) {
+
+				VectorSearchOptions options = Boolean.TRUE.equals( this.exact )
+					? VectorSearchOptions.exactVectorSearchOptions()
+					: VectorSearchOptions.approximateVectorSearchOptions( this.numCandidates );
+
+				if (preFilterCriteria.isPresent()) {
+					options = options.filter( preFilterCriteria.get() );
 
 				}
 
-				if (this.numCandidates != null && this.numCandidates > 10000L) {
-					throw new IllegalStateException( "vectorSearch.numCandidates must be <= 10000" );
+				for (Function<VectorSearchOptions, VectorSearchOptions> customizer : this.driverOptionCustomizers) {
+					options = Objects.requireNonNull( customizer.apply( options ), "driver vector option customizer result" );
 
 				}
+
+				return options;
 
 			}
 
-			private Document buildVectorSearchStageBody(
+			private Bson buildVectorSearchStage(
 				Optional<Bson> preFilterCriteria
 			) {
 
 				validateVectorSearchBody();
-
-				Document body = new Document()
-					.append( "index", this.index )
-					.append( "path", this.path )
-					.append( "limit", this.limit );
+				VectorSearchOptions options = buildVectorSearchOptions( preFilterCriteria );
 
 				if (this.queryVector != null) {
-					body.append( "queryVector", this.queryVector.toBsonValue() );
+					return Aggregates
+						.vectorSearch(
+							this.path,
+							this.queryVector,
+							this.index,
+							this.limit,
+							options
+						);
 
 				}
 
-				if (this.queryText != null && ! this.queryText.isBlank()) {
-
-					if (this.textQueryShape == VectorTextQueryShape.TEXT_OBJECT) {
-						body.append( "query", new Document( "text", this.queryText ) );
-
-					} else {
-						body.append( "query", this.queryText );
-
-					}
+				if (this.driverBinaryVector != null) {
+					return Aggregates.vectorSearch( this.path, this.driverBinaryVector, this.index, this.limit, options );
 
 				}
+
+				if (this.driverQuery != null) {
+					return Aggregates.vectorSearch( this.path, this.driverQuery, this.index, this.limit, options );
+
+				}
+
+				TextVectorSearchQuery query = VectorSearchQuery.textQuery( this.queryText );
 
 				if (this.model != null && ! this.model.isBlank()) {
-					body.append( "model", this.model );
+					query = query.model( this.model );
 
 				}
 
-				if (this.numCandidates != null) {
-					body.append( "numCandidates", this.numCandidates );
-
-				}
-
-				if (this.exact != null) {
-					body.append( "exact", this.exact );
-
-				}
-
-				preFilterCriteria.ifPresent( criteria -> body.append( "filter", MongoBsonSupport.toDocument( criteria ) ) );
-
-				return body;
+				return Aggregates.vectorSearch( this.path, query, this.index, this.limit, options );
 
 			}
 
@@ -4737,7 +4938,7 @@ public class ReactiveMongoDsl<K> {
 
 				List<Bson> ops = new ArrayList<>();
 
-				ops.add( new Document( "$vectorSearch", buildVectorSearchStageBody( preFilterCriteria ) ) );
+				ops.add( buildVectorSearchStage( preFilterCriteria ) );
 
 				postFilterCriteria.ifPresent( criteria -> ops.add( Aggregates.match( criteria ) ) );
 
@@ -4753,7 +4954,17 @@ public class ReactiveMongoDsl<K> {
 
 					}
 
-					ops.add( new Document( "$addFields", addFields ) );
+					ops
+						.add(
+							Aggregates
+								.addFields(
+									addFields
+										.entrySet()
+										.stream()
+										.map( entry -> new com.mongodb.client.model.Field<>( entry.getKey(), entry.getValue() ) )
+										.toArray( com.mongodb.client.model.Field<?>[]::new )
+								)
+						);
 
 				}
 
@@ -4770,9 +4981,13 @@ public class ReactiveMongoDsl<K> {
 				Class<?> entityClass, List<Bson> ops
 			) {
 
-				return ReactiveMongoDsl.this.aggregateDocuments(
-					mongoExecutionContext, entityClass, collectionName, applyAggOptions( ops )
-				);
+				return ReactiveMongoDsl.this
+					.aggregateDocuments(
+						mongoExecutionContext,
+						entityClass,
+						collectionName,
+						applyAggOptions( ops )
+					);
 
 			}
 
@@ -4911,6 +5126,26 @@ public class ReactiveMongoDsl<K> {
 			private String[] excludes = null;
 
 
+			@Override
+			public FindAllQueryBuilder<S> readPreference(
+				ReadPreference rp
+			) {
+
+				super.readPreference( rp );
+				return this;
+
+			}
+
+			@Override
+			public FindAllQueryBuilder<S> isAllowDiskUse(
+				Boolean allow
+			) {
+
+				super.isAllowDiskUse( allow );
+				return this;
+
+			}
+
 			/**
 			 * Starts paging configuration for this query.
 			 *
@@ -4941,35 +5176,45 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Applies the given sort orders to the query.
+			 * Starts ordered sorting for this query.
+			 * <p>Driver-native sort definitions belong inside {@link SortSpec#driver(Bson)} so
+			 * every sort path uses the same ordered fluent DSL.</p>
 			 *
-			 * @param sorts
-			 *            the sort orders
-			 * 
-			 * @return this builder
+			 * @return the ordered sort DSL
 			 */
-			public FindAllQueryBuilder<S> sort( Bson sort ) {
+			public SortSpec<FindAllQueryBuilder<S>> sorts() {
 
-				this.sort = sort;
-				return this;
+				return new SortSpec<FindAllQueryBuilder<S>>( this ) {
 
-			}
+					@Override
+					protected void apply() {
 
-			/** Alias kept for fluent-call compatibility; pass a MongoDB driver sort Bson. */
-			public FindAllQueryBuilder<S> sorts( Bson sort ) {
+						FindAllQueryBuilder.this.sort = isEmpty() ? null : this;
 
-				return sort( sort );
+					}
+
+				};
 
 			}
 
 			/**
-			 * Excludes the given fields from the result projection.
+			 * Configures ordered sorting in one callback and returns this query builder.
 			 *
-			 * @param excludes
-			 *            the field names to exclude
-			 * 
+			 * @param spec
+			 *            the ordered sort configuration
+			 *
 			 * @return this builder
 			 */
+			public FindAllQueryBuilder<S> sorts(
+				Consumer<SortSpec<FindAllQueryBuilder<S>>> spec
+			) {
+
+				SortSpec<FindAllQueryBuilder<S>> sort = sorts();
+				Objects.requireNonNull( spec, "spec" ).accept( sort );
+				return sort.end();
+
+			}
+
 			public FindAllQueryBuilder<S> excludes(
 				String... excludes
 			) {
@@ -5117,11 +5362,14 @@ public class ReactiveMongoDsl<K> {
 						query.projection( Projections.exclude( excludes ) );
 
 					return applyQueryOptions( query );
+
 				} );
 
-				return Mono.zip( executeClassMono, queryMono ).flatMapMany( tuple ->
-					find( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() )
-				);
+				return Mono
+					.zip( executeClassMono, queryMono )
+					.flatMapMany(
+						tuple -> find( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() )
+					);
 
 			}
 
@@ -5184,9 +5432,11 @@ public class ReactiveMongoDsl<K> {
 					.buildCriteria()
 					.map( criteriaOptional -> applyAggOptions( buildFindAllAggregationOps( criteriaOptional, true, true ) ) );
 
-				return Mono.zip( executeClassMono, aggregationMono ).flatMapMany( tuple ->
-					aggregate( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2(), tuple.getT1() )
-				);
+				return Mono
+					.zip( executeClassMono, aggregationMono )
+					.flatMapMany(
+						tuple -> aggregate( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2(), tuple.getT1() )
+					);
 
 			}
 
@@ -5261,16 +5511,19 @@ public class ReactiveMongoDsl<K> {
 						if (paging != null) {
 							operations.add( Aggregates.skip( Math.toIntExact( (long) paging.pageNumber * paging.pageSize ) ) );
 							operations.add( Aggregates.limit( paging.pageSize ) );
+
 						}
 
-						operations.add(
-							new Document(
-								"$project",
-								new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs )
-							)
-						);
+						operations
+							.add(
+								Aggregates
+									.project(
+										new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs )
+									)
+							);
 
 						return applyAggOptions( operations );
+
 					} );
 
 				return Mono.zip( leftClassMono, rightClassMono, aggregationMono ).flatMapMany( tuple -> {
@@ -5283,10 +5536,14 @@ public class ReactiveMongoDsl<K> {
 						.map( document -> {
 							E leftValue = mongoExecutionContext.read( leftClass, document.get( leftKey, Document.class ) );
 							List<R2> rightValues = readLookupValues(
-								rightBuilder.getMongoExecutionContext(), rightClass, document.get( rightKey )
+								rightBuilder.getMongoExecutionContext(),
+								rightClass,
+								document.get( rightKey )
 							);
 							return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues );
+
 						} );
+
 				} );
 
 			}
@@ -5312,7 +5569,8 @@ public class ReactiveMongoDsl<K> {
 				Mono<Class<E>> leftClassMono = executeClassMono;
 				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
 
-				return Mono.zip( fieldBuilder.buildCriteria(), rightBuilder.getFieldBuilderCriteria(), leftClassMono, rightClassMono )
+				return Mono
+					.zip( fieldBuilder.buildCriteria(), rightBuilder.getFieldBuilderCriteria(), leftClassMono, rightClassMono )
 					.flatMap( tuple -> {
 						Optional<Bson> leftCriteria = tuple.getT1();
 						Optional<Bson> rightCriteria = tuple.getT2();
@@ -5331,19 +5589,23 @@ public class ReactiveMongoDsl<K> {
 
 						List<Bson> data = new ArrayList<>( common );
 						data.add( Aggregates.sort( sort != null ? sort : Sorts.descending( "_id" ) ) );
+
 						if (paging != null) {
 							data.add( Aggregates.skip( Math.toIntExact( (long) paging.pageNumber * paging.pageSize ) ) );
 							data.add( Aggregates.limit( paging.pageSize ) );
+
 						}
-						data.add( new Document( "$project", new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs ) ) );
+
+						data.add( Aggregates.project( new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs ) ) );
 
 						List<Bson> countPipeline = new ArrayList<>( common );
 						countPipeline.add( Aggregates.count( "totalCount" ) );
 
-						Bson facet = Aggregates.facet(
-							new Facet( "data", data ),
-							new Facet( "count", countPipeline )
-						);
+						Bson facet = Aggregates
+							.facet(
+								new Facet( "data", data ),
+								new Facet( "count", countPipeline )
+							);
 
 						return aggregateDocuments( mongoExecutionContext, leftClass, collectionName, applyAggOptions( List.of( facet ) ) )
 							.next()
@@ -5353,9 +5615,12 @@ public class ReactiveMongoDsl<K> {
 								List<ResultTuple<E, List<R2>>> result = rows.stream().map( row -> {
 									E leftValue = mongoExecutionContext.read( leftClass, row.get( leftKey, Document.class ) );
 									List<R2> rightValues = readLookupValues(
-										rightBuilder.getMongoExecutionContext(), rightClass, row.get( rightKey )
+										rightBuilder.getMongoExecutionContext(),
+										rightClass,
+										row.get( rightKey )
 									);
 									return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues );
+
 								} ).toList();
 
 								@SuppressWarnings("unchecked")
@@ -5364,8 +5629,10 @@ public class ReactiveMongoDsl<K> {
 									? 0L
 									: Optional.ofNullable( countRows.get( 0 ).get( "totalCount", Number.class ) ).map( Number::longValue ).orElse( 0L );
 								return new PageResult<>( result, totalCount );
+
 							} )
 							.defaultIfEmpty( new PageResult<>( List.of(), 0L ) );
+
 					} );
 
 			}
@@ -5382,24 +5649,66 @@ public class ReactiveMongoDsl<K> {
 		public class FindQueryBuilder<S extends E> extends QueryBuilderAccesser<FindExecute<E>, FindAggregation<E>> implements FindExecute<E>, FindAggregation<E> {
 
 			private Bson sort;
+
 			private String[] excludes;
 
-			/** Applies a MongoDB driver sort definition. Field names are physical MongoDB field paths. */
-			public FindQueryBuilder<S> sort(
-				Bson sort
+			@Override
+			public FindQueryBuilder<S> readPreference(
+				ReadPreference rp
 			) {
 
-				this.sort = sort;
+				super.readPreference( rp );
 				return this;
 
 			}
 
-			/** Alias kept for fluent-call compatibility. */
-			public FindQueryBuilder<S> sorts(
-				Bson sort
+			@Override
+			public FindQueryBuilder<S> isAllowDiskUse(
+				Boolean allow
 			) {
 
-				return sort( sort );
+				super.isAllowDiskUse( allow );
+				return this;
+
+			}
+
+			/**
+			 * Starts ordered sorting for this query.
+			 * <p>Driver-native sort definitions belong inside {@link SortSpec#driver(Bson)} so
+			 * every sort path uses the same ordered fluent DSL.</p>
+			 *
+			 * @return the ordered sort DSL
+			 */
+			public SortSpec<FindQueryBuilder<S>> sorts() {
+
+				return new SortSpec<FindQueryBuilder<S>>( this ) {
+
+					@Override
+					protected void apply() {
+
+						FindQueryBuilder.this.sort = isEmpty() ? null : this;
+
+					}
+
+				};
+
+			}
+
+			/**
+			 * Configures ordered sorting in one callback and returns this query builder.
+			 *
+			 * @param spec
+			 *            the ordered sort configuration
+			 *
+			 * @return this builder
+			 */
+			public FindQueryBuilder<S> sorts(
+				Consumer<SortSpec<FindQueryBuilder<S>>> spec
+			) {
+
+				SortSpec<FindQueryBuilder<S>> sort = sorts();
+				Objects.requireNonNull( spec, "spec" ).accept( sort );
+				return sort.end();
 
 			}
 
@@ -5439,7 +5748,8 @@ public class ReactiveMongoDsl<K> {
 			@Override
 			public Mono<E> execute() {
 
-				return Mono.zip( executeClassMono, fieldBuilder.buildCriteria().map( criteria -> buildFindSpec( criteria, false ) ) )
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( criteria -> buildFindSpec( criteria, false ) ) )
 					.flatMap( tuple -> findOne( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
 
 			}
@@ -5447,7 +5757,8 @@ public class ReactiveMongoDsl<K> {
 			@Override
 			public Mono<E> executeFirst() {
 
-				return Mono.zip( executeClassMono, fieldBuilder.buildCriteria().map( criteria -> buildFindSpec( criteria, true ) ) )
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( criteria -> buildFindSpec( criteria, true ) ) )
 					.flatMap( tuple -> findOne( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
 
 			}
@@ -5463,13 +5774,16 @@ public class ReactiveMongoDsl<K> {
 					if (excludes != null && excludes.length > 0)
 						operations.add( Aggregates.project( Projections.exclude( excludes ) ) );
 					return applyAggOptions( operations );
+
 				} );
 
-				return Mono.zip( executeClassMono, aggregationMono ).flatMap( tuple ->
-					aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() )
-						.next()
-						.map( document -> mongoExecutionContext.read( tuple.getT1(), document ) )
-				);
+				return Mono
+					.zip( executeClassMono, aggregationMono )
+					.flatMap(
+						tuple -> aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() )
+							.next()
+							.map( document -> mongoExecutionContext.read( tuple.getT1(), document ) )
+					);
 
 			}
 
@@ -5499,8 +5813,9 @@ public class ReactiveMongoDsl<K> {
 						appendLookupStages( operations, rightCollection, rightAs, rightCriteria, spec );
 						operations.add( Aggregates.sort( sort != null ? sort : Sorts.descending( "_id" ) ) );
 						operations.add( Aggregates.limit( 1 ) );
-						operations.add( new Document( "$project", new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs ) ) );
+						operations.add( Aggregates.project( new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs ) ) );
 						return applyAggOptions( operations );
+
 					} );
 
 				return Mono.zip( leftClassMono, rightClassMono, aggregationMono ).flatMap( tuple -> {
@@ -5514,10 +5829,14 @@ public class ReactiveMongoDsl<K> {
 						.map( document -> {
 							E leftValue = mongoExecutionContext.read( leftClass, document.get( leftKey, Document.class ) );
 							List<R2> rightValues = readLookupValues(
-								rightBuilder.getMongoExecutionContext(), rightClass, document.get( rightKey )
+								rightBuilder.getMongoExecutionContext(),
+								rightClass,
+								document.get( rightKey )
 							);
 							return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues.isEmpty() ? null : rightValues.get( 0 ) );
+
 						} );
+
 				} );
 
 			}
@@ -5531,11 +5850,33 @@ public class ReactiveMongoDsl<K> {
 		public class CountQueryBuilder extends QueryBuilderAccesser<CountExecute<E>, CountAggregation<E>> implements CountExecute<E>, CountAggregation<E> {
 
 			@Override
+			public CountQueryBuilder readPreference(
+				ReadPreference rp
+			) {
+
+				super.readPreference( rp );
+				return this;
+
+			}
+
+			@Override
+			public CountQueryBuilder isAllowDiskUse(
+				Boolean allow
+			) {
+
+				super.isAllowDiskUse( allow );
+				return this;
+
+			}
+
+			@Override
 			public Mono<Long> execute() {
 
-				Mono<FindSpec> queryMono = fieldBuilder.buildCriteria()
+				Mono<FindSpec> queryMono = fieldBuilder
+					.buildCriteria()
 					.map( criteria -> applyQueryOptions( new FindSpec().filter( criteria.orElseGet( Document::new ) ) ) );
-				return Mono.zip( executeClassMono, queryMono )
+				return Mono
+					.zip( executeClassMono, queryMono )
 					.flatMap( tuple -> count( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
 
 			}
@@ -5548,14 +5889,17 @@ public class ReactiveMongoDsl<K> {
 					criteria.ifPresent( filter -> operations.add( Aggregates.match( filter ) ) );
 					operations.add( Aggregates.count( "count" ) );
 					return applyAggOptions( operations );
+
 				} );
 
-				return Mono.zip( executeClassMono, aggregationMono ).flatMap( tuple ->
-					aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() )
-						.singleOrEmpty()
-						.map( document -> Optional.ofNullable( document.get( "count", Number.class ) ).map( Number::longValue ).orElse( 0L ) )
-						.defaultIfEmpty( 0L )
-				);
+				return Mono
+					.zip( executeClassMono, aggregationMono )
+					.flatMap(
+						tuple -> aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() )
+							.singleOrEmpty()
+							.map( document -> Optional.ofNullable( document.get( "count", Number.class ) ).map( Number::longValue ).orElse( 0L ) )
+							.defaultIfEmpty( 0L )
+					);
 
 			}
 
@@ -5583,32 +5927,47 @@ public class ReactiveMongoDsl<K> {
 
 						if (spec.isUnwind()) {
 							Document rightExists = new Document( "$ne", List.of( new Document( "$type", "$" + rightAs ), "missing" ) );
-							operations.add(
-								new Document(
-									"$group",
-									new Document( "_id", null )
-										.append( "leftCount", new Document( "$sum", 1 ) )
-										.append( "rightCount", new Document( "$sum", new Document( "$cond", List.of( rightExists, 1, 0 ) ) ) )
-								)
-							);
+							operations
+								.add(
+									Aggregates
+										.group(
+											null,
+											List
+												.of(
+													Accumulators.sum( "leftCount", 1 ),
+													Accumulators.sum( "rightCount", new Document( "$cond", List.of( rightExists, 1, 0 ) ) )
+												)
+										)
+								);
+
 						} else {
-							operations.add(
-								new Document(
-									"$set",
-									new Document( "_rightSize", new Document( "$size", new Document( "$ifNull", List.of( "$" + rightAs, List.of() ) ) ) )
-								)
-							);
-							operations.add(
-								new Document(
-									"$group",
-									new Document( "_id", null )
-										.append( "leftCount", new Document( "$sum", 1 ) )
-										.append( "rightCount", new Document( "$sum", "$_rightSize" ) )
-								)
-							);
+							operations
+								.add(
+									Aggregates
+										.set(
+											new com.mongodb.client.model.Field<>(
+												"_rightSize",
+												new Document( "$size", new Document( "$ifNull", List.of( "$" + rightAs, List.of() ) ) )
+											)
+										)
+								);
+							operations
+								.add(
+									Aggregates
+										.group(
+											null,
+											List
+												.of(
+													Accumulators.sum( "leftCount", 1 ),
+													Accumulators.sum( "rightCount", "$_rightSize" )
+												)
+										)
+								);
+
 						}
 
 						return applyAggOptions( operations );
+
 					} );
 
 				return Mono.zip( leftClassMono, rightClassMono, aggregationMono ).flatMap( tuple -> {
@@ -5616,13 +5975,16 @@ public class ReactiveMongoDsl<K> {
 					String rightName = simpleName( tuple.getT2() );
 					return aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT3() )
 						.singleOrEmpty()
-						.map( document -> new ResultTuple<>(
-							leftName,
-							Optional.ofNullable( document.get( "leftCount", Number.class ) ).map( Number::longValue ).orElse( 0L ),
-							rightName,
-							Optional.ofNullable( document.get( "rightCount", Number.class ) ).map( Number::longValue ).orElse( 0L )
-						) )
+						.map(
+							document -> new ResultTuple<>(
+								leftName,
+								Optional.ofNullable( document.get( "leftCount", Number.class ) ).map( Number::longValue ).orElse( 0L ),
+								rightName,
+								Optional.ofNullable( document.get( "rightCount", Number.class ) ).map( Number::longValue ).orElse( 0L )
+							)
+						)
 						.defaultIfEmpty( new ResultTuple<>( leftName, 0L, rightName, 0L ) );
+
 				} );
 
 			}
@@ -5642,10 +6004,17 @@ public class ReactiveMongoDsl<K> {
 			 */
 			public Mono<DeleteResult> execute() {
 
-				return Mono.zip( executeClassMono, fieldBuilder.buildCriteria() )
-					.flatMap( tuple -> deleteByFilter(
-						mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2().orElseGet( Document::new ), true
-					) );
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria() )
+					.flatMap(
+						tuple -> deleteByFilter(
+							mongoExecutionContext,
+							tuple.getT1(),
+							collectionName,
+							tuple.getT2().orElseGet( Document::new ),
+							true
+						)
+					);
 
 			}
 
@@ -5657,11 +6026,33 @@ public class ReactiveMongoDsl<K> {
 		public class ExistsQueryBuilder extends QueryBuilderAccesser<ExistsExecute<E>, ExistsAggregation<E>> implements ExistsExecute<E>, ExistsAggregation<E> {
 
 			@Override
+			public ExistsQueryBuilder readPreference(
+				ReadPreference rp
+			) {
+
+				super.readPreference( rp );
+				return this;
+
+			}
+
+			@Override
+			public ExistsQueryBuilder isAllowDiskUse(
+				Boolean allow
+			) {
+
+				super.isAllowDiskUse( allow );
+				return this;
+
+			}
+
+			@Override
 			public Mono<Boolean> execute() {
 
-				Mono<FindSpec> queryMono = fieldBuilder.buildCriteria()
+				Mono<FindSpec> queryMono = fieldBuilder
+					.buildCriteria()
 					.map( criteria -> applyQueryOptions( new FindSpec().filter( criteria.orElseGet( Document::new ) ) ) );
-				return Mono.zip( executeClassMono, queryMono )
+				return Mono
+					.zip( executeClassMono, queryMono )
 					.flatMap( tuple -> exists( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
 
 			}
@@ -5674,9 +6065,11 @@ public class ReactiveMongoDsl<K> {
 					criteria.ifPresent( filter -> operations.add( Aggregates.match( filter ) ) );
 					operations.add( Aggregates.limit( 1 ) );
 					return applyAggOptions( operations );
+
 				} );
 
-				return Mono.zip( executeClassMono, aggregationMono )
+				return Mono
+					.zip( executeClassMono, aggregationMono )
 					.flatMap( tuple -> aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ).hasElements() );
 
 			}
@@ -5709,9 +6102,10 @@ public class ReactiveMongoDsl<K> {
 								"$gt",
 								List.of( new Document( "$size", new Document( "$ifNull", List.of( "$" + rightAs, List.of() ) ) ), 0 )
 							);
-						operations.add( new Document( "$project", new Document( "_rightExists", rightExistsExpression ) ) );
+						operations.add( Aggregates.project( Projections.computed( "_rightExists", rightExistsExpression ) ) );
 						operations.add( Aggregates.limit( 1 ) );
 						return applyAggOptions( operations ).allowDiskUse( false );
+
 					} );
 
 				return Mono.zip( leftClassMono, rightClassMono, aggregationMono ).flatMap( tuple -> {
@@ -5719,13 +6113,16 @@ public class ReactiveMongoDsl<K> {
 					String rightName = simpleName( tuple.getT2() );
 					return aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT3() )
 						.next()
-						.map( document -> new ResultTuple<>(
-							leftName,
-							true,
-							rightName,
-							Optional.ofNullable( document.get( "_rightExists", Boolean.class ) ).orElse( false )
-						) )
+						.map(
+							document -> new ResultTuple<>(
+								leftName,
+								true,
+								rightName,
+								Optional.ofNullable( document.get( "_rightExists", Boolean.class ) ).orElse( false )
+							)
+						)
 						.defaultIfEmpty( new ResultTuple<>( leftName, false, rightName, false ) );
+
 				} );
 
 			}
@@ -5763,19 +6160,12 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			@Deprecated
-			public AtomicUpsertTypedBuilder upsert() {
-
-				return upsertOne();
-
-			}
-
 			public class AtomicUpdateTypedBuilder {
 
 				private final AtomicUpdateMode mode;
 
 				protected AtomicUpdateTypedBuilder(
-					AtomicUpdateMode mode
+													AtomicUpdateMode mode
 				) {
 
 					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
@@ -5816,10 +6206,11 @@ public class ReactiveMongoDsl<K> {
 			public class AtomicDocumentUpdateBuilder {
 
 				protected final AtomicUpdateMode mode;
+
 				protected final DocumentSpec doc = new DocumentSpec();
 
 				protected AtomicDocumentUpdateBuilder(
-					AtomicUpdateMode mode
+														AtomicUpdateMode mode
 				) {
 
 					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
@@ -5876,6 +6267,24 @@ public class ReactiveMongoDsl<K> {
 				) {
 
 					doc.add( Updates.pull( requireField( field ), value ) );
+					return this;
+
+				}
+
+				/**
+				 * Adds a MongoDB driver-native update definition. This keeps newer or advanced
+				 * {@link Updates} operations usable without adding a matching DSL method first.
+				 *
+				 * @param update
+				 *            the driver-native update definition
+				 *
+				 * @return this builder
+				 */
+				public AtomicDocumentUpdateBuilder driverUpdate(
+					Bson update
+				) {
+
+					doc.add( Objects.requireNonNull( update, "update" ) );
 					return this;
 
 				}
@@ -5967,15 +6376,26 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
+				@Override
+				public AtomicUpsertDocumentBuilder driverUpdate(
+					Bson update
+				) {
+
+					super.driverUpdate( update );
+					return this;
+
+				}
+
 			}
 
 			public class AtomicPipelineUpdateBuilder {
 
 				private final AtomicUpdateMode mode;
+
 				private final PipelineSpec pipe = new PipelineSpec();
 
 				private AtomicPipelineUpdateBuilder(
-					AtomicUpdateMode mode
+													AtomicUpdateMode mode
 				) {
 
 					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
@@ -6046,7 +6466,9 @@ public class ReactiveMongoDsl<K> {
 						case UPSERT_ONE -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, false, true );
 						case MULTI -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, true, false );
 						case FIRST -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, false, false );
+
 					};
+
 				} );
 
 			}
@@ -6080,6 +6502,7 @@ public class ReactiveMongoDsl<K> {
 			private class PipelineSpec {
 
 				private final List<Bson> pipeline = new ArrayList<>();
+
 				private Document pendingSet = new Document();
 
 				void set(
@@ -6107,14 +6530,15 @@ public class ReactiveMongoDsl<K> {
 				) {
 
 					flushSet();
-					List<String> physicalFields = Arrays.stream( fields )
+					List<String> physicalFields = Arrays
+						.stream( fields )
 						.filter( Objects::nonNull )
 						.map( String::trim )
 						.filter( value -> ! value.isBlank() )
 						.map( MongoFieldNameSupport::toMongoField )
 						.toList();
 					if (! physicalFields.isEmpty())
-						pipeline.add( new Document( "$unset", physicalFields.size() == 1 ? physicalFields.get( 0 ) : physicalFields ) );
+						pipeline.add( Aggregates.unset( physicalFields ) );
 
 				}
 
@@ -6150,8 +6574,19 @@ public class ReactiveMongoDsl<K> {
 				private void flushSet() {
 
 					if (! pendingSet.isEmpty()) {
-						pipeline.add( new Document( "$set", new Document( pendingSet ) ) );
+						pipeline
+							.add(
+								Aggregates
+									.set(
+										pendingSet
+											.entrySet()
+											.stream()
+											.map( entry -> new com.mongodb.client.model.Field<>( entry.getKey(), entry.getValue() ) )
+											.toArray( com.mongodb.client.model.Field<?>[]::new )
+									)
+							);
 						pendingSet = new Document();
+
 					}
 
 				}
@@ -6173,7 +6608,6 @@ public class ReactiveMongoDsl<K> {
 
 
 
-
 	}
 
 	/**
@@ -6183,22 +6617,6 @@ public class ReactiveMongoDsl<K> {
 	 *            the entity type
 	 */
 	public abstract class ExecuteEntityBuilder<E> extends AbstractQueryBuilder<E, ExecuteEntityBuilder<E>> implements ExecuteBuilder {
-
-		@SuppressWarnings("unchecked")
-		ExecuteEntityBuilder(
-								K key
-		) {
-
-			this.executeClassMono = Mono
-				.just(
-					(Class<E>) ((ParameterizedType) getClass()
-						.getGenericSuperclass()).getActualTypeArguments()[0]
-				);
-
-			this.mongoExecutionContext = ReactiveMongoDsl.this.getMongoTemplate( key );
-			this.executeBuilder = this;
-
-		}
 
 		ExecuteEntityBuilder(
 								Class<E> executeClass,
@@ -6221,24 +6639,6 @@ public class ReactiveMongoDsl<K> {
 	 */
 	public abstract class ExecuteCustomClassBuilder<E> extends AbstractQueryBuilder<E, ExecuteCustomClassBuilder<E>> implements ExecuteBuilder {
 
-		@SuppressWarnings("unchecked")
-		ExecuteCustomClassBuilder(
-									K key,
-									String collectionName
-		) {
-
-			this.executeClassMono = Mono
-				.just(
-					(Class<E>) ((ParameterizedType) getClass()
-						.getGenericSuperclass()).getActualTypeArguments()[0]
-				);
-
-			this.mongoExecutionContext = ReactiveMongoDsl.this.getMongoTemplate( key );
-			this.collectionName = collectionName;
-			this.executeBuilder = this;
-
-		}
-
 		ExecuteCustomClassBuilder(
 									Class<E> executeClass,
 									K key,
@@ -6251,24 +6651,6 @@ public class ReactiveMongoDsl<K> {
 			this.executeBuilder = this;
 
 		}
-
-	}
-
-	/**
-	 * Creates an execution context for an entity type inferred from the anonymous builder subclass.
-	 *
-	 * @param key
-	 *            the logical Mongo execution-context key
-	 * @param <E>
-	 *            the entity type
-	 * 
-	 * @return an execution builder bound to the inferred entity type
-	 */
-	public <E> ExecuteEntityBuilder<E> executeEntity(
-		K key
-	) {
-
-		return new ExecuteEntityBuilder<>( key ) {};
 
 	}
 
@@ -6312,27 +6694,6 @@ public class ReactiveMongoDsl<K> {
 	) {
 
 		return new ExecuteCustomClassBuilder<>( executeCustomClass, key, collectionName ) {};
-
-	}
-
-	/**
-	 * Creates an execution context for a custom collection using a type
-	 * inferred from the anonymous builder subclass.
-	 *
-	 * @param key
-	 *            the logical Mongo execution-context key
-	 * @param collectionName
-	 *            the target collection name
-	 * @param <E>
-	 *            the mapped result type
-	 * 
-	 * @return an execution builder bound to the inferred type and collection
-	 */
-	public <E> ExecuteCustomClassBuilder<E> executeCustomClass(
-		K key, String collectionName
-	) {
-
-		return new ExecuteCustomClassBuilder<>( key, collectionName ) {};
 
 	}
 
