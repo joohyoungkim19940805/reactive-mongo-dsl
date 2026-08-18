@@ -1,5 +1,6 @@
 package com.byeolnaerim.mongodsl.vector;
 
+import com.byeolnaerim.mongodsl.internal.MongoFieldNameSupport;
 import java.util.Objects;
 
 /**

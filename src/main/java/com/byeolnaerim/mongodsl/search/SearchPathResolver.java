@@ -1,5 +1,6 @@
 package com.byeolnaerim.mongodsl.search;
 
+import com.byeolnaerim.mongodsl.internal.MongoFieldNameSupport;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;

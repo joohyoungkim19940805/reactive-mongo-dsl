@@ -12,11 +12,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition;
 import com.byeolnaerim.mongodsl.lookup.LookupSpec;
-import com.byeolnaerim.mongodsl.query.MongoSort.Order;
 import com.byeolnaerim.mongodsl.result.ResultTuple;
 import com.byeolnaerim.mongodsl.spi.DriverMongoExecutionContext;
 import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
 import com.mongodb.MongoClientSettings;
+import com.mongodb.client.model.Sorts;
 import com.mongodb.reactivestreams.client.ClientSession;
 import com.mongodb.reactivestreams.client.MongoClient;
 import com.mongodb.reactivestreams.client.MongoClients;
@@ -147,7 +147,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 
 		ProductionLikeEntity found = mongoDsl
 			.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
-			.fields(pair("id", entity.getId()), pair("accountName", "account-a"))
+			.fields(pair("id", new ObjectId(entity.getId())), pair("account_name", "account-a"))
 			.end()
 			.find()
 			.execute()
@@ -160,7 +160,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			1L,
 			mongoDsl
 				.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
-				.fields(pair("id", entity.getId()))
+				.fields(pair("_id", new ObjectId(entity.getId())))
 				.end()
 				.count()
 				.execute()
@@ -169,7 +169,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertTrue(
 			mongoDsl
 				.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
-				.fields(pair("id", entity.getId()))
+				.fields(pair("_id", new ObjectId(entity.getId())))
 				.end()
 				.exists()
 				.execute()
@@ -194,8 +194,8 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		ProductionLikeEntity found = mongoDsl
 			.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
 			.fields(
-				pair("auction.id", entity.getAuction().getId()),
-				pair("auction.title", "auction-111")
+				pair("auction._id", new ObjectId(entity.getAuction().getId())),
+				pair("auction.auction_title", "auction-111")
 			)
 			.end()
 			.find()
@@ -272,7 +272,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 
 		mongoDsl
 			.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
-			.saveAllBulkUpsertByKey(List.of(sameKey, anotherKey), "caseNo", "caseYear", "court", "accountName")
+			.saveAllBulkUpsertByKey(List.of(sameKey, anotherKey), "caseNo", "caseYear", "court", "account_name")
 			.block();
 
 		assertEquals(2L, Mono.from(mongoDatabase.getCollection(ENTITY_COLLECTION).countDocuments()).block());
@@ -381,31 +381,31 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 	}
 
 	@Test
-	void atomicDocumentAndPipelineUpdatesMapAliasesAndIdValues() {
+	void atomicDocumentAndPipelineUpdatesUsePhysicalMongoFields() {
 		ProductionLikeEntity entity = entity("atomic-before", "join-a", 2026, 701, "READY", 100L);
 		entity.setRetryCount(1);
 		mongoDsl.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT).save(entity).block();
 
 		mongoDsl
 			.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
-			.fields(pair("id", entity.getId()))
+			.fields(pair("_id", new ObjectId(entity.getId())))
 			.end()
 			.atomicUpdate()
 			.first()
 			.document()
-			.set("accountName", "atomic-document")
+			.set("account_name", "atomic-document")
 			.inc("retryCount", 1)
 			.execute()
 			.block();
 
 		mongoDsl
 			.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
-			.fields(pair("id", entity.getId()))
+			.fields(pair("_id", new ObjectId(entity.getId())))
 			.end()
 			.atomicUpdate()
 			.first()
 			.pipeline()
-			.set("accountName", "atomic-pipeline")
+			.set("account_name", "atomic-pipeline")
 			.inc("retryCount", 2)
 			.execute()
 			.block();
@@ -417,7 +417,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 	}
 
 	@Test
-	void findAllAndAggregationPreserveMappedSortPagingAndProjection() {
+	void findAllAndAggregationPreservePhysicalSortPagingAndProjection() {
 		List<ProductionLikeEntity> entities = List.of(
 			entity("alpha", "join-a", 2026, 801, "READY", 100L),
 			entity("charlie", "join-b", 2026, 802, "READY", 200L),
@@ -430,7 +430,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			.fields()
 			.end()
 			.findAll()
-			.sorts(Order.desc("accountName"))
+			.sort(Sorts.descending("account_name"))
 			.paging(0, 2)
 			.excludes("status")
 			.execute()
@@ -442,7 +442,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			.fields()
 			.end()
 			.findAll()
-			.sorts(Order.desc("accountName"))
+			.sort(Sorts.descending("account_name"))
 			.paging(0, 2)
 			.excludes("status")
 			.executeAggregationStream()
@@ -473,7 +473,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			.pageSize(2)
 			.pageNumber(0)
 			.and()
-			.sorts(Order.desc("accountName"))
+			.sort(Sorts.descending("account_name"))
 			.executeAggregation()
 			.block();
 
@@ -498,11 +498,11 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 
 		var leftBuilder = mongoDsl
 			.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
-			.fields(pair("id", left.getId()))
+			.fields(pair("_id", new ObjectId(left.getId())))
 			.end();
 		var rightBuilder = mongoDsl
 			.executeEntity(ProductionLikeChild.class, TestMongo.RIGHT)
-			.fields(pair("status", "ACTIVE"))
+			.fields(pair("child_status", "ACTIVE"))
 			.end()
 			.findAll();
 
@@ -513,7 +513,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 				LookupSpec
 					.builder()
 					.as("childHit")
-					.bindConditionFields("joinKey", Condition.eq, "joinKey")
+					.bindConditionFields("left_join_key", Condition.eq, "right_join_key")
 					.limit(10)
 					.build()
 			)
@@ -554,7 +554,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			.end();
 		var rightBuilder = mongoDsl
 			.executeEntity(ProductionLikeChild.class, TestMongo.RIGHT)
-			.fields(pair("status", "ACTIVE"))
+			.fields(pair("child_status", "ACTIVE"))
 			.end()
 			.findAll();
 
@@ -566,7 +566,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 				LookupSpec
 					.builder()
 					.as("childHit")
-					.bindConditionFields("joinKey", Condition.eq, "joinKey")
+					.bindConditionFields("left_join_key", Condition.eq, "right_join_key")
 					.limit(10)
 					.build()
 			)
@@ -660,7 +660,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 
 		DriverPojo found = mongoDsl
 			.executeEntity(DriverPojo.class, TestMongo.DRIVER)
-			.fields(pair("id", pojo.getId()))
+			.fields(pair("_id", new ObjectId(pojo.getId())))
 			.end()
 			.find()
 			.execute()
@@ -928,39 +928,6 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		}
 
 		@Override
-		public String getMappedFieldName(Class<?> entityClass, String fieldName) {
-			if (fieldName == null || fieldName.isBlank())
-				return fieldName;
-			int dot = fieldName.indexOf('.');
-			String head = dot < 0 ? fieldName : fieldName.substring(0, dot);
-			String tail = dot < 0 ? "" : fieldName.substring(dot);
-			if ("id".equals(head))
-				return "_id" + tail;
-			if (entityClass == ProductionLikeEntity.class) {
-				if ("accountName".equals(head))
-					return "account_name" + tail;
-				if ("joinKey".equals(head))
-					return "left_join_key" + tail;
-				if ("auction.id".equals(fieldName))
-					return "auction._id";
-				if ("auction.title".equals(fieldName))
-					return "auction.auction_title";
-			}
-			if (entityClass == ProductionLikeChild.class) {
-				if ("joinKey".equals(head))
-					return "right_join_key" + tail;
-				if ("status".equals(head))
-					return "child_status" + tail;
-			}
-			return fieldName;
-		}
-
-		@Override
-		public Document mapQuery(Class<?> entityClass, Document query) {
-			return convertIdQueryValues(MongoExecutionContext.super.mapQuery(entityClass, query));
-		}
-
-		@Override
 		public Object getNative() {
 			return nativeMarker;
 		}
@@ -970,38 +937,6 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 				throw new IllegalArgumentException("Left context cannot map " + entityClass.getName());
 			if (!left && entityClass != ProductionLikeChild.class)
 				throw new IllegalArgumentException("Right context cannot map " + entityClass.getName());
-		}
-
-		private static Document convertIdQueryValues(Document source) {
-			Document mapped = new Document();
-			source.forEach((key, value) -> {
-				if ("_id".equals(key) || key.endsWith("._id")) {
-					mapped.put(key, convertIdConditionValue(value));
-				} else if (("$and".equals(key) || "$or".equals(key) || "$nor".equals(key)) && value instanceof List<?> list) {
-					mapped.put(
-						key,
-						list.stream()
-							.map(item -> item instanceof Document document ? convertIdQueryValues(document) : item)
-							.toList()
-					);
-				} else {
-					mapped.put(key, value);
-				}
-			});
-			return mapped;
-		}
-
-		private static Object convertIdConditionValue(Object value) {
-			if (value instanceof String stringValue)
-				return toMongoId(stringValue);
-			if (value instanceof List<?> list)
-				return list.stream().map(ProductionLikeMongoExecutionContext::convertIdConditionValue).toList();
-			if (value instanceof Document document) {
-				Document mapped = new Document();
-				document.forEach((operator, nestedValue) -> mapped.put(operator, convertIdConditionValue(nestedValue)));
-				return mapped;
-			}
-			return value;
 		}
 
 		private static Object toMongoId(String id) {

@@ -18,6 +18,7 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.bson.Document;
+import org.bson.conversions.Bson;
 import org.reactivestreams.Publisher;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.ExecuteBuilder;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.CountAggregation;
@@ -28,19 +29,11 @@ import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuild
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllAggregation;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllExecute;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindExecute;
-import com.byeolnaerim.mongodsl.aggregation.MongoAggregationOptions;
 import com.byeolnaerim.mongodsl.criteria.FieldsPair;
-import com.byeolnaerim.mongodsl.criteria.MongoCriteriaSupport;
-import com.byeolnaerim.mongodsl.internal.aggregation.MongoAggregation;
-import com.byeolnaerim.mongodsl.internal.aggregation.MongoAggregationOperation;
-import com.byeolnaerim.mongodsl.internal.update.MongoAggregationUpdate;
-import com.byeolnaerim.mongodsl.internal.update.MongoUpdate;
-import com.byeolnaerim.mongodsl.internal.update.MongoUpdateDefinition;
+import com.byeolnaerim.mongodsl.criteria.FieldsPairBsonSupport;
+import com.byeolnaerim.mongodsl.internal.MongoBsonSupport;
+import com.byeolnaerim.mongodsl.internal.MongoFieldNameSupport;
 import com.byeolnaerim.mongodsl.lookup.LookupSpec;
-import com.byeolnaerim.mongodsl.query.MongoCriteria;
-import com.byeolnaerim.mongodsl.query.MongoQuery;
-import com.byeolnaerim.mongodsl.query.MongoSort;
-import com.byeolnaerim.mongodsl.query.MongoSort.Order;
 import com.byeolnaerim.mongodsl.result.PageResult;
 import com.byeolnaerim.mongodsl.result.PageStream;
 import com.byeolnaerim.mongodsl.result.ResultTuple;
@@ -64,13 +57,21 @@ import com.byeolnaerim.mongodsl.vector.VectorQueryVector;
 import com.byeolnaerim.mongodsl.vector.VectorTextQueryShape;
 import com.mongodb.ReadPreference;
 import com.mongodb.bulk.BulkWriteResult;
+import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.BulkWriteOptions;
+import com.mongodb.client.model.Projections;
+import com.mongodb.client.model.Sorts;
+import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.CountOptions;
+import com.mongodb.client.model.Facet;
 import com.mongodb.client.model.DeleteOneModel;
+import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.InsertOneModel;
 import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.model.UpdateOptions;
+import com.mongodb.client.model.UnwindOptions;
+import com.mongodb.client.model.Variable;
 import com.mongodb.client.model.WriteModel;
 import com.mongodb.client.result.DeleteResult;
 import com.mongodb.client.result.UpdateResult;
@@ -104,6 +105,7 @@ public class ReactiveMongoDsl<K> {
 
 	/**
 	 * Creates a new DSL instance using the given resolver and a default {@link ObjectMapper}.
+	 * The mapper is retained for source/API compatibility; history snapshots use the active Mongo execution context mapping.
 	 *
 	 * @param resolver
 	 *            the Mongo execution-context resolver
@@ -122,7 +124,7 @@ public class ReactiveMongoDsl<K> {
 	 * @param resolver
 	 *            the Mongo execution-context resolver
 	 * @param objectMapper
-	 *            the object mapper used by helper features such as history snapshot creation
+	 *            the object mapper retained for source/API compatibility with existing callers
 	 */
 	public ReactiveMongoDsl(
 							MongoTemplateResolver<K> resolver,
@@ -178,34 +180,280 @@ public class ReactiveMongoDsl<K> {
 					return Mono
 						.defer( supplier )
 						.contextWrite( context -> context.put( CLIENT_SESSION_CONTEXT_KEY, session ) )
-						.flatMap( value -> Mono.from( session.commitTransaction() ).thenReturn( value ) )
-						.switchIfEmpty( Mono.from( session.commitTransaction() ).then( Mono.empty() ) );
+						.flatMap( value -> commitTransaction( session ).thenReturn( value ) )
+						.switchIfEmpty( commitTransaction( session ).then( Mono.empty() ) );
 
 				},
 				session -> Mono.fromRunnable( session::close ),
-				(session, error) -> Mono
-					.from( session.abortTransaction() )
-					.onErrorResume( ignored -> Mono.empty() )
-					.then( Mono.fromRunnable( session::close ) ),
-				session -> Mono
-					.from( session.abortTransaction() )
-					.onErrorResume( ignored -> Mono.empty() )
-					.then( Mono.fromRunnable( session::close ) )
+				(session, error) -> abortTransactionIfActive( session ).then( Mono.fromRunnable( session::close ) ),
+				session -> abortTransactionIfActive( session ).then( Mono.fromRunnable( session::close ) )
 			);
 
 	}
 
+	private Mono<Void> commitTransaction(
+		ClientSession session
+	) {
+
+		return Mono.defer( () -> Mono.from( session.commitTransaction() ).then() );
+
+	}
+
+	private Mono<Void> abortTransactionIfActive(
+		ClientSession session
+	) {
+
+		return Mono
+			.defer( () -> session.hasActiveTransaction() ? Mono.from( session.abortTransaction() ).then() : Mono.empty() )
+			.onErrorResume( ignored -> Mono.empty() );
+
+	}
+
+
+	private static Document copyDocument(
+		Document source
+	) {
+
+		Document copy = new Document();
+		source.forEach( (key, value) -> copy.put( key, copyDocumentValue( value ) ) );
+		return copy;
+
+	}
+
+	private static Object copyDocumentValue(
+		Object value
+	) {
+
+		if (value instanceof Document document)
+			return copyDocument( document );
+		if (value instanceof Map<?, ?> map) {
+			Document copy = new Document();
+			map.forEach( (key, nestedValue) -> copy.put( String.valueOf( key ), copyDocumentValue( nestedValue ) ) );
+			return copy;
+
+		}
+		if (value instanceof Collection<?> collection)
+			return collection.stream().map( ReactiveMongoDsl::copyDocumentValue ).toList();
+		if (value instanceof byte[] bytes)
+			return bytes.clone();
+		if (value instanceof java.util.Date date)
+			return new java.util.Date( date.getTime() );
+		return value;
+
+	}
+
+	private static Object readDocumentPath(Document document, String path) {
+
+		Object current = document;
+		for (String segment : path.split("\\.")) {
+			if (!(current instanceof Document currentDocument))
+				return null;
+			current = currentDocument.get(segment);
+		}
+		return current;
+
+	}
+
+	private static void removeDocumentPath(Document document, String path) {
+
+		String[] segments = path.split("\\.");
+		Document current = document;
+		for (int i = 0; i < segments.length - 1; i++) {
+			Object nested = current.get(segments[i]);
+			if (!(nested instanceof Document nestedDocument))
+				return;
+			current = nestedDocument;
+		}
+		current.remove(segments[segments.length - 1]);
+
+	}
+
+	private static <T> List<T> readLookupValues(
+		MongoExecutionContext executionContext, Class<T> targetClass, Object rawValue
+	) {
+
+		if (rawValue instanceof Document document)
+			return List.of( executionContext.read( targetClass, document ) );
+		if (!(rawValue instanceof Collection<?> collection))
+			return List.of();
+		return collection
+			.stream()
+			.filter( Document.class::isInstance )
+			.map( Document.class::cast )
+			.map( document -> executionContext.read( targetClass, document ) )
+			.toList();
+
+	}
+
+	private static void appendLookupStages(
+		List<Bson> operations, String rightCollection, String rightAs, Optional<Bson> rightCriteria, LookupSpec spec
+	) {
+
+		List<Bson> pipeline = new ArrayList<>();
+		rightCriteria.ifPresent( criteria -> pipeline.add( Aggregates.match( criteria ) ) );
+
+		Document let = spec.getLetDoc() == null ? new Document() : new Document( spec.getLetDoc() );
+		if (spec.getLocalField() != null && spec.getForeignField() != null && (! pipeline.isEmpty() || ! let.isEmpty() || ! spec.getPipelineDocs().isEmpty())) {
+			String localVariable = "vlf";
+			let.put( localVariable, "$" + spec.getLocalField() );
+			pipeline.add(
+				new Document(
+					"$match",
+					new Document(
+						"$expr",
+						new Document( "$eq", List.of( "$" + spec.getForeignField(), "$$" + localVariable ) )
+					)
+				)
+			);
+		}
+
+		pipeline.addAll( spec.getPipelineDocs() );
+
+		if (spec.getLocalField() != null && spec.getForeignField() != null && pipeline.isEmpty() && let.isEmpty()) {
+			operations.add( Aggregates.lookup( rightCollection, spec.getLocalField(), spec.getForeignField(), rightAs ) );
+
+		} else if (let.isEmpty()) {
+			operations.add( Aggregates.lookup( rightCollection, pipeline, rightAs ) );
+
+		} else {
+			List<Variable<Object>> variables = let
+				.entrySet()
+				.stream()
+				.map( entry -> new Variable<Object>( entry.getKey(), entry.getValue() ) )
+				.toList();
+			operations.add( Aggregates.lookup( rightCollection, variables, pipeline, rightAs ) );
+
+		}
+
+		if (spec.isUnwind()) {
+			operations.add(
+				Aggregates.unwind(
+					"$" + rightAs,
+					new UnwindOptions().preserveNullAndEmptyArrays( spec.isPreserveNullAndEmptyArrays() )
+				)
+			);
+		}
+
+		operations.addAll( spec.getOuterStages() );
+	}
+
+	private static final class FindSpec {
+
+		private Bson filter = new Document();
+		private Bson sort;
+		private Bson projection;
+		private long skip;
+		private int limit;
+		private ReadPreference readPreference;
+		private Boolean allowDiskUse;
+		private Consumer<FindPublisher<Document>> customizer = ignored -> {};
+
+		FindSpec filter(Bson filter) {
+			this.filter = filter == null ? new Document() : filter;
+			return this;
+		}
+
+		FindSpec sort(Bson sort) {
+			this.sort = sort;
+			return this;
+		}
+
+		FindSpec projection(Bson projection) {
+			this.projection = projection;
+			return this;
+		}
+
+		FindSpec skip(long skip) {
+			this.skip = skip;
+			return this;
+		}
+
+		FindSpec limit(int limit) {
+			this.limit = limit;
+			return this;
+		}
+
+		FindSpec readPreference(ReadPreference readPreference) {
+			this.readPreference = readPreference;
+			return this;
+		}
+
+		FindSpec allowDiskUse(Boolean allowDiskUse) {
+			this.allowDiskUse = allowDiskUse;
+			return this;
+		}
+
+		FindSpec customize(Consumer<FindPublisher<Document>> customizer) {
+			if (customizer != null)
+				this.customizer = this.customizer.andThen(customizer);
+			return this;
+		}
+
+	}
+
+
+	private static final class AggregationSpec {
+
+		private final List<Bson> pipeline;
+		private ReadPreference readPreference;
+		private Boolean allowDiskUse;
+		private Consumer<AggregatePublisher<Document>> customizer = ignored -> {};
+
+		private AggregationSpec(List<? extends Bson> pipeline) {
+			this.pipeline = List.copyOf(pipeline);
+		}
+
+		AggregationSpec readPreference(ReadPreference readPreference) {
+			this.readPreference = readPreference;
+			return this;
+		}
+
+		AggregationSpec allowDiskUse(Boolean allowDiskUse) {
+			this.allowDiskUse = allowDiskUse;
+			return this;
+		}
+
+		AggregationSpec customize(Consumer<AggregatePublisher<Document>> customizer) {
+			if (customizer != null)
+				this.customizer = this.customizer.andThen(customizer);
+			return this;
+		}
+
+	}
+
+	private static final class UpdateSpec {
+
+		private final Bson update;
+		private final List<Bson> pipeline;
+
+		private UpdateSpec(Bson update, List<Bson> pipeline) {
+			this.update = update;
+			this.pipeline = pipeline;
+		}
+
+		static UpdateSpec document(Bson update) {
+			return new UpdateSpec(Objects.requireNonNull(update, "update must not be null"), List.of());
+		}
+
+		static UpdateSpec pipeline(List<? extends Bson> pipeline) {
+			return new UpdateSpec(null, List.copyOf(pipeline));
+		}
+
+		boolean isPipeline() {
+			return !pipeline.isEmpty();
+		}
+
+	}
 
 	private <T> Mono<T> executeWithSession(
 		Function<ClientSession, ? extends Publisher<T>> withSession, Supplier<? extends Publisher<T>> withoutSession
 	) {
 
-		return Mono
-			.deferContextual(
-				context -> context.hasKey( CLIENT_SESSION_CONTEXT_KEY )
-					? Mono.from( withSession.apply( context.get( CLIENT_SESSION_CONTEXT_KEY ) ) )
-					: Mono.from( withoutSession.get() )
-			);
+		return Mono.deferContextual(
+			context -> context.hasKey(CLIENT_SESSION_CONTEXT_KEY)
+				? Mono.from(withSession.apply(context.get(CLIENT_SESSION_CONTEXT_KEY)))
+				: Mono.from(withoutSession.get())
+		);
 
 	}
 
@@ -213,12 +461,11 @@ public class ReactiveMongoDsl<K> {
 		Function<ClientSession, ? extends Publisher<T>> withSession, Supplier<? extends Publisher<T>> withoutSession
 	) {
 
-		return Flux
-			.deferContextual(
-				context -> context.hasKey( CLIENT_SESSION_CONTEXT_KEY )
-					? Flux.from( withSession.apply( context.get( CLIENT_SESSION_CONTEXT_KEY ) ) )
-					: Flux.from( withoutSession.get() )
-			);
+		return Flux.deferContextual(
+			context -> context.hasKey(CLIENT_SESSION_CONTEXT_KEY)
+				? Flux.from(withSession.apply(context.get(CLIENT_SESSION_CONTEXT_KEY)))
+				: Flux.from(withoutSession.get())
+		);
 
 	}
 
@@ -226,122 +473,116 @@ public class ReactiveMongoDsl<K> {
 		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName
 	) {
 
-		return executionContext
-			.getDatabase()
-			.map(
-				database -> database
-					.getCollection(
-						explicitCollectionName != null && ! explicitCollectionName.isBlank()
-							? explicitCollectionName
-							: executionContext.getCollectionName( entityClass )
-					)
-			);
+		return executionContext.getDatabase().map(
+			database -> database.getCollection(
+				explicitCollectionName != null && !explicitCollectionName.isBlank()
+					? explicitCollectionName
+					: executionContext.getCollectionName(entityClass)
+			)
+		);
 
 	}
 
 	private FindPublisher<Document> applyQuery(
-		MongoExecutionContext executionContext, Class<?> entityClass, MongoCollection<Document> collection, MongoQuery query, ClientSession session
+		MongoCollection<Document> collection, FindSpec query, ClientSession session
 	) {
 
-		MongoCollection<Document> target = query.readPreference() == null
+		MongoCollection<Document> target = query.readPreference == null
 			? collection
-			: collection.withReadPreference( query.readPreference() );
-		Document filter = executionContext.mapQuery( entityClass, query.filter() );
+			: collection.withReadPreference(query.readPreference);
 		FindPublisher<Document> publisher = session == null
-			? target.find( filter )
-			: target.find( session, filter );
+			? target.find(query.filter)
+			: target.find(session, query.filter);
 
-		if (query.sort() != null && query.sort().isSorted())
-			publisher = publisher.sort( executionContext.mapSort( entityClass, query.sort().toDocument() ) );
-		if (! query.projection().isEmpty())
-			publisher = publisher.projection( executionContext.mapProjection( entityClass, query.projection() ) );
-		if (query.skip() > 0)
-			publisher = publisher.skip( Math.toIntExact( query.skip() ) );
-		if (query.limit() > 0)
-			publisher = publisher.limit( query.limit() );
-		if (query.allowDiskUse() != null)
-			publisher = publisher.allowDiskUse( query.allowDiskUse() );
-
+		if (query.sort != null)
+			publisher = publisher.sort(query.sort);
+		if (query.projection != null)
+			publisher = publisher.projection(query.projection);
+		if (query.skip > 0)
+			publisher = publisher.skip(Math.toIntExact(query.skip));
+		if (query.limit > 0)
+			publisher = publisher.limit(query.limit);
+		if (query.allowDiskUse != null)
+			publisher = publisher.allowDiskUse(query.allowDiskUse);
+		query.customizer.accept(publisher);
 		return publisher;
 
 	}
 
 	private <T> Flux<T> find(
-		MongoExecutionContext executionContext, Class<T> entityClass, String explicitCollectionName, MongoQuery query
+		MongoExecutionContext executionContext, Class<T> entityClass, String explicitCollectionName, FindSpec query
 	) {
 
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+		return resolveCollection(executionContext, entityClass, explicitCollectionName)
 			.flatMapMany(
 				collection -> executeFluxWithSession(
-					session -> applyQuery( executionContext, entityClass, collection, query, session ),
-					() -> applyQuery( executionContext, entityClass, collection, query, null )
+					session -> applyQuery(collection, query, session),
+					() -> applyQuery(collection, query, null)
 				)
 			)
-			.map( document -> executionContext.read( entityClass, document ) );
+			.map(document -> executionContext.read(entityClass, document));
 
 	}
 
 	private <T> Mono<T> findOne(
-		MongoExecutionContext executionContext, Class<T> entityClass, String explicitCollectionName, MongoQuery query
+		MongoExecutionContext executionContext, Class<T> entityClass, String explicitCollectionName, FindSpec query
 	) {
 
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+		return resolveCollection(executionContext, entityClass, explicitCollectionName)
 			.flatMap(
 				collection -> executeWithSession(
-					session -> applyQuery( executionContext, entityClass, collection, query, session ).first(),
-					() -> applyQuery( executionContext, entityClass, collection, query, null ).first()
+					session -> applyQuery(collection, query, session).first(),
+					() -> applyQuery(collection, query, null).first()
 				)
 			)
-			.map( document -> executionContext.read( entityClass, document ) );
+			.map(document -> executionContext.read(entityClass, document));
 
 	}
 
 	private AggregatePublisher<Document> applyAggregation(
-		MongoExecutionContext executionContext, Class<?> entityClass, MongoCollection<Document> collection, MongoAggregation aggregation, ClientSession session
+		MongoCollection<Document> collection, AggregationSpec aggregation, ClientSession session
 	) {
 
-		MongoAggregationOptions options = aggregation.options();
-		MongoCollection<Document> target = options.readPreference() == null
+		MongoCollection<Document> target = aggregation.readPreference == null
 			? collection
-			: collection.withReadPreference( options.readPreference() );
-		List<Document> pipeline = executionContext.mapAggregationPipeline( entityClass, aggregation.pipeline() );
+			: collection.withReadPreference(aggregation.readPreference);
 		AggregatePublisher<Document> publisher = session == null
-			? target.aggregate( pipeline )
-			: target.aggregate( session, pipeline );
-
-		if (options.allowDiskUse() != null)
-			publisher = publisher.allowDiskUse( options.allowDiskUse() );
-		if (options.batchSize() != null)
-			publisher = publisher.batchSize( options.batchSize() );
-		if (options.maxTimeMillis() != null)
-			publisher = publisher.maxTime( options.maxTimeMillis(), java.util.concurrent.TimeUnit.MILLISECONDS );
-		if (options.comment() != null)
-			publisher = publisher.comment( options.comment() );
-
+			? target.aggregate(aggregation.pipeline)
+			: target.aggregate(session, aggregation.pipeline);
+		if (aggregation.allowDiskUse != null)
+			publisher = publisher.allowDiskUse(aggregation.allowDiskUse);
+		aggregation.customizer.accept(publisher);
 		return publisher;
 
 	}
 
 	private Flux<Document> aggregateDocuments(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, MongoAggregation aggregation
+		MongoExecutionContext executionContext,
+		Class<?> entityClass,
+		String explicitCollectionName,
+		AggregationSpec aggregation
 	) {
 
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+		return resolveCollection(executionContext, entityClass, explicitCollectionName)
 			.flatMapMany(
 				collection -> executeFluxWithSession(
-					session -> applyAggregation( executionContext, entityClass, collection, aggregation, session ),
-					() -> applyAggregation( executionContext, entityClass, collection, aggregation, null )
+					session -> applyAggregation(collection, aggregation, session),
+					() -> applyAggregation(collection, aggregation, null)
 				)
 			);
 
 	}
 
 	private <T> Flux<T> aggregate(
-		MongoExecutionContext executionContext, Class<?> sourceClass, String explicitCollectionName, MongoAggregation aggregation, Class<T> targetClass
+		MongoExecutionContext executionContext,
+		Class<?> sourceClass,
+		String explicitCollectionName,
+		AggregationSpec aggregation,
+		Class<T> targetClass
 	) {
 
-		return aggregateDocuments( executionContext, sourceClass, explicitCollectionName, aggregation )
-			.map( document -> executionContext.read( targetClass, document ) );
+		return aggregateDocuments(executionContext, sourceClass, explicitCollectionName, aggregation)
+			.map(document -> executionContext.read(targetClass, document));
 
 	}
 
@@ -349,30 +590,23 @@ public class ReactiveMongoDsl<K> {
 		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, T entity
 	) {
 
-		Document document = executionContext.write( entity );
-		Object id = executionContext.getId( entity );
-
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
-			.flatMap( collection -> {
-
-				if (id == null) {
-					return executeWithSession(
-						session -> collection.insertOne( session, document ),
-						() -> collection.insertOne( document )
-					).doOnSuccess( ignored -> {
-						if (document.get( "_id" ) != null)
-							executionContext.setId( entity, document.get( "_id" ) );
-
-					} ).thenReturn( entity );
-
-				}
-
+		Document document = executionContext.write(entity);
+		Object id = executionContext.getId(entity);
+		return resolveCollection(executionContext, entityClass, explicitCollectionName).flatMap(collection -> {
+			if (id == null) {
 				return executeWithSession(
-					session -> collection.replaceOne( session, new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) ),
-					() -> collection.replaceOne( new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) )
-				).thenReturn( entity );
-
-			} );
+					session -> collection.insertOne(session, document),
+					() -> collection.insertOne(document)
+				).doOnSuccess(ignored -> {
+					if (document.get("_id") != null)
+						executionContext.setId(entity, document.get("_id"));
+				}).thenReturn(entity);
+			}
+			return executeWithSession(
+				session -> collection.replaceOne(session, new Document("_id", id), document, new ReplaceOptions().upsert(true)),
+				() -> collection.replaceOne(new Document("_id", id), document, new ReplaceOptions().upsert(true))
+			).thenReturn(entity);
+		});
 
 	}
 
@@ -382,26 +616,22 @@ public class ReactiveMongoDsl<K> {
 
 		if (entities.isEmpty())
 			return Flux.empty();
-
-		List<Document> documents = entities.stream().map( executionContext::write ).toList();
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+		List<Document> documents = entities.stream().map(executionContext::write).toList();
+		return resolveCollection(executionContext, entityClass, explicitCollectionName)
 			.flatMap(
 				collection -> executeWithSession(
-					session -> collection.insertMany( session, documents ),
-					() -> collection.insertMany( documents )
+					session -> collection.insertMany(session, documents),
+					() -> collection.insertMany(documents)
 				)
 			)
-			.doOnSuccess( ignored -> {
-
+			.doOnSuccess(ignored -> {
 				for (int i = 0; i < entities.size(); i++) {
-					Object generatedId = documents.get( i ).get( "_id" );
-					if (generatedId != null && executionContext.getId( entities.get( i ) ) == null)
-						executionContext.setId( entities.get( i ), generatedId );
-
+					Object generatedId = documents.get(i).get("_id");
+					if (generatedId != null && executionContext.getId(entities.get(i)) == null)
+						executionContext.setId(entities.get(i), generatedId);
 				}
-
-			} )
-			.thenMany( Flux.fromIterable( entities ) );
+			})
+			.thenMany(Flux.fromIterable(entities));
 
 	}
 
@@ -411,11 +641,11 @@ public class ReactiveMongoDsl<K> {
 
 		if (documents.isEmpty())
 			return Mono.empty();
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+		return resolveCollection(executionContext, entityClass, explicitCollectionName)
 			.flatMap(
 				collection -> executeWithSession(
-					session -> collection.insertMany( session, documents ),
-					() -> collection.insertMany( documents )
+					session -> collection.insertMany(session, documents),
+					() -> collection.insertMany(documents)
 				)
 			)
 			.then();
@@ -423,123 +653,115 @@ public class ReactiveMongoDsl<K> {
 	}
 
 	private Mono<BulkWriteResult> bulkWrite(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<? extends WriteModel<Document>> writes
+		MongoExecutionContext executionContext,
+		Class<?> entityClass,
+		String explicitCollectionName,
+		List<? extends WriteModel<Document>> writes
 	) {
 
 		if (writes.isEmpty())
 			return Mono.empty();
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+		return resolveCollection(executionContext, entityClass, explicitCollectionName)
 			.flatMap(
 				collection -> executeWithSession(
-					session -> collection.bulkWrite( session, writes, new BulkWriteOptions().ordered( false ) ),
-					() -> collection.bulkWrite( writes, new BulkWriteOptions().ordered( false ) )
+					session -> collection.bulkWrite(session, writes, new BulkWriteOptions().ordered(false)),
+					() -> collection.bulkWrite(writes, new BulkWriteOptions().ordered(false))
 				)
 			);
 
 	}
 
 	private Mono<DeleteResult> deleteByFilter(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, Document filter, boolean many
+		MongoExecutionContext executionContext,
+		Class<?> entityClass,
+		String explicitCollectionName,
+		Bson filter,
+		boolean many
 	) {
 
-		Document mappedFilter = executionContext.mapQuery( entityClass, filter );
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+		return resolveCollection(executionContext, entityClass, explicitCollectionName)
 			.flatMap(
 				collection -> executeWithSession(
-					session -> many ? collection.deleteMany( session, mappedFilter ) : collection.deleteOne( session, mappedFilter ),
-					() -> many ? collection.deleteMany( mappedFilter ) : collection.deleteOne( mappedFilter )
+					session -> many ? collection.deleteMany(session, filter) : collection.deleteOne(session, filter),
+					() -> many ? collection.deleteMany(filter) : collection.deleteOne(filter)
 				)
 			);
 
 	}
 
 	private Mono<Long> count(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, MongoQuery query
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, FindSpec query
 	) {
 
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
-			.flatMap( collection -> {
-				MongoCollection<Document> target = query.readPreference() == null
-					? collection
-					: collection.withReadPreference( query.readPreference() );
-				CountOptions options = new CountOptions();
-
-				if (query.skip() > 0)
-					options.skip( Math.toIntExact( query.skip() ) );
-				if (query.limit() > 0)
-					options.limit( query.limit() );
-
-				Document filter = executionContext.mapQuery( entityClass, query.filter() );
-				return executeWithSession(
-					session -> target.countDocuments( session, filter, options ),
-					() -> target.countDocuments( filter, options )
-				);
-
-			} );
+		return resolveCollection(executionContext, entityClass, explicitCollectionName).flatMap(collection -> {
+			MongoCollection<Document> target = query.readPreference == null
+				? collection
+				: collection.withReadPreference(query.readPreference);
+			CountOptions options = new CountOptions();
+			if (query.skip > 0)
+				options.skip(Math.toIntExact(query.skip));
+			if (query.limit > 0)
+				options.limit(query.limit);
+			return executeWithSession(
+				session -> target.countDocuments(session, query.filter, options),
+				() -> target.countDocuments(query.filter, options)
+			);
+		});
 
 	}
 
 	private Mono<Boolean> exists(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, MongoQuery query
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, FindSpec query
 	) {
 
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+		query.limit(1);
+		return resolveCollection(executionContext, entityClass, explicitCollectionName)
 			.flatMap(
 				collection -> executeWithSession(
-					session -> applyQuery( executionContext, entityClass, collection, query.limit( 1 ), session ).first(),
-					() -> applyQuery( executionContext, entityClass, collection, query.limit( 1 ), null ).first()
+					session -> applyQuery(collection, query, session).first(),
+					() -> applyQuery(collection, query, null).first()
 				).hasElement()
 			);
 
 	}
 
 	private Mono<UpdateResult> update(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, MongoQuery query, MongoUpdateDefinition updateDefinition, boolean multi, boolean upsert
+		MongoExecutionContext executionContext,
+		Class<?> entityClass,
+		String explicitCollectionName,
+		Bson filter,
+		UpdateSpec updateSpec,
+		boolean multi,
+		boolean upsert
 	) {
 
-		Document filter = executionContext.mapQuery( entityClass, query.filter() );
-		Document updateDocument = updateDefinition.isPipeline()
-			? new Document()
-			: executionContext.mapUpdate( entityClass, updateDefinition.document() );
-		List<Document> updatePipeline = updateDefinition.isPipeline()
-			? executionContext.mapUpdatePipeline( entityClass, updateDefinition.pipeline() )
-			: List.of();
-
-		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+		return resolveCollection(executionContext, entityClass, explicitCollectionName)
 			.flatMap(
 				collection -> executeWithSession(
 					session -> {
-						UpdateOptions options = new UpdateOptions().upsert( upsert );
-
-						if (updateDefinition.isPipeline()) {
-							return multi
-								? collection.updateMany( session, filter, updatePipeline, options )
-								: collection.updateOne( session, filter, updatePipeline, options );
-
-						}
-
+					UpdateOptions options = new UpdateOptions().upsert(upsert);
+					if (updateSpec.isPipeline()) {
 						return multi
-							? collection.updateMany( session, filter, updateDocument, options )
-							: collection.updateOne( session, filter, updateDocument, options );
-
-					},
-					() -> {
-						UpdateOptions options = new UpdateOptions().upsert( upsert );
-
-						if (updateDefinition.isPipeline()) {
-							return multi
-								? collection.updateMany( filter, updatePipeline, options )
-								: collection.updateOne( filter, updatePipeline, options );
-
-						}
-
-						return multi
-							? collection.updateMany( filter, updateDocument, options )
-							: collection.updateOne( filter, updateDocument, options );
-
+							? collection.updateMany(session, filter, updateSpec.pipeline, options)
+							: collection.updateOne(session, filter, updateSpec.pipeline, options);
 					}
-				)
-			);
+					return multi
+						? collection.updateMany(session, filter, updateSpec.update, options)
+						: collection.updateOne(session, filter, updateSpec.update, options);
+				},
+				() -> {
+					UpdateOptions options = new UpdateOptions().upsert(upsert);
+					if (updateSpec.isPipeline()) {
+						return multi
+							? collection.updateMany(filter, updateSpec.pipeline, options)
+							: collection.updateOne(filter, updateSpec.pipeline, options);
+					}
+					return multi
+						? collection.updateMany(filter, updateSpec.update, options)
+						: collection.updateOne(filter, updateSpec.update, options);
+				}
+			)
+		);
 
 	}
 
@@ -560,7 +782,7 @@ public class ReactiveMongoDsl<K> {
 
 		LogicalOperator operator;
 
-		List<MongoCriteria> criteriaList;
+		List<Bson> criteriaList;
 
 		CriteriaGroup(
 						LogicalOperator operator
@@ -588,8 +810,6 @@ public class ReactiveMongoDsl<K> {
 
 
 		protected MongoExecutionContext mongoExecutionContext;
-
-		// protected Mono<MongoQuery> queryMono;
 
 		protected Mono<Class<E>> executeClassMono;
 
@@ -758,96 +978,63 @@ public class ReactiveMongoDsl<K> {
 				.filter( Objects::nonNull )
 				.map( String::trim )
 				.filter( value -> ! value.isBlank() )
+				.map( MongoFieldNameSupport::toMongoField )
 				.toArray( String[]::new );
 			if (keys.length == 0)
 				return Mono.error( new IllegalArgumentException( "keyFieldName must contain at least 1 non-blank field" ) );
 
-			Class<?> entityClass = entities.iterator().next().getClass();
-			Field[] keyFields = new Field[keys.length];
-
-			try {
-
-				for (int i = 0; i < keys.length; i++) {
-					keyFields[i] = entityClass.getDeclaredField( keys[i] );
-					keyFields[i].setAccessible( true );
-
-				}
-
-			} catch (NoSuchFieldException e) {
-				return Mono.error( new IllegalArgumentException( "No field in " + entityClass.getName() + ": " + e.getMessage(), e ) );
-
-			}
-
-			try {
+			return executeClassMono.flatMap( entityClass -> {
 				List<WriteModel<Document>> writes = new ArrayList<>();
 
 				for (E entity : entities) {
+					Document document = mongoExecutionContext.write( entity );
 					Document keyDocument = new Document();
 					boolean missingKey = false;
 
-					for (int i = 0; i < keys.length; i++) {
-						Object value = keyFields[i].get( entity );
-
+					for (String key : keys) {
+						Object value = readDocumentPath( document, key );
 						if (value == null) {
 							missingKey = true;
 							break;
-
 						}
-
-						keyDocument.append( keys[i], value );
-
+						keyDocument.append( key, value );
 					}
-
-					Document document = mongoExecutionContext.write( entity );
 
 					if (missingKey) {
 						writes.add( new InsertOneModel<>( document ) );
 						continue;
-
 					}
 
-					keyDocument = mongoExecutionContext.mapQuery( entityClass, keyDocument );
 					document.remove( "_id" );
 					for (String key : keys)
-						document.remove( mongoExecutionContext.getMappedFieldName( entityClass, key ) );
+						removeDocumentPath( document, key );
 
 					Document updateDocument = new Document( "$setOnInsert", new Document( keyDocument ) );
 					if (! document.isEmpty())
 						updateDocument.append( "$set", document );
 
-					writes
-						.add(
-							new UpdateOneModel<>(
-								keyDocument,
-								updateDocument,
-								new UpdateOptions().upsert( true )
-							)
-						);
-
+					writes.add(
+						new UpdateOneModel<>(
+							keyDocument,
+							updateDocument,
+							new UpdateOptions().upsert( true )
+						)
+					);
 				}
 
 				return bulkWrite( mongoExecutionContext, entityClass, collectionName, writes );
-
-			} catch (IllegalAccessException e) {
-				return Mono.error( new RuntimeException( "Failed to access key field(s)", e ) );
-
-			} finally {
-
-				for (Field field : keyFields) {
-					if (field != null)
-						field.setAccessible( false );
-
-				}
-
-			}
+			} );
 
 		}
+
 
 		private String resolveRemoveCollectionName(
 			Class<?> clazz
 		) {
 
-			return mongoExecutionContext.getCollectionName( clazz ) + "_remove";
+			return (collectionName != null && ! collectionName.isBlank()
+				? collectionName
+				: mongoExecutionContext.getCollectionName( clazz )) + "_remove";
 
 		}
 
@@ -969,22 +1156,6 @@ public class ReactiveMongoDsl<K> {
 
 		}
 
-		@SuppressWarnings("unchecked")
-		private E deepClone(
-			E e, ObjectMapper objectMapper
-		) {
-
-			try {
-				String json = objectMapper.writeValueAsString( e );
-				return (E) objectMapper.readValue( json, e.getClass() );
-
-			} catch (Exception ex) {
-				throw new RuntimeException( "Failed to clone entity for history", ex );
-
-			}
-
-		}
-
 		public Mono<Void> createHistory(
 			E e
 		) {
@@ -1014,16 +1185,20 @@ public class ReactiveMongoDsl<K> {
 		) {
 
 			Objects.requireNonNull( e, "entity must not be null" );
+			Objects.requireNonNull( objectMapper, "objectMapper must not be null" );
 			String suffix = prefix == null || prefix.isBlank()
 				? "history"
 				: (prefix.charAt( 0 ) == '_' ? prefix.substring( 1 ) : prefix);
 			Class<?> entityClass = e.getClass();
-			Document snapshot = mongoExecutionContext.write( deepClone( e, objectMapper ) );
+			Document snapshot = copyDocument( mongoExecutionContext.write( e ) );
 			snapshot.remove( "_id" );
+			String sourceCollection = collectionName != null && ! collectionName.isBlank()
+				? collectionName
+				: mongoExecutionContext.getCollectionName( entityClass );
 			return insertDocuments(
 				mongoExecutionContext,
 				entityClass,
-				mongoExecutionContext.getCollectionName( entityClass ) + "_" + suffix,
+				sourceCollection + "_" + suffix,
 				List.of( snapshot )
 			);
 
@@ -1301,7 +1476,7 @@ public class ReactiveMongoDsl<K> {
 				for (String k : keys) {
 					if (k == null || k.isBlank())
 						continue;
-					keyFields.add( k );
+					keyFields.add( MongoFieldNameSupport.toMongoField( k ) );
 
 				}
 
@@ -1354,7 +1529,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$sum", "$" + field ) );
+				accumulators.put( as, new Document( "$sum", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 				hasAccumulator = true;
 				return this;
 
@@ -1374,7 +1549,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$avg", "$" + field ) );
+				accumulators.put( as, new Document( "$avg", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 				hasAccumulator = true;
 				return this;
 
@@ -1394,7 +1569,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$min", "$" + field ) );
+				accumulators.put( as, new Document( "$min", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 				hasAccumulator = true;
 				return this;
 
@@ -1414,7 +1589,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$max", "$" + field ) );
+				accumulators.put( as, new Document( "$max", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 				hasAccumulator = true;
 				return this;
 
@@ -1434,7 +1609,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$addToSet", "$" + field ) );
+				accumulators.put( as, new Document( "$addToSet", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 				hasAccumulator = true;
 				return this;
 
@@ -1454,7 +1629,7 @@ public class ReactiveMongoDsl<K> {
 				String field, String as
 			) {
 
-				accumulators.put( as, new Document( "$push", "$" + field ) );
+				accumulators.put( as, new Document( "$push", "$" + MongoFieldNameSupport.toMongoField( field ) ) );
 				hasAccumulator = true;
 				return this;
 
@@ -1467,7 +1642,7 @@ public class ReactiveMongoDsl<K> {
 			 */
 			public Mono<Map<KK, V>> execute() {
 
-				return buildAndRun( null, null );
+				return buildAndRun( null );
 
 			}
 
@@ -1489,13 +1664,13 @@ public class ReactiveMongoDsl<K> {
 
 				Objects.requireNonNull( rightBuilder, "rightBuilder is required" );
 				Objects.requireNonNull( spec, "LookupSpec is required" );
-				return buildAndRun( new LookupCtx<>( rightBuilder, spec ), null );
+				return buildAndRun( new LookupCtx<>( rightBuilder, spec ) );
 
 			}
 
 			// 내부: 파이프라인 구성/실행
 			private <R2> Mono<Map<KK, V>> buildAndRun(
-				LookupCtx<R2> lookup, MongoSort dummy
+				LookupCtx<R2> lookup
 			) {
 
 				if (keyFields.isEmpty())
@@ -1508,71 +1683,28 @@ public class ReactiveMongoDsl<K> {
 				return Mono
 					.zip( fieldBuilder.buildCriteria(), leftClassMono )
 					.flatMap( tuple -> {
-						Optional<MongoCriteria> leftMatch = tuple.getT1();
+						Optional<Bson> leftMatch = tuple.getT1();
 						Class<E> leftClass = tuple.getT2();
 
 						String leftColl = (collectionName != null && ! collectionName.isBlank())
 							? collectionName
 							: mongoExecutionContext.getCollectionName( leftClass );
 
-						List<MongoAggregationOperation> ops = new ArrayList<>();
-						leftMatch.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
+						List<Bson> ops = new ArrayList<>();
+						leftMatch.ifPresent( c -> ops.add( Aggregates.match( c ) ) );
 
-						Mono<List<MongoAggregationOperation>> opsMono = (lookup == null)
+						Mono<List<Bson>> opsMono = (lookup == null)
 							? Mono.just( ops )
-							: lookup.rightClass().map( rightClass -> {
+							: Mono.zip( lookup.rightClass(), lookup.rightBuilder.getFieldBuilderCriteria() ).map( rightTuple -> {
+								Class<R2> rightClass = rightTuple.getT1();
 								String rightColl = (lookup.rightCollectionName() != null && ! lookup.rightCollectionName().isBlank())
 									? lookup.rightCollectionName()
 									: lookup.rightBuilder.getMongoExecutionContext().getCollectionName( rightClass );
-
-								String rightAs = (lookup.spec.getAs() != null && ! lookup.spec.getAs().isBlank())
+								String rightAs = lookup.spec.getAs() != null && ! lookup.spec.getAs().isBlank()
 									? lookup.spec.getAs()
 									: rightClass.getSimpleName();
-
-								Document lk = new Document( "from", rightColl ).append( "as", rightAs );
-
-								if (lookup.spec.getLocalField() != null && lookup.spec.getForeignField() != null) {
-									lk
-										.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, lookup.spec.getLocalField() ) )
-										.append( "foreignField", lookup.rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, lookup.spec.getForeignField() ) );
-
-								} else {
-									lk
-										.append( "let", Optional.ofNullable( lookup.spec.getLetDoc() ).orElseGet( Document::new ) )
-										.append(
-											"pipeline",
-											lookup.rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
-												rightClass, Optional.ofNullable( lookup.spec.getPipelineDocs() ).orElseGet( List::of )
-											)
-										);
-
-								}
-
-								ops.add( ctx -> new Document( "$lookup", lk ) );
-
-								if (lookup.spec.isUnwind()) {
-									ops
-										.add(
-											ctx -> new Document(
-												"$unwind",
-												new Document( "path", "$" + rightAs )
-													.append( "preserveNullAndEmptyArrays", lookup.spec.isPreserveNullAndEmptyArrays() )
-											)
-										);
-
-								}
-
-								if (lookup.spec.getOuterStages() != null) {
-
-									for (Document st : lookup.spec.getOuterStages()) {
-										ops.add( ctx -> st );
-
-									}
-
-								}
-
+								appendLookupStages( ops, rightColl, rightAs, rightTuple.getT2(), lookup.spec );
 								return ops;
-
 							} );
 
 						return opsMono.flatMap( opList -> {
@@ -1591,11 +1723,11 @@ public class ReactiveMongoDsl<K> {
 							Document groupBody = new Document( "_id", groupId );
 							for (String as : accumulators.keySet())
 								groupBody.append( as, accumulators.get( as ) );
-							opList.add( ctx -> new Document( "$group", groupBody ) );
+							opList.add( new Document( "$group", groupBody ) );
 
-							MongoAggregation agg = accessor.applyAggOptions( MongoAggregation.newAggregation( opList ) );
+							AggregationSpec aggregation = accessor.applyAggOptions( opList );
 
-							Flux<Document> flux = aggregateDocuments( mongoExecutionContext, leftClass, leftColl, agg );
+							Flux<Document> flux = aggregateDocuments( mongoExecutionContext, leftClass, leftColl, aggregation );
 
 							return flux.collect( LinkedHashMap::new, (LinkedHashMap<KK, V> map, Document d) -> {
 								KK key = this.keyConverter.apply( d );
@@ -1659,86 +1791,65 @@ public class ReactiveMongoDsl<K> {
 
 			protected Boolean isAllowDiskUse = null;
 
-			protected Consumer<MongoQuery> queryCustomizer = q -> {};
+			protected Consumer<FindPublisher<Document>> queryCustomizer = ignored -> {};
 
-			protected Consumer<MongoAggregationOptions.Builder> aggOptionsCustomizer = b -> {};
+			protected Consumer<AggregatePublisher<Document>> aggregationCustomizer = ignored -> {};
 
 			public interface Runner {}
 
+			/** Applies a MongoDB driver FindPublisher customization directly. */
 			@SuppressWarnings("unchecked")
 			public final Q customizeQuery(
-				Consumer<MongoQuery> c
+				Consumer<FindPublisher<Document>> customizer
 			) {
 
-				if (c != null)
-					this.queryCustomizer = this.queryCustomizer.andThen( c );
+				if (customizer != null)
+					this.queryCustomizer = this.queryCustomizer.andThen( customizer );
 				return (Q) this;
 
 			}
 
+			/** Applies a MongoDB driver AggregatePublisher customization directly. */
 			@SuppressWarnings("unchecked")
 			public final A customizeAggregation(
-				Consumer<MongoAggregationOptions.Builder> c
+				Consumer<AggregatePublisher<Document>> customizer
 			) {
 
-				if (c != null)
-					this.aggOptionsCustomizer = this.aggOptionsCustomizer.andThen( c );
+				if (customizer != null)
+					this.aggregationCustomizer = this.aggregationCustomizer.andThen( customizer );
 				return (A) this;
 
 			}
 
-
-			public QueryBuilderAccesser<Q, A> readPreference(
-				ReadPreference rp
-			) {
+			public QueryBuilderAccesser<Q, A> readPreference( ReadPreference rp ) {
 
 				this.readPreference = rp;
 				return this;
 
 			}
 
-			public QueryBuilderAccesser<Q, A> isAllowDiskUse(
-				Boolean allow
-			) {
+			public QueryBuilderAccesser<Q, A> isAllowDiskUse( Boolean allow ) {
 
 				this.isAllowDiskUse = allow;
 				return this;
 
 			}
 
-			protected MongoAggregation applyAggOptions(
-				MongoAggregation agg
-			) {
+			protected AggregationSpec applyAggOptions( List<? extends Bson> pipeline ) {
 
-				MongoAggregationOptions.Builder b = MongoAggregationOptions.builder();
-
-				if (isAllowDiskUse != null)
-					b.allowDiskUse( isAllowDiskUse );
-				if (readPreference != null)
-					b.readPreference( readPreference );
-
-				aggOptionsCustomizer.accept( b );
-
-				return agg.withOptions( b.build() );
+				return new AggregationSpec( pipeline )
+					.readPreference( readPreference )
+					.allowDiskUse( isAllowDiskUse )
+					.customize( aggregationCustomizer );
 
 			}
 
+			protected FindSpec applyQueryOptions( FindSpec query ) {
 
-			protected MongoQuery applyQueryOptions(
-				MongoQuery q
-			) {
-
-				if (readPreference != null)
-					q.withReadPreference( readPreference );
-
-				if (isAllowDiskUse != null) {
-					q.allowDiskUse( isAllowDiskUse );
-
-					// 또는 query.diskUse(isAllowDiskUse ? DiskUse.ALLOW : DiskUse.DISALLOW);
-				}
-
-				queryCustomizer.accept( q );
-				return q;
+				return query
+					.readPreference( readPreference )
+					.allowDiskUse( isAllowDiskUse )
+					.customize( queryCustomizer );
 
 			}
 
@@ -1769,11 +1880,11 @@ public class ReactiveMongoDsl<K> {
 
 			protected MongoExecutionContext getMongoExecutionContext() { return AbstractQueryBuilder.this.mongoExecutionContext; }
 
-		protected Mono<Class<E>> getExecuteClassMono() { return executeClassMono; }
+			protected Mono<Class<E>> getExecuteClassMono() { return executeClassMono; }
 
 			protected String getCollectionName() { return collectionName; }
 
-			protected Mono<Optional<MongoCriteria>> getFieldBuilderCriteria() { return fieldBuilder.buildCriteria(); }
+			protected Mono<Optional<Bson>> getFieldBuilderCriteria() { return fieldBuilder.buildCriteria(); }
 
 
 			public interface FindAllExecute<E> extends Runner {
@@ -1928,7 +2039,7 @@ public class ReactiveMongoDsl<K> {
 					for (FieldsPair<?, ?> pair : fieldsPairs) {
 
 						if (pair != null) {
-							MongoCriteria criteria = MongoCriteriaSupport.createSingleCriteria( pair );
+							Bson criteria = FieldsPairBsonSupport.createSingleCriteria( pair );
 
 							if (criteria != null) {
 								criteriaStack.peek().criteriaList.add( criteria );
@@ -2092,23 +2203,23 @@ public class ReactiveMongoDsl<K> {
 				if (criteriaStack.size() <= 1) { return this; }
 
 				CriteriaGroup finishedGroup = criteriaStack.pop();
-				List<MongoCriteria> validCriteria = finishedGroup.criteriaList
+				List<Bson> validCriteria = finishedGroup.criteriaList
 					.stream()
 					.filter( Objects::nonNull )
 					.collect( Collectors.toList() );
 
 				if (! validCriteria.isEmpty()) {
-					MongoCriteria groupCriteria;
+					Bson groupCriteria;
 
 					switch (finishedGroup.operator) {
 						case AND:
-							groupCriteria = new MongoCriteria().andOperator( validCriteria );
+							groupCriteria = FieldsPairBsonSupport.combine( validCriteria, "AND" );
 							break;
 						case OR:
-							groupCriteria = new MongoCriteria().orOperator( validCriteria );
+							groupCriteria = FieldsPairBsonSupport.combine( validCriteria, "OR" );
 							break;
 						case NOR:
-							groupCriteria = new MongoCriteria().norOperator( validCriteria );
+							groupCriteria = FieldsPairBsonSupport.combine( validCriteria, "NOR" );
 							break;
 						default:
 							throw new IllegalArgumentException( "Unsupported operator: " + finishedGroup.operator );
@@ -2140,27 +2251,27 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			private Mono<Optional<MongoCriteria>> buildCriteria() {
+			private Mono<Optional<Bson>> buildCriteria() {
 
-				Mono<Optional<MongoCriteria>> resultMono = Mono.fromCallable( () -> {
-					List<MongoCriteria> allCriteria = new ArrayList<>();
+				Mono<Optional<Bson>> resultMono = Mono.fromCallable( () -> {
+					List<Bson> allCriteria = new ArrayList<>();
 					Deque<CriteriaGroup> tempStack = new ArrayDeque<>( criteriaStack );
 
 					while (! tempStack.isEmpty()) {
 						CriteriaGroup group = tempStack.pop();
 
 						if (! group.criteriaList.isEmpty()) {
-							MongoCriteria combined = null;
+							Bson combined = null;
 
 							switch (group.operator) {
 								case AND:
-									combined = new MongoCriteria().andOperator( group.criteriaList );
+									combined = FieldsPairBsonSupport.combine( group.criteriaList, "AND" );
 									break;
 								case OR:
-									combined = new MongoCriteria().orOperator( group.criteriaList );
+									combined = FieldsPairBsonSupport.combine( group.criteriaList, "OR" );
 									break;
 								case NOR:
-									combined = new MongoCriteria().norOperator( group.criteriaList );
+									combined = FieldsPairBsonSupport.combine( group.criteriaList, "NOR" );
 									break;
 
 							}
@@ -2178,11 +2289,11 @@ public class ReactiveMongoDsl<K> {
 
 					if (allCriteria.size() == 1) { return Optional.of( allCriteria.get( 0 ) ); }
 
-					return Optional.of( new MongoCriteria().andOperator( allCriteria ) );
+					return Optional.of( FieldsPairBsonSupport.combine( allCriteria, "AND" ) );
 
 				} );
 				return resultMono;
-				// .onErrorMap( e -> new RuntimeException( "Failed to build MongoCriteria: " + e.getMessage(), e )
+				// .onErrorMap( e -> new RuntimeException( "Failed to build MongoDB filter: " + e.getMessage(), e )
 				// );
 
 
@@ -2501,7 +2612,7 @@ public class ReactiveMongoDsl<K> {
 				String... excludes
 			) {
 
-				this.excludes = excludes;
+				this.excludes = MongoFieldNameSupport.toMongoFields( excludes );
 				return this;
 
 			}
@@ -3206,21 +3317,13 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			private MongoCriteria buildScoreMatchCriteria() {
+			private Bson buildScoreMatchCriteria() {
 
-				MongoCriteria criteria = MongoCriteria.where( "score" );
-
-				if (this.scoreGte != null) {
-					criteria.gte( this.scoreGte );
-
-				}
-
-				if (this.scoreLte != null) {
-					criteria.lte( this.scoreLte );
-
-				}
-
-				return criteria;
+				if (this.scoreGte != null && this.scoreLte != null)
+					return new Document( "score", new Document( "$gte", this.scoreGte ).append( "$lte", this.scoreLte ) );
+				if (this.scoreGte != null)
+					return Filters.gte( "score", this.scoreGte );
+				return Filters.lte( "score", this.scoreLte );
 
 			}
 
@@ -3280,15 +3383,15 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @return the aggregation operations
 			 */
-			private List<MongoAggregationOperation> buildAggregationOps(
-				Optional<MongoCriteria> postCriteria, boolean includePaging, boolean includeProjection, boolean includeCount, boolean includeMetaAdds
+			private List<Bson> buildAggregationOps(
+				Optional<Bson> postCriteria, boolean includePaging, boolean includeProjection, boolean includeCount, boolean includeMetaAdds
 			) {
 
-				List<MongoAggregationOperation> ops = new ArrayList<>();
+				List<Bson> ops = new ArrayList<>();
 
-				ops.add( ctx -> new Document( "$search", buildSearchStageBody( includeCount ) ) );
+				ops.add( new Document( "$search", buildSearchStageBody( includeCount ) ) );
 
-				postCriteria.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
+				postCriteria.ifPresent( c -> ops.add( Aggregates.match( c ) ) );
 
 				if ((includeMetaAdds && ! this.addFieldsDocs.isEmpty()) || hasScoreMatch()) {
 					Document addFields = new Document();
@@ -3311,23 +3414,23 @@ public class ReactiveMongoDsl<K> {
 
 					}
 
-					ops.add( ctx -> new Document( "$addFields", addFields ) );
+					ops.add( new Document( "$addFields", addFields ) );
 
 				}
 
 				if (hasScoreMatch()) {
-					ops.add( MongoAggregation.match( buildScoreMatchCriteria() ) );
+					ops.add( Aggregates.match( buildScoreMatchCriteria() ) );
 
 				}
 
 				if (includePaging && this.pageNumber != null && this.pageSize != null) {
-					ops.add( MongoAggregation.skip( (long) this.pageNumber * this.pageSize ) );
-					ops.add( MongoAggregation.limit( this.pageSize ) );
+					ops.add( Aggregates.skip( Math.toIntExact( (long) this.pageNumber * this.pageSize ) ) );
+					ops.add( Aggregates.limit( this.pageSize ) );
 
 				}
 
 				if (includeProjection && this.excludes != null && this.excludes.length > 0) {
-					ops.add( MongoAggregation.project().andExclude( this.excludes ) );
+					ops.add( Aggregates.project( Projections.exclude( this.excludes ) ) );
 
 				}
 
@@ -3347,12 +3450,12 @@ public class ReactiveMongoDsl<K> {
 			 * @return the raw aggregation result stream
 			 */
 			private Flux<Document> aggregateDocuments(
-				Class<?> entityClass, List<MongoAggregationOperation> ops
+				Class<?> entityClass, List<Bson> ops
 			) {
 
-				MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
-
-				return ReactiveMongoDsl.this.aggregateDocuments( mongoExecutionContext, entityClass, collectionName, agg );
+				return ReactiveMongoDsl.this.aggregateDocuments(
+					mongoExecutionContext, entityClass, collectionName, applyAggOptions( ops )
+				);
 
 			}
 
@@ -3775,8 +3878,8 @@ public class ReactiveMongoDsl<K> {
 						.zip( executeClassMono, postFilterBuilder.buildCriteria() )
 						.flatMapMany( tuple -> {
 							Class<E> entityClass = tuple.getT1();
-							Optional<MongoCriteria> criteriaOpt = tuple.getT2();
-							List<MongoAggregationOperation> ops = buildAggregationOps(
+							Optional<Bson> criteriaOpt = tuple.getT2();
+							List<Bson> ops = buildAggregationOps(
 								criteriaOpt,
 								true,
 								true,
@@ -3881,9 +3984,9 @@ public class ReactiveMongoDsl<K> {
 						.zip( executeClassMono, postFilterBuilder.buildCriteria() )
 						.flatMap( tuple -> {
 							Class<E> entityClass = tuple.getT1();
-							Optional<MongoCriteria> criteriaOpt = tuple.getT2();
+							Optional<Bson> criteriaOpt = tuple.getT2();
 
-							List<MongoAggregationOperation> ops = buildAggregationOps(
+							List<Bson> ops = buildAggregationOps(
 								criteriaOpt,
 								false,
 								false,
@@ -3891,7 +3994,7 @@ public class ReactiveMongoDsl<K> {
 								false
 							);
 
-							ops.add( ctx -> new Document( "$count", "count" ) );
+							ops.add( Aggregates.count( "count" ) );
 
 							return aggregateDocuments( entityClass, ops )
 								.next()
@@ -3919,11 +4022,9 @@ public class ReactiveMongoDsl<K> {
 
 					return executeClassMono.flatMap( entityClass -> {
 						Document body = buildSearchMetaStageBody( countType );
-						MongoAggregation agg = applyAggOptions(
-							MongoAggregation.newAggregation( ctx -> new Document( "$searchMeta", body ) )
-						);
+						AggregationSpec aggregation = applyAggOptions( List.of( new Document( "$searchMeta", body ) ) );
 
-						Flux<Document> docs = ReactiveMongoDsl.this.aggregateDocuments( mongoExecutionContext, entityClass, collectionName, agg );
+						Flux<Document> docs = ReactiveMongoDsl.this.aggregateDocuments( mongoExecutionContext, entityClass, collectionName, aggregation );
 
 						return docs
 							.next()
@@ -4334,7 +4435,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Adds Mongo MongoQuery Language pre-filters that are rendered into the
+			 * Adds MongoDB Query Language pre-filters that are rendered into the
 			 * {@code filter} field inside {@code $vectorSearch}.
 			 *
 			 * @param fieldsPairs
@@ -4352,7 +4453,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Adds Mongo MongoQuery Language pre-filters that are rendered into the
+			 * Adds MongoDB Query Language pre-filters that are rendered into the
 			 * {@code filter} field inside {@code $vectorSearch}.
 			 *
 			 * @param fieldsPairs
@@ -4475,7 +4576,7 @@ public class ReactiveMongoDsl<K> {
 				String... excludes
 			) {
 
-				this.excludes = excludes;
+				this.excludes = MongoFieldNameSupport.toMongoFields( excludes );
 				return this;
 
 			}
@@ -4582,7 +4683,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			private Document buildVectorSearchStageBody(
-				Optional<MongoCriteria> preFilterCriteria
+				Optional<Bson> preFilterCriteria
 			) {
 
 				validateVectorSearchBody();
@@ -4624,21 +4725,21 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				preFilterCriteria.ifPresent( criteria -> body.append( "filter", criteria.getCriteriaObject() ) );
+				preFilterCriteria.ifPresent( criteria -> body.append( "filter", MongoBsonSupport.toDocument( criteria ) ) );
 
 				return body;
 
 			}
 
-			private List<MongoAggregationOperation> buildAggregationOps(
-				Optional<MongoCriteria> preFilterCriteria, Optional<MongoCriteria> postFilterCriteria, boolean includeProjection, boolean includeMetaAdds
+			private List<Bson> buildAggregationOps(
+				Optional<Bson> preFilterCriteria, Optional<Bson> postFilterCriteria, boolean includeProjection, boolean includeMetaAdds
 			) {
 
-				List<MongoAggregationOperation> ops = new ArrayList<>();
+				List<Bson> ops = new ArrayList<>();
 
-				ops.add( ctx -> new Document( "$vectorSearch", buildVectorSearchStageBody( preFilterCriteria ) ) );
+				ops.add( new Document( "$vectorSearch", buildVectorSearchStageBody( preFilterCriteria ) ) );
 
-				postFilterCriteria.ifPresent( criteria -> ops.add( MongoAggregation.match( criteria ) ) );
+				postFilterCriteria.ifPresent( criteria -> ops.add( Aggregates.match( criteria ) ) );
 
 				if (includeMetaAdds && ! this.addFieldsDocs.isEmpty()) {
 					Document addFields = new Document();
@@ -4652,12 +4753,12 @@ public class ReactiveMongoDsl<K> {
 
 					}
 
-					ops.add( ctx -> new Document( "$addFields", addFields ) );
+					ops.add( new Document( "$addFields", addFields ) );
 
 				}
 
 				if (includeProjection && this.excludes != null && this.excludes.length > 0) {
-					ops.add( MongoAggregation.project().andExclude( this.excludes ) );
+					ops.add( Aggregates.project( Projections.exclude( this.excludes ) ) );
 
 				}
 
@@ -4666,12 +4767,12 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			private Flux<Document> aggregateDocuments(
-				Class<?> entityClass, List<MongoAggregationOperation> ops
+				Class<?> entityClass, List<Bson> ops
 			) {
 
-				MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
-
-				return ReactiveMongoDsl.this.aggregateDocuments( mongoExecutionContext, entityClass, collectionName, agg );
+				return ReactiveMongoDsl.this.aggregateDocuments(
+					mongoExecutionContext, entityClass, collectionName, applyAggOptions( ops )
+				);
 
 			}
 
@@ -4695,9 +4796,9 @@ public class ReactiveMongoDsl<K> {
 						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
 						.flatMapMany( tuple -> {
 							Class<E> entityClass = tuple.getT1();
-							Optional<MongoCriteria> preCriteria = tuple.getT2();
-							Optional<MongoCriteria> postCriteria = tuple.getT3();
-							List<MongoAggregationOperation> ops = buildAggregationOps( preCriteria, postCriteria, true, true );
+							Optional<Bson> preCriteria = tuple.getT2();
+							Optional<Bson> postCriteria = tuple.getT3();
+							List<Bson> ops = buildAggregationOps( preCriteria, postCriteria, true, true );
 							return aggregateDocuments( entityClass, ops )
 								.map( doc -> mongoExecutionContext.read( entityClass, doc ) );
 
@@ -4755,11 +4856,11 @@ public class ReactiveMongoDsl<K> {
 						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
 						.flatMap( tuple -> {
 							Class<E> entityClass = tuple.getT1();
-							Optional<MongoCriteria> preCriteria = tuple.getT2();
-							Optional<MongoCriteria> postCriteria = tuple.getT3();
+							Optional<Bson> preCriteria = tuple.getT2();
+							Optional<Bson> postCriteria = tuple.getT3();
 
-							List<MongoAggregationOperation> ops = buildAggregationOps( preCriteria, postCriteria, false, false );
-							ops.add( ctx -> new Document( "$count", "count" ) );
+							List<Bson> ops = buildAggregationOps( preCriteria, postCriteria, false, false );
+							ops.add( Aggregates.count( "count" ) );
 
 							return aggregateDocuments( entityClass, ops )
 								.next()
@@ -4805,7 +4906,7 @@ public class ReactiveMongoDsl<K> {
 
 			private Paging paging;
 
-			private MongoSort sort = MongoSort.unsorted();
+			private Bson sort;
 
 			private String[] excludes = null;
 
@@ -4847,29 +4948,17 @@ public class ReactiveMongoDsl<K> {
 			 * 
 			 * @return this builder
 			 */
-			public FindAllQueryBuilder<S> sorts(
-				Order... sorts
-			) {
+			public FindAllQueryBuilder<S> sort( Bson sort ) {
 
-				this.sort = MongoSort.by( sorts );
+				this.sort = sort;
 				return this;
 
 			}
 
-			/**
-			 * Applies the given sort orders to the query.
-			 *
-			 * @param sorts
-			 *            the sort orders
-			 * 
-			 * @return this builder
-			 */
-			public FindAllQueryBuilder<S> sorts(
-				Collection<Order> sorts
-			) {
+			/** Alias kept for fluent-call compatibility; pass a MongoDB driver sort Bson. */
+			public FindAllQueryBuilder<S> sorts( Bson sort ) {
 
-				this.sort = MongoSort.by( sorts.toArray( Order[]::new ) );
-				return this;
+				return sort( sort );
 
 			}
 
@@ -4885,7 +4974,7 @@ public class ReactiveMongoDsl<K> {
 				String... excludes
 			) {
 
-				this.excludes = excludes;
+				this.excludes = MongoFieldNameSupport.toMongoFields( excludes );
 				return this;
 
 			}
@@ -4902,7 +4991,7 @@ public class ReactiveMongoDsl<K> {
 				Collection<String> excludes
 			) {
 
-				this.excludes = excludes.toArray( String[]::new );
+				this.excludes = MongoFieldNameSupport.toMongoFields( excludes.toArray( String[]::new ) );
 				return this;
 
 			}
@@ -5017,55 +5106,25 @@ public class ReactiveMongoDsl<K> {
 			@Override
 			public Flux<E> execute() {
 
-				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					MongoQuery query = new MongoQuery();
+				Mono<FindSpec> queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
+					FindSpec query = new FindSpec().filter( criteriaOptional.orElseGet( Document::new ) );
 
-					if (criteriaOptional.isPresent()) {
-						query.addCriteria( criteriaOptional.get() );
-
-					}
-
-					if (paging != null) {
+					if (paging != null)
 						query.skip( (long) paging.pageNumber * paging.pageSize ).limit( paging.pageSize );
+					if (sort != null)
+						query.sort( sort );
+					if (excludes != null && excludes.length > 0)
+						query.projection( Projections.exclude( excludes ) );
 
-					}
-
-					query.with( this.sort );
-
-					if (excludes != null && excludes.length != 0) {
-						query.fields().exclude( excludes );
-						// query.fields().slice( collectionName, 0 );
-
-					}
-
-					applyQueryOptions( query );
-
-					if (excludes != null && excludes.length > 0) {
-						var fields = query.fields();
-						Arrays
-							.stream( excludes )
-							.filter( s -> s != null && ! s.isBlank() )
-							.forEach( fields::exclude );
-
-					}
-
-					return query;
-
+					return applyQueryOptions( query );
 				} );
-				Flux<E> result = Mono
-					.zip( executeClassMono, queryMono )
-					.flatMapMany( tuple -> {
-						var entityClass = tuple.getT1();
-						var query = tuple.getT2();
-						Flux<? extends E> queryResult = find( mongoExecutionContext, entityClass, collectionName, query );
-						return queryResult;
 
-					} );
-
-				return result;
-				// .onErrorMap( e -> new RuntimeException( "Failed to find with : " + e.getMessage(), e ) );
+				return Mono.zip( executeClassMono, queryMono ).flatMapMany( tuple ->
+					find( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() )
+				);
 
 			}
+
 
 			/**
 			 * Executes the current query as a reactive page. Unlike {@link PageResult},
@@ -5086,32 +5145,24 @@ public class ReactiveMongoDsl<K> {
 			 * This deliberately avoids {@code $facet} so documents can be emitted as
 			 * the cursor produces them.
 			 */
-			private List<MongoAggregationOperation> buildFindAllAggregationOps(
-				Optional<MongoCriteria> criteriaOptional, boolean includePaging, boolean includeProjection
+			private List<Bson> buildFindAllAggregationOps(
+				Optional<Bson> criteriaOptional, boolean includePaging, boolean includeProjection
 			) {
 
-				List<MongoAggregationOperation> operations = new ArrayList<>();
+				List<Bson> operations = new ArrayList<>();
 
-				criteriaOptional.ifPresent( criteria -> operations.add( MongoAggregation.match( criteria ) ) );
+				criteriaOptional.ifPresent( criteria -> operations.add( Aggregates.match( criteria ) ) );
 
-				operations
-					.add(
-						MongoAggregation
-							.sort(
-								(this.sort != null && this.sort.isSorted())
-									? this.sort
-									: MongoSort.by( MongoSort.Direction.DESC, "_id" )
-							)
-					);
+				operations.add( Aggregates.sort( this.sort != null ? this.sort : Sorts.descending( "_id" ) ) );
 
 				if (includePaging && paging != null) {
-					operations.add( MongoAggregation.skip( (long) paging.pageNumber * paging.pageSize ) );
-					operations.add( MongoAggregation.limit( paging.pageSize ) );
+					operations.add( Aggregates.skip( Math.toIntExact( (long) paging.pageNumber * paging.pageSize ) ) );
+					operations.add( Aggregates.limit( paging.pageSize ) );
 
 				}
 
 				if (includeProjection && excludes != null && excludes.length != 0) {
-					operations.add( MongoAggregation.project().andExclude( excludes ) );
+					operations.add( Aggregates.project( Projections.exclude( excludes ) ) );
 
 				}
 
@@ -5129,19 +5180,13 @@ public class ReactiveMongoDsl<K> {
 			@Override
 			public Flux<E> executeAggregationStream() {
 
-				Mono<MongoAggregation> aggregationMono = fieldBuilder
+				Mono<AggregationSpec> aggregationMono = fieldBuilder
 					.buildCriteria()
-					.map( criteriaOptional -> applyAggOptions( MongoAggregation.newAggregation( buildFindAllAggregationOps( criteriaOptional, true, true ) ) ) );
+					.map( criteriaOptional -> applyAggOptions( buildFindAllAggregationOps( criteriaOptional, true, true ) ) );
 
-				return Mono
-					.zip( executeClassMono, aggregationMono )
-					.flatMapMany( tuple -> {
-						Class<E> entityClass = tuple.getT1();
-						MongoAggregation aggregation = tuple.getT2();
-
-						return aggregate( mongoExecutionContext, entityClass, collectionName, aggregation, entityClass );
-
-					} );
+				return Mono.zip( executeClassMono, aggregationMono ).flatMapMany( tuple ->
+					aggregate( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2(), tuple.getT1() )
+				);
 
 			}
 
@@ -5191,188 +5236,58 @@ public class ReactiveMongoDsl<K> {
 				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 			) {
 
-				// 왼쪽/오른쪽 클래스, 컬렉션명 결정
 				Mono<Class<E>> leftClassMono = executeClassMono;
 				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
 
-
-				Mono<MongoAggregation> aggMono = Mono
-					.zip(
-						fieldBuilder.buildCriteria(), // 왼쪽 match
-						rightBuilder.getFieldBuilderCriteria(),
-						leftClassMono,
-						rightClassMono
-					)
+				Mono<AggregationSpec> aggregationMono = Mono
+					.zip( fieldBuilder.buildCriteria(), rightBuilder.getFieldBuilderCriteria(), leftClassMono, rightClassMono )
 					.map( tuple -> {
-						Optional<MongoCriteria> leftCriteriaOpt = tuple.getT1();
-						Optional<MongoCriteria> rightCriteriaOpt = tuple.getT2();
+						Optional<Bson> leftCriteria = tuple.getT1();
+						Optional<Bson> rightCriteria = tuple.getT2();
 						Class<E> leftClass = tuple.getT3();
 						Class<R2> rightClass = tuple.getT4();
-
-						// String leftCollection = (collectionName != null && ! collectionName.isBlank())
-						// ? collectionName
-						// : resolveCollectionName( leftClass );
-
-						String rightCollection = (rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank())
+						String rightCollection = rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank()
 							? rightBuilder.getCollectionName()
 							: rightBuilder.resolveCollectionName( rightClass );
-
+						String rightAs = spec.getAs() != null && ! spec.getAs().isBlank() ? spec.getAs() : simpleName( rightClass );
 						String leftKey = simpleName( leftClass );
-						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
 						String rightKey = simpleName( rightClass );
 
-						List<MongoAggregationOperation> ops = new ArrayList<>();
-						leftCriteriaOpt.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
+						List<Bson> operations = new ArrayList<>();
+						leftCriteria.ifPresent( criteria -> operations.add( Aggregates.match( criteria ) ) );
+						appendLookupStages( operations, rightCollection, rightAs, rightCriteria, spec );
+						operations.add( Aggregates.sort( sort != null ? sort : Sorts.descending( "_id" ) ) );
 
-						// $lookup 구성
-						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
+						if (paging != null) {
+							operations.add( Aggregates.skip( Math.toIntExact( (long) paging.pageNumber * paging.pageSize ) ) );
+							operations.add( Aggregates.limit( paging.pageSize ) );
+						}
 
-						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
-							rightClass, Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of )
+						operations.add(
+							new Document(
+								"$project",
+								new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs )
+							)
 						);
-						List<Document> nonLimitStages = new ArrayList<>();
-						List<Document> limitStages = new ArrayList<>();
 
-						for (Document st : userStages) {
-							if (st.containsKey( "$limit" ))
-								limitStages.add( st );
-							else
-								nonLimitStages.add( st );
+						return applyAggOptions( operations );
+					} );
 
-						}
+				return Mono.zip( leftClassMono, rightClassMono, aggregationMono ).flatMapMany( tuple -> {
+					Class<E> leftClass = tuple.getT1();
+					Class<R2> rightClass = tuple.getT2();
+					String leftKey = simpleName( leftClass );
+					String rightKey = simpleName( rightClass );
 
-						boolean needPipeline = (spec.getLocalField() == null || spec.getForeignField() == null) // 원래 pipeline 모드
-							|| rightCriteriaOpt.isPresent() // 오른쪽 추가 필터 있음
-							|| ! nonLimitStages.isEmpty() || ! limitStages.isEmpty(); // 사용자가 넣은 stage 있음
-
-						if (! needPipeline) {
-							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
-							lookupBody
-								.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) )
-								.append( "foreignField", rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ) );
-
-						} else {
-							List<Document> pipe = new ArrayList<>();
-
-							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rightBuilder.getMongoExecutionContext().mapQuery( rightClass, rc.getCriteriaObject() ) ) ) );
-
-							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
-							if (spec.getLocalField() != null && spec.getForeignField() != null) {
-								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lookupBody.append( "let", new Document( lfVar, "$" + mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) ) );
-								pipe
-									.add(
-										new Document(
-											"$match",
-											new Document(
-												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ), "$$" + lfVar ) )
-											)
-										)
-									);
-
-							} else {
-								// let 그대로 유지 (없으면 빈 Document)
-								lookupBody.append( "let", Optional.ofNullable( spec.getLetDoc() ).orElseGet( Document::new ) );
-
-							}
-
-							boolean onlyProjects = ! nonLimitStages.isEmpty() && nonLimitStages.stream().allMatch( st -> st.containsKey( "$project" ) );
-
-							if (onlyProjects) {
-								// EXISTS 최적화: limit → project (후보를 1건으로 줄인 다음 project)
-								pipe.addAll( limitStages );
-								pipe.addAll( nonLimitStages );
-
-							} else {
-								// 일반 케이스: 기존 순서 유지
-								pipe.addAll( nonLimitStages );
-								pipe.addAll( limitStages );
-
-							}
-
-							lookupBody.append( "pipeline", pipe );
-
-						}
-
-						MongoAggregationOperation lookupOp = (ctx) -> new Document( "$lookup", lookupBody );
-						ops.add( lookupOp );
-
-						if (spec.isUnwind()) {
-							Document unwind = new Document(
-								"$unwind",
-								new Document( "path", "$" + rightAs )
-									.append( "preserveNullAndEmptyArrays", spec.isPreserveNullAndEmptyArrays() )
+					return aggregateDocuments( mongoExecutionContext, leftClass, collectionName, tuple.getT3() )
+						.map( document -> {
+							E leftValue = mongoExecutionContext.read( leftClass, document.get( leftKey, Document.class ) );
+							List<R2> rightValues = readLookupValues(
+								rightBuilder.getMongoExecutionContext(), rightClass, document.get( rightKey )
 							);
-							ops.add( ctx -> unwind );
-
-						}
-
-						if (spec.getOuterStages() != null && ! spec.getOuterStages().isEmpty()) {
-
-							for (Document st : spec.getOuterStages()) {
-								ops.add( ctx -> st );
-
-							}
-
-						}
-
-						// 정렬/페이징(왼쪽 기준) 유지
-						ops.add( MongoAggregation.sort( (this.sort != null && this.sort.isSorted()) ? this.sort : MongoSort.by( MongoSort.Direction.DESC, "_id" ) ) );
-
-						if (this.paging != null) {
-							ops.add( MongoAggregation.skip( (long) this.paging.pageNumber * this.paging.pageSize ) );
-							ops.add( MongoAggregation.limit( this.paging.pageSize ) );
-
-						}
-
-						// 결과 모양: { LeftName: $$ROOT, RightName: $<rightAs> }
-						Document project = new Document(
-							"$project",
-							new Document()
-								.append( leftKey, "$$ROOT" )
-								.append( rightKey, "$" + rightAs )
-						);
-						ops.add( ctx -> project );
-
-						MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
-
-						return agg;
-
-					} );
-
-				return Mono
-					.zip( leftClassMono, rightClassMono, aggMono )
-					.flatMapMany( tuple -> {
-						Class<E> leftClass = tuple.getT1();
-						Class<R2> rightClass = tuple.getT2();
-						MongoAggregation agg = tuple.getT3();
-
-						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, leftClass, collectionName, agg );
-
-						String leftKey = simpleName( leftClass );
-						String rightKey = simpleName( rightClass );
-
-						return docs.map( d -> {
-							@SuppressWarnings("unchecked")
-							S leftVal = (S) mongoExecutionContext.read( leftClass, (Document) d.get( leftKey ) );
-
-							@SuppressWarnings("unchecked")
-							List<Document> rightArr = (List<Document>) d.get( rightKey );
-
-							List<R2> rightVal = (rightArr == null) ? List.of()
-								: rightArr
-									.stream()
-									.map( x -> rightBuilder.getMongoExecutionContext().read( rightClass, x ) )
-									.collect( Collectors.toList() );
-
-							return new ResultTuple<>( leftKey, leftVal, rightKey, rightVal );
-
+							return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues );
 						} );
-
-					} );
+				} );
 
 			}
 
@@ -5396,230 +5311,61 @@ public class ReactiveMongoDsl<K> {
 
 				Mono<Class<E>> leftClassMono = executeClassMono;
 				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
-				// rightBuilder
-				return Mono
-					.zip(
-						fieldBuilder.buildCriteria(), // 왼쪽 match
-						rightBuilder.getFieldBuilderCriteria(),
-						leftClassMono,
-						rightClassMono
-					)
+
+				return Mono.zip( fieldBuilder.buildCriteria(), rightBuilder.getFieldBuilderCriteria(), leftClassMono, rightClassMono )
 					.flatMap( tuple -> {
-						Optional<MongoCriteria> leftCriteriaOpt = tuple.getT1();
-						Optional<MongoCriteria> rightCriteriaOpt = tuple.getT2();
+						Optional<Bson> leftCriteria = tuple.getT1();
+						Optional<Bson> rightCriteria = tuple.getT2();
 						Class<E> leftClass = tuple.getT3();
 						Class<R2> rightClass = tuple.getT4();
-
-						String leftCollection = (collectionName != null && ! collectionName.isBlank())
-							? collectionName
-							: resolveCollectionName( leftClass );
-
-						String rightCollection = (rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank())
+						String rightCollection = rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank()
 							? rightBuilder.getCollectionName()
 							: rightBuilder.resolveCollectionName( rightClass );
-
+						String rightAs = spec.getAs() != null && ! spec.getAs().isBlank() ? spec.getAs() : simpleName( rightClass );
 						String leftKey = simpleName( leftClass );
-						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
 						String rightKey = simpleName( rightClass );
 
-						// ===== 공통 스테이지 빌드 =====
-						List<MongoAggregationOperation> common = new ArrayList<>();
-						leftCriteriaOpt.ifPresent( c -> common.add( MongoAggregation.match( c ) ) );
+						List<Bson> common = new ArrayList<>();
+						leftCriteria.ifPresent( criteria -> common.add( Aggregates.match( criteria ) ) );
+						appendLookupStages( common, rightCollection, rightAs, rightCriteria, spec );
 
-						// $lookup
-						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
-
-						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
-							rightClass, Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of )
-						);
-						List<Document> nonLimitStages = new ArrayList<>();
-						List<Document> limitStages = new ArrayList<>();
-
-						for (Document st : userStages) {
-							if (st.containsKey( "$limit" ))
-								limitStages.add( st );
-							else
-								nonLimitStages.add( st );
-
+						List<Bson> data = new ArrayList<>( common );
+						data.add( Aggregates.sort( sort != null ? sort : Sorts.descending( "_id" ) ) );
+						if (paging != null) {
+							data.add( Aggregates.skip( Math.toIntExact( (long) paging.pageNumber * paging.pageSize ) ) );
+							data.add( Aggregates.limit( paging.pageSize ) );
 						}
+						data.add( new Document( "$project", new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs ) ) );
 
-						boolean needPipeline = (spec.getLocalField() == null || spec.getForeignField() == null) // 원래 pipeline 모드
-							|| rightCriteriaOpt.isPresent() // 오른쪽 추가 필터 있음
-							|| ! nonLimitStages.isEmpty() || ! limitStages.isEmpty(); // 사용자가 넣은 stage 있음
+						List<Bson> countPipeline = new ArrayList<>( common );
+						countPipeline.add( Aggregates.count( "totalCount" ) );
 
-						if (! needPipeline) {
-							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
-							lookupBody
-								.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) )
-								.append( "foreignField", rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ) );
-
-						} else {
-							List<Document> pipe = new ArrayList<>();
-
-							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rightBuilder.getMongoExecutionContext().mapQuery( rightClass, rc.getCriteriaObject() ) ) ) );
-
-							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
-							if (spec.getLocalField() != null && spec.getForeignField() != null) {
-								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lookupBody.append( "let", new Document( lfVar, "$" + mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) ) );
-								pipe
-									.add(
-										new Document(
-											"$match",
-											new Document(
-												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ), "$$" + lfVar ) )
-											)
-										)
-									);
-
-							} else {
-								// let 그대로 유지 (없으면 빈 Document)
-								lookupBody.append( "let", Optional.ofNullable( spec.getLetDoc() ).orElseGet( Document::new ) );
-
-							}
-
-							boolean onlyProjects = ! nonLimitStages.isEmpty() && nonLimitStages.stream().allMatch( st -> st.containsKey( "$project" ) );
-
-							if (onlyProjects) {
-								// EXISTS 최적화: limit → project (후보를 1건으로 줄인 다음 project)
-								pipe.addAll( limitStages );
-								pipe.addAll( nonLimitStages );
-
-							} else {
-								// 일반 케이스: 기존 순서 유지
-								pipe.addAll( nonLimitStages );
-								pipe.addAll( limitStages );
-
-							}
-
-							lookupBody.append( "pipeline", pipe );
-
-						}
-
-						MongoAggregationOperation lookupOp = (ctx) -> new Document( "$lookup", lookupBody );
-						common.add( lookupOp );
-
-						if (spec.isUnwind()) {
-							Document unwind = new Document(
-								"$unwind",
-								new Document( "path", "$" + rightAs )
-									.append( "preserveNullAndEmptyArrays", spec.isPreserveNullAndEmptyArrays() )
-							);
-							common.add( ctx -> unwind );
-
-						}
-
-						if (spec.getOuterStages() != null && ! spec.getOuterStages().isEmpty()) {
-
-							for (Document st : spec.getOuterStages()) {
-								common.add( ctx -> st );
-
-							}
-
-						}
-
-						// ===== data 서브파이프라인 =====
-						List<MongoAggregationOperation> dataOps = new ArrayList<>( common );
-						dataOps
-							.add(
-								MongoAggregation
-									.sort(
-										(this.sort != null && this.sort.isSorted()) ? this.sort : MongoSort.by( MongoSort.Direction.DESC, "_id" )
-									)
-							);
-
-						if (this.paging != null) {
-							dataOps.add( MongoAggregation.skip( (long) this.paging.pageNumber * this.paging.pageSize ) );
-							dataOps.add( MongoAggregation.limit( this.paging.pageSize ) );
-
-						}
-
-						// 프로젝트: { LeftName: $$ROOT, RightName: $<rightAs> }
-						Document project = new Document(
-							"$project",
-							new Document()
-								.append( leftKey, "$$ROOT" )
-								.append( rightKey, "$" + rightAs )
-						);
-						dataOps.add( ctx -> project );
-
-						// ===== count 서브파이프라인 (isCounitng == true일 때만) =====
-						List<MongoAggregationOperation> countOps = new ArrayList<>( common );
-						// 정렬/페이징/프로젝션 없이, 동일 조건 기준으로 개수만 집계
-						countOps.add( MongoAggregation.count().as( "totalCount" ) );
-
-
-						// ===== $facet 구성 =====
-						MongoAggregationOperation facetOp = MongoAggregation
-							.facet( dataOps.toArray( new MongoAggregationOperation[0] ) )
-							.as( "data" )
-							.and( countOps.toArray( new MongoAggregationOperation[0] ) )
-							.as( "count" );
-
-						MongoAggregation agg = applyAggOptions(
-							MongoAggregation
-								.newAggregation( facetOp )
+						Bson facet = Aggregates.facet(
+							new Facet( "data", data ),
+							new Facet( "count", countPipeline )
 						);
 
-
-						Mono<Document> facetDocMono = aggregateDocuments( mongoExecutionContext, leftClass, leftCollection, agg ).next(); // $facet 결과는 1문서
-
-						return facetDocMono.flatMap( facetDoc -> {
-							@SuppressWarnings("unchecked")
-							List<Document> dataArr = (List<Document>) facetDoc.getOrDefault( "data", List.of() );
-
-							// data 매핑
-							List<ResultTuple<E, List<R2>>> data = dataArr.stream().map( d -> {
+						return aggregateDocuments( mongoExecutionContext, leftClass, collectionName, applyAggOptions( List.of( facet ) ) )
+							.next()
+							.map( facetDocument -> {
 								@SuppressWarnings("unchecked")
-								E leftVal = (E) mongoExecutionContext.read( leftClass, (Document) d.get( leftKey ) );
+								List<Document> rows = (List<Document>) facetDocument.getOrDefault( "data", List.of() );
+								List<ResultTuple<E, List<R2>>> result = rows.stream().map( row -> {
+									E leftValue = mongoExecutionContext.read( leftClass, row.get( leftKey, Document.class ) );
+									List<R2> rightValues = readLookupValues(
+										rightBuilder.getMongoExecutionContext(), rightClass, row.get( rightKey )
+									);
+									return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues );
+								} ).toList();
 
-								Object rawRight = d.get( rightKey );
-								List<R2> rightVal;
-
-								if (rawRight instanceof List<?> rawList) {
-									@SuppressWarnings("unchecked")
-									List<Document> rightDocs = (List<Document>) rawList;
-									rightVal = rightDocs
-										.stream()
-										.map( x -> rightBuilder.getMongoExecutionContext().read( rightClass, x ) )
-										.collect( Collectors.toList() );
-
-								} else if (rawRight instanceof Document rd) {
-									// unwind(true) 케이스: 단건을 리스트로 래핑
-									rightVal = List.of( rightBuilder.getMongoExecutionContext().read( rightClass, rd ) );
-
-								} else {
-									rightVal = List.of();
-
-								}
-
-								return new ResultTuple<>( leftKey, leftVal, rightKey, rightVal );
-
-							} ).collect( Collectors.toList() );
-
-							Long totalCount = 0L;
-
-							@SuppressWarnings("unchecked")
-							List<Document> countArr = (List<Document>) facetDoc.getOrDefault( "count", List.of() );
-
-							if (! countArr.isEmpty()) {
-								Object n = countArr.get( 0 ).get( "totalCount" );
-								if (n instanceof Number)
-									totalCount = ((Number) n).longValue();
-								else if (n != null)
-									totalCount = Long.parseLong( n.toString() );
-								else
-									totalCount = 0L;
-
-							}
-
-							return Mono.just( new PageResult<>( data, totalCount ) );
-
-						} );
-
+								@SuppressWarnings("unchecked")
+								List<Document> countRows = (List<Document>) facetDocument.getOrDefault( "count", List.of() );
+								long totalCount = countRows.isEmpty()
+									? 0L
+									: Optional.ofNullable( countRows.get( 0 ).get( "totalCount", Number.class ) ).map( Number::longValue ).orElse( 0L );
+								return new PageResult<>( result, totalCount );
+							} )
+							.defaultIfEmpty( new PageResult<>( List.of(), 0L ) );
 					} );
 
 			}
@@ -5635,531 +5381,184 @@ public class ReactiveMongoDsl<K> {
 		 */
 		public class FindQueryBuilder<S extends E> extends QueryBuilderAccesser<FindExecute<E>, FindAggregation<E>> implements FindExecute<E>, FindAggregation<E> {
 
-			private MongoSort sort = MongoSort.unsorted();
+			private Bson sort;
+			private String[] excludes;
 
-			private String[] excludes = null;
-
-
-			/**
-			 * Applies the given sort orders to the query.
-			 *
-			 * @param sorts
-			 *            the sort orders
-			 * 
-			 * @return this builder
-			 */
-			public FindQueryBuilder<S> sorts(
-				Order... sorts
+			/** Applies a MongoDB driver sort definition. Field names are physical MongoDB field paths. */
+			public FindQueryBuilder<S> sort(
+				Bson sort
 			) {
 
-				this.sort = MongoSort.by( sorts );
+				this.sort = sort;
 				return this;
 
 			}
 
-			/**
-			 * Applies the given sort orders to the query.
-			 *
-			 * @param sorts
-			 *            the sort orders
-			 * 
-			 * @return this builder
-			 */
+			/** Alias kept for fluent-call compatibility. */
 			public FindQueryBuilder<S> sorts(
-				Collection<Order> sorts
+				Bson sort
 			) {
 
-				this.sort = MongoSort.by( sorts.toArray( Order[]::new ) );
-				return this;
+				return sort( sort );
 
 			}
 
-			/**
-			 * Excludes the given fields from the result projection.
-			 *
-			 * @param excludes
-			 *            the field names to exclude
-			 * 
-			 * @return this builder
-			 */
 			public FindQueryBuilder<S> excludes(
 				String... excludes
 			) {
 
-				this.excludes = excludes;
+				this.excludes = MongoFieldNameSupport.toMongoFields( excludes );
 				return this;
 
 			}
 
-			/**
-			 * Excludes the given fields from the result projection.
-			 *
-			 * @param excludes
-			 *            the field names to exclude
-			 * 
-			 * @return this builder
-			 */
 			public FindQueryBuilder<S> excludes(
 				Collection<String> excludes
 			) {
 
-				this.excludes = excludes.toArray( String[]::new );
+				this.excludes = MongoFieldNameSupport.toMongoFields( excludes.toArray( String[]::new ) );
 				return this;
 
 			}
 
-			/**
-			 * Executes the current criteria and returns at most one matching entity.
-			 *
-			 * @return a {@link Mono} emitting the matched entity, or empty if none exists
-			 */
+			private FindSpec buildFindSpec(
+				Optional<Bson> criteria, boolean firstOnly
+			) {
+
+				FindSpec query = new FindSpec().filter( criteria.orElseGet( Document::new ) );
+				if (sort != null)
+					query.sort( sort );
+				if (firstOnly)
+					query.limit( 1 );
+				if (excludes != null && excludes.length > 0)
+					query.projection( Projections.exclude( excludes ) );
+				return applyQueryOptions( query );
+
+			}
+
 			@Override
 			public Mono<E> execute() {
 
-				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					MongoQuery query = new MongoQuery();
-
-					if (criteriaOptional.isPresent()) {
-						query.addCriteria( criteriaOptional.get() );
-
-					}
-
-					query.with( this.sort );
-
-
-					applyQueryOptions( query );
-
-
-					if (excludes != null && excludes.length > 0) {
-						var fields = query.fields();
-						Arrays
-							.stream( excludes )
-							.filter( s -> s != null && ! s.isBlank() )
-							.forEach( fields::exclude );
-
-					}
-
-					return query;
-
-				} );
-				Mono<E> result = Mono
-					.zip( executeClassMono, queryMono )
-					.flatMap( tuple -> {
-						var entityClass = tuple.getT1();
-						var query = tuple.getT2();
-						return findOne( mongoExecutionContext, entityClass, collectionName, query );
-
-
-					} );
-				return result;// .onErrorMap( e -> new RuntimeException( "Failed to find by fields: " + e.getMessage(), e ) );
+				return Mono.zip( executeClassMono, fieldBuilder.buildCriteria().map( criteria -> buildFindSpec( criteria, false ) ) )
+					.flatMap( tuple -> findOne( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
 
 			}
 
-			/**
-			 * Executes the current criteria with sorting applied and returns the first matching entity.
-			 *
-			 * @return a {@link Mono} emitting the first matched entity, or empty if none exists
-			 */
 			@Override
 			public Mono<E> executeFirst() {
 
-				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					MongoQuery query = new MongoQuery();
-
-					if (criteriaOptional.isPresent()) {
-						query.addCriteria( criteriaOptional.get() );
-
-					}
-
-					query.limit( 1 );
-					query.with( sort );
-
-					applyQueryOptions( query );
-
-					if (excludes != null && excludes.length > 0) {
-						var fields = query.fields();
-						Arrays
-							.stream( excludes )
-							.filter( s -> s != null && ! s.isBlank() )
-							.forEach( fields::exclude );
-
-					}
-
-					return query;
-
-				} );
-
-				Mono<E> result = Mono
-					.zip( executeClassMono, queryMono )
-					.flatMap( tuple -> {
-						var entityClass = tuple.getT1();
-						var query = tuple.getT2();
-						return findOne( mongoExecutionContext, entityClass, collectionName, query );
-
-
-					} );
-				return result
-					.doOnError( e -> {
-						e.printStackTrace();
-
-					} );
+				return Mono.zip( executeClassMono, fieldBuilder.buildCriteria().map( criteria -> buildFindSpec( criteria, true ) ) )
+					.flatMap( tuple -> findOne( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
 
 			}
 
-			/**
-			 * Executes the current single-result query as an aggregation pipeline
-			 * and maps the first resulting document back to the target type.
-			 *
-			 * @return a {@link Mono} emitting the mapped result, or empty if none exists
-			 */
 			@Override
 			public Mono<E> executeAggregation() {
 
-				Mono<MongoAggregation> aggregationMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					List<MongoAggregationOperation> ops = new ArrayList<>();
-
-					// where 절 ($match)
-					criteriaOptional.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
-
-					// 정렬
-					ops
-						.add(
-							MongoAggregation
-								.sort(
-									(this.sort != null && this.sort.isSorted())
-										? this.sort
-										: MongoSort.by( MongoSort.Direction.DESC, "_id" )
-								)
-						);
-
-					// 단건만
-					ops.add( MongoAggregation.limit( 1 ) );
-
-					// 프로젝트 (exclude)
-					if (excludes != null && excludes.length > 0) {
-						ops.add( MongoAggregation.project().andExclude( excludes ) );
-
-					}
-
-					MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
-
-					return agg;
-
+				Mono<AggregationSpec> aggregationMono = fieldBuilder.buildCriteria().map( criteria -> {
+					List<Bson> operations = new ArrayList<>();
+					criteria.ifPresent( filter -> operations.add( Aggregates.match( filter ) ) );
+					operations.add( Aggregates.sort( sort != null ? sort : Sorts.descending( "_id" ) ) );
+					operations.add( Aggregates.limit( 1 ) );
+					if (excludes != null && excludes.length > 0)
+						operations.add( Aggregates.project( Projections.exclude( excludes ) ) );
+					return applyAggOptions( operations );
 				} );
 
-				return Mono
-					.zip( executeClassMono, aggregationMono )
-					.flatMap( tuple -> {
-						Class<E> entityClass = tuple.getT1();
-						MongoAggregation aggregation = tuple.getT2();
-
-						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, entityClass, collectionName, aggregation );
-
-						// 첫 문서를 엔티티로 매핑 (없으면 empty Mono)
-						return docs.next().map( doc -> mongoExecutionContext.read( entityClass, doc ) );
-
-					} );
+				return Mono.zip( executeClassMono, aggregationMono ).flatMap( tuple ->
+					aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() )
+						.next()
+						.map( document -> mongoExecutionContext.read( tuple.getT1(), document ) )
+				);
 
 			}
 
-			/**
-			 * Executes the current single-result query with a {@code $lookup} join.
-			 *
-			 * @param rightBuilder
-			 *            the right-side query builder used as the join target
-			 * @param spec
-			 *            the lookup specification
-			 * @param <R2>
-			 *            the right-side mapped type
-			 * 
-			 * @return a {@link Mono} emitting the joined tuple result
-			 */
 			@Override
 			public <R2> Mono<ResultTuple<E, R2>> executeLookup(
 				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindQueryBuilder<R2> rightBuilder, LookupSpec spec
 			) {
 
-				// 내부적으로 FindAll과 거의 동일하되, limit(1) 보장
 				Mono<Class<E>> leftClassMono = executeClassMono;
 				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
-
-				Mono<MongoAggregation> aggMono = Mono
-					.zip(
-						fieldBuilder.buildCriteria(),
-						rightBuilder.getFieldBuilderCriteria(),
-						leftClassMono,
-						rightClassMono
-					)
+				Mono<AggregationSpec> aggregationMono = Mono
+					.zip( fieldBuilder.buildCriteria(), rightBuilder.getFieldBuilderCriteria(), leftClassMono, rightClassMono )
 					.map( tuple -> {
-						Optional<MongoCriteria> leftCriteriaOpt = tuple.getT1();
-						Optional<MongoCriteria> rightCriteriaOpt = tuple.getT2();
+						Optional<Bson> leftCriteria = tuple.getT1();
+						Optional<Bson> rightCriteria = tuple.getT2();
 						Class<E> leftClass = tuple.getT3();
 						Class<R2> rightClass = tuple.getT4();
-
-						// String leftCollection = (collectionName != null && ! collectionName.isBlank())
-						// ? collectionName
-						// : resolveCollectionName( leftClass );
-
-						String rightCollection = (rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank())
+						String rightCollection = rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank()
 							? rightBuilder.getCollectionName()
 							: rightBuilder.resolveCollectionName( rightClass );
-
+						String rightAs = spec.getAs() != null && ! spec.getAs().isBlank() ? spec.getAs() : simpleName( rightClass );
 						String leftKey = simpleName( leftClass );
-						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
 						String rightKey = simpleName( rightClass );
 
-						List<MongoAggregationOperation> ops = new ArrayList<>();
-						leftCriteriaOpt.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
-
-						Document lookupBody = new Document( "from", rightCollection ).append( "as", rightAs );
-
-						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
-							rightClass, Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of )
-						);
-						List<Document> nonLimitStages = new ArrayList<>();
-						List<Document> limitStages = new ArrayList<>();
-
-						for (Document st : userStages) {
-							if (st.containsKey( "$limit" ))
-								limitStages.add( st );
-							else
-								nonLimitStages.add( st );
-
-						}
-
-						boolean needPipeline = (spec.getLocalField() == null || spec.getForeignField() == null) // 원래 pipeline 모드
-							|| rightCriteriaOpt.isPresent() // 오른쪽 추가 필터 있음
-							|| ! nonLimitStages.isEmpty() || ! limitStages.isEmpty(); // 사용자가 넣은 stage 있음
-
-						if (! needPipeline) {
-							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
-							lookupBody
-								.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) )
-								.append( "foreignField", rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ) );
-
-						} else {
-							List<Document> pipe = new ArrayList<>();
-
-							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightCriteriaOpt.ifPresent( rc -> pipe.add( new Document( "$match", rightBuilder.getMongoExecutionContext().mapQuery( rightClass, rc.getCriteriaObject() ) ) ) );
-
-							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
-							if (spec.getLocalField() != null && spec.getForeignField() != null) {
-								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lookupBody.append( "let", new Document( lfVar, "$" + mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) ) );
-								pipe
-									.add(
-										new Document(
-											"$match",
-											new Document(
-												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ), "$$" + lfVar ) )
-											)
-										)
-									);
-
-							} else {
-								// let 그대로 유지 (없으면 빈 Document)
-								lookupBody.append( "let", Optional.ofNullable( spec.getLetDoc() ).orElseGet( Document::new ) );
-
-							}
-
-							boolean onlyProjects = ! nonLimitStages.isEmpty() && nonLimitStages.stream().allMatch( st -> st.containsKey( "$project" ) );
-
-							if (onlyProjects) {
-								// EXISTS 최적화: limit → project (후보를 1건으로 줄인 다음 project)
-								pipe.addAll( limitStages );
-								pipe.addAll( nonLimitStages );
-
-							} else {
-								// 일반 케이스: 기존 순서 유지
-								pipe.addAll( nonLimitStages );
-								pipe.addAll( limitStages );
-
-							}
-
-							lookupBody.append( "pipeline", pipe );
-
-						}
-
-						ops.add( ctx -> new Document( "$lookup", lookupBody ) );
-
-						if (spec.isUnwind()) {
-							ops
-								.add(
-									ctx -> new Document(
-										"$unwind",
-										new Document( "path", "$" + rightAs )
-											.append( "preserveNullAndEmptyArrays", spec.isPreserveNullAndEmptyArrays() )
-									)
-								);
-
-						}
-
-						if (spec.getOuterStages() != null && ! spec.getOuterStages().isEmpty()) {
-
-							for (Document st : spec.getOuterStages()) {
-								ops.add( ctx -> st );
-
-							}
-
-						}
-
-						// sort + limit(1)
-						ops.add( MongoAggregation.sort( (this.sort != null && this.sort.isSorted()) ? this.sort : MongoSort.by( MongoSort.Direction.DESC, "_id" ) ) );
-						ops.add( MongoAggregation.limit( 1 ) );
-
-						Document project = new Document(
-							"$project",
-							new Document()
-								.append( leftKey, "$$ROOT" )
-								.append( rightKey, "$" + rightAs )
-						);
-						ops.add( ctx -> project );
-
-						MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
-
-
-						// agg.withOptions( MongoAggregation.newAggregationOptions().allowDiskUse( false ).build() );
-						return agg;
-
+						List<Bson> operations = new ArrayList<>();
+						leftCriteria.ifPresent( filter -> operations.add( Aggregates.match( filter ) ) );
+						appendLookupStages( operations, rightCollection, rightAs, rightCriteria, spec );
+						operations.add( Aggregates.sort( sort != null ? sort : Sorts.descending( "_id" ) ) );
+						operations.add( Aggregates.limit( 1 ) );
+						operations.add( new Document( "$project", new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs ) ) );
+						return applyAggOptions( operations );
 					} );
 
-				return Mono
-					.zip( leftClassMono, rightClassMono, aggMono )
-					.flatMap( tuple -> {
-						Class<E> leftClass = tuple.getT1();
-						Class<R2> rightClass = tuple.getT2();
-						MongoAggregation agg = tuple.getT3();
+				return Mono.zip( leftClassMono, rightClassMono, aggregationMono ).flatMap( tuple -> {
+					Class<E> leftClass = tuple.getT1();
+					Class<R2> rightClass = tuple.getT2();
+					String leftKey = simpleName( leftClass );
+					String rightKey = simpleName( rightClass );
 
-						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, leftClass, collectionName, agg );
-
-						String leftKey = simpleName( leftClass );
-						String rightKey = simpleName( rightClass );
-
-						return docs.next().map( d -> {
-							@SuppressWarnings("unchecked")
-							S leftVal = (S) mongoExecutionContext.read( leftClass, (Document) d.get( leftKey ) );
-
-							Object raw = d.get( rightKey );
-							R2 rightVal = null;
-
-							if (raw instanceof Document rd) {
-								rightVal = rightBuilder.getMongoExecutionContext().read( rightClass, rd );
-
-							} else if (raw instanceof List<?> rl && ! rl.isEmpty() && rl.get( 0 ) instanceof Document r0) {
-								rightVal = rightBuilder.getMongoExecutionContext().read( rightClass, r0 ); // 첫 원소
-
-							}
-
-							return new ResultTuple<>( leftKey, leftVal, rightKey, rightVal );
-
+					return aggregateDocuments( mongoExecutionContext, leftClass, collectionName, tuple.getT3() )
+						.next()
+						.map( document -> {
+							E leftValue = mongoExecutionContext.read( leftClass, document.get( leftKey, Document.class ) );
+							List<R2> rightValues = readLookupValues(
+								rightBuilder.getMongoExecutionContext(), rightClass, document.get( rightKey )
+							);
+							return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues.isEmpty() ? null : rightValues.get( 0 ) );
 						} );
-
-					} );
+				} );
 
 			}
 
-
 		}
+
 
 		/**
 		 * Builder for count queries with optional aggregation and lookup support.
 		 */
 		public class CountQueryBuilder extends QueryBuilderAccesser<CountExecute<E>, CountAggregation<E>> implements CountExecute<E>, CountAggregation<E> {
 
-			/**
-			 * Returns the number of documents matching the current criteria.
-			 *
-			 * @return a {@link Mono} emitting the matching document count
-			 */
 			@Override
 			public Mono<Long> execute() {
 
-				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					MongoQuery query = new MongoQuery();
-
-					if (criteriaOptional.isPresent()) {
-						query.addCriteria( criteriaOptional.get() );
-
-					}
-
-					applyQueryOptions( query );
-
-					return query;
-
-				} );
-				return Mono
-					.zip( executeClassMono, queryMono )
-					.flatMap( tuple -> {
-
-						var entityClass = tuple.getT1();
-						var query = tuple.getT2();
-						return count( mongoExecutionContext, entityClass, collectionName, query );
-
-					} )
-				// .onErrorMap( e -> new RuntimeException( "Failed to count documents: " + e.getMessage(), e ) )
-				;
+				Mono<FindSpec> queryMono = fieldBuilder.buildCriteria()
+					.map( criteria -> applyQueryOptions( new FindSpec().filter( criteria.orElseGet( Document::new ) ) ) );
+				return Mono.zip( executeClassMono, queryMono )
+					.flatMap( tuple -> count( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
 
 			}
 
-			/**
-			 * Returns the number of documents matching the current criteria using an aggregation pipeline.
-			 *
-			 * @return a {@link Mono} emitting the matching document count
-			 */
 			@Override
 			public Mono<Long> executeAggregation() {
 
-				Mono<MongoAggregation> aggMono = fieldBuilder.buildCriteria().map( criteriaOpt -> {
-					List<MongoAggregationOperation> ops = new ArrayList<>();
-
-					// where 절($match)
-					criteriaOpt.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
-
-					// 카운트
-					ops.add( ctx -> new Document( "$count", "count" ) );
-
-					MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
-
-					return agg;
-
+				Mono<AggregationSpec> aggregationMono = fieldBuilder.buildCriteria().map( criteria -> {
+					List<Bson> operations = new ArrayList<>();
+					criteria.ifPresent( filter -> operations.add( Aggregates.match( filter ) ) );
+					operations.add( Aggregates.count( "count" ) );
+					return applyAggOptions( operations );
 				} );
 
-				return Mono
-					.zip( executeClassMono, aggMono )
-					.flatMap( tuple -> {
-						Class<E> entityClass = tuple.getT1();
-						MongoAggregation aggregation = tuple.getT2();
-
-						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, entityClass, collectionName, aggregation );
-
-						return docs
-							.singleOrEmpty()
-							.map( d -> {
-								Number n = d.get( "count", Number.class );
-								return (n == null) ? 0L : n.longValue();
-
-							} )
-							.defaultIfEmpty( 0L );
-
-					} );
+				return Mono.zip( executeClassMono, aggregationMono ).flatMap( tuple ->
+					aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() )
+						.singleOrEmpty()
+						.map( document -> Optional.ofNullable( document.get( "count", Number.class ) ).map( Number::longValue ).orElse( 0L ) )
+						.defaultIfEmpty( 0L )
+				);
 
 			}
 
-			/**
-			 * Executes a count query that includes a {@code $lookup} stage.
-			 *
-			 * @param rightBuilder
-			 *            the right-side query builder used as the join target
-			 * @param spec
-			 *            the lookup specification
-			 * @param <R2>
-			 *            the right-side mapped type
-			 * 
-			 * @return a {@link Mono} emitting a tuple containing left and right count-related results
-			 */
 			@Override
 			public <R2> Mono<ResultTuple<Long, Long>> executeLookup(
 				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
@@ -6167,207 +5566,69 @@ public class ReactiveMongoDsl<K> {
 
 				Mono<Class<E>> leftClassMono = executeClassMono;
 				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
-
-				Mono<MongoAggregation> aggMono = Mono
-					.zip(
-						fieldBuilder.buildCriteria(),
-						rightBuilder.getFieldBuilderCriteria(),
-						leftClassMono,
-						rightClassMono
-					)
-					.map( tp -> {
-						Optional<MongoCriteria> leftMatch = tp.getT1();
-						Optional<MongoCriteria> rightMatch = tp.getT2();
-						Class<E> leftClass = tp.getT3();
-						Class<R2> rightClass = tp.getT4();
-
-						String rightColl = (rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank())
+				Mono<AggregationSpec> aggregationMono = Mono
+					.zip( fieldBuilder.buildCriteria(), rightBuilder.getFieldBuilderCriteria(), leftClassMono, rightClassMono )
+					.map( tuple -> {
+						Optional<Bson> leftCriteria = tuple.getT1();
+						Optional<Bson> rightCriteria = tuple.getT2();
+						Class<R2> rightClass = tuple.getT4();
+						String rightCollection = rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank()
 							? rightBuilder.getCollectionName()
 							: rightBuilder.resolveCollectionName( rightClass );
+						String rightAs = spec.getAs() != null && ! spec.getAs().isBlank() ? spec.getAs() : simpleName( rightClass );
 
-						// String leftKey = simpleName( leftClass );
-						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
-						// String rightKey = simpleName( rightClass ); // 이름만 쓸거라 키로도 사용
-
-						List<MongoAggregationOperation> ops = new ArrayList<>();
-						leftMatch.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
-
-						// $lookup
-						Document lk = new Document( "from", rightColl ).append( "as", rightAs );
-						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
-							rightClass, Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of )
-						);
-						List<Document> nonLimitStages = new ArrayList<>();
-						List<Document> limitStages = new ArrayList<>();
-
-						for (Document st : userStages) {
-							if (st.containsKey( "$limit" ))
-								limitStages.add( st );
-							else
-								nonLimitStages.add( st );
-
-						}
-
-						boolean needPipeline = (spec.getLocalField() == null || spec.getForeignField() == null) // 원래 pipeline 모드
-							|| rightMatch.isPresent() // 오른쪽 추가 필터 있음
-							|| ! nonLimitStages.isEmpty() || ! limitStages.isEmpty(); // 사용자가 넣은 stage 있음
-
-						if (! needPipeline) {
-							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
-							lk
-								.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) )
-								.append( "foreignField", rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ) );
-
-						} else {
-							List<Document> pipe = new ArrayList<>();
-
-							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightMatch.ifPresent( rc -> pipe.add( new Document( "$match", rightBuilder.getMongoExecutionContext().mapQuery( rightClass, rc.getCriteriaObject() ) ) ) );
-
-							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
-							if (spec.getLocalField() != null && spec.getForeignField() != null) {
-								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lk.append( "let", new Document( lfVar, "$" + mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) ) );
-								pipe
-									.add(
-										new Document(
-											"$match",
-											new Document(
-												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ), "$$" + lfVar ) )
-											)
-										)
-									);
-
-							} else {
-								// let 그대로 유지 (없으면 빈 Document)
-								lk.append( "let", Optional.ofNullable( spec.getLetDoc() ).orElseGet( Document::new ) );
-
-							}
-
-							boolean onlyProjects = ! nonLimitStages.isEmpty() && nonLimitStages.stream().allMatch( st -> st.containsKey( "$project" ) );
-
-							if (onlyProjects) {
-								// EXISTS 최적화: limit → project (후보를 1건으로 줄인 다음 project)
-								pipe.addAll( limitStages );
-								pipe.addAll( nonLimitStages );
-
-							} else {
-								// 일반 케이스: 기존 순서 유지
-								pipe.addAll( nonLimitStages );
-								pipe.addAll( limitStages );
-
-							}
-
-							lk.append( "pipeline", pipe );
-
-						}
-
-						ops.add( ctx -> new Document( "$lookup", lk ) );
+						List<Bson> operations = new ArrayList<>();
+						leftCriteria.ifPresent( filter -> operations.add( Aggregates.match( filter ) ) );
+						appendLookupStages( operations, rightCollection, rightAs, rightCriteria, spec );
 
 						if (spec.isUnwind()) {
-							ops
-								.add(
-									ctx -> new Document(
-										"$unwind",
-										new Document( "path", "$" + rightAs )
-											.append( "preserveNullAndEmptyArrays", spec.isPreserveNullAndEmptyArrays() )
-									)
-								);
-
-						}
-
-						if (spec.getOuterStages() != null) {
-							for (Document st : spec.getOuterStages())
-								ops.add( ctx -> st ); // ← lookup 이후 필터
-
-						}
-
-						if (spec.isUnwind()) {
-
-							// 그룹으로 왼쪽/오른쪽 카운트 동시 계산
-							Document group = new Document(
-								"$group",
-								new Document( "_id", null )
-									.append( "leftCount", new Document( "$sum", 1 ) )
-									.append(
-										"rightCount",
-										new Document(
-											"$sum",
-											new Document(
-												"$cond",
-												List
-													.of(
-														new Document( "$ifNull", List.of( "$" + rightAs, null ) ),
-														1,
-														0
-													)
-											)
-										)
-									)
-							);
-							ops.add( ctx -> group );
-
-						} else {
-							// 배열 크기를 더해서 오른쪽 총 매칭 수를 계산
-							Document setSize = new Document(
-								"$set",
+							Document rightExists = new Document( "$ne", List.of( new Document( "$type", "$" + rightAs ), "missing" ) );
+							operations.add(
 								new Document(
-									"_rightSize",
-									new Document(
-										"$size",
-										new Document( "$ifNull", List.of( "$" + rightAs, List.of() ) )
-									)
+									"$group",
+									new Document( "_id", null )
+										.append( "leftCount", new Document( "$sum", 1 ) )
+										.append( "rightCount", new Document( "$sum", new Document( "$cond", List.of( rightExists, 1, 0 ) ) ) )
 								)
 							);
-							ops.add( ctx -> setSize );
-
-							Document group = new Document(
-								"$group",
-								new Document( "_id", null )
-									.append( "leftCount", new Document( "$sum", 1 ) )
-									.append( "rightCount", new Document( "$sum", "$_rightSize" ) )
+						} else {
+							operations.add(
+								new Document(
+									"$set",
+									new Document( "_rightSize", new Document( "$size", new Document( "$ifNull", List.of( "$" + rightAs, List.of() ) ) ) )
+								)
 							);
-							ops.add( ctx -> group );
-
+							operations.add(
+								new Document(
+									"$group",
+									new Document( "_id", null )
+										.append( "leftCount", new Document( "$sum", 1 ) )
+										.append( "rightCount", new Document( "$sum", "$_rightSize" ) )
+								)
+							);
 						}
 
-						MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
-
-						// agg.withOptions( MongoAggregation.newAggregationOptions().allowDiskUse( false ).build() );
-						return agg;
-
+						return applyAggOptions( operations );
 					} );
 
-				return Mono
-					.zip( leftClassMono, rightClassMono, aggMono )
-					.flatMap( tp -> {
-						Class<E> leftClass = tp.getT1();
-						Class<R2> rightClass = tp.getT2();
-						MongoAggregation agg = tp.getT3();
-
-						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, leftClass, collectionName, agg );
-
-						String leftName = simpleName( leftClass );
-						String rightName = simpleName( rightClass );
-
-						return docs
-							.singleOrEmpty()
-							.map( d -> {
-								long lc = Optional.ofNullable( d.get( "leftCount", Number.class ) ).map( Number::longValue ).orElse( 0L );
-								long rc = Optional.ofNullable( d.get( "rightCount", Number.class ) ).map( Number::longValue ).orElse( 0L );
-								return new ResultTuple<>( leftName, lc, rightName, rc );
-
-							} )
-							.defaultIfEmpty( new ResultTuple<>( leftName, 0L, rightName, 0L ) );
-
-					} );
+				return Mono.zip( leftClassMono, rightClassMono, aggregationMono ).flatMap( tuple -> {
+					String leftName = simpleName( tuple.getT1() );
+					String rightName = simpleName( tuple.getT2() );
+					return aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT3() )
+						.singleOrEmpty()
+						.map( document -> new ResultTuple<>(
+							leftName,
+							Optional.ofNullable( document.get( "leftCount", Number.class ) ).map( Number::longValue ).orElse( 0L ),
+							rightName,
+							Optional.ofNullable( document.get( "rightCount", Number.class ) ).map( Number::longValue ).orElse( 0L )
+						) )
+						.defaultIfEmpty( new ResultTuple<>( leftName, 0L, rightName, 0L ) );
+				} );
 
 			}
 
-
 		}
+
 
 		/**
 		 * Builder for criteria-based delete operations.
@@ -6381,27 +5642,10 @@ public class ReactiveMongoDsl<K> {
 			 */
 			public Mono<DeleteResult> execute() {
 
-				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					MongoQuery query = new MongoQuery();
-
-					if (criteriaOptional.isPresent()) {
-						query.addCriteria( criteriaOptional.get() );
-
-					}
-
-					return query;
-
-				} );
-				return Mono
-					.zip( executeClassMono, queryMono )
-					.flatMap( tuple -> {
-						var entityClass = tuple.getT1();
-						var query = tuple.getT2();
-						return deleteByFilter( mongoExecutionContext, entityClass, collectionName, query.filter(), true );
-
-					} )
-				// .onErrorMap( e -> new RuntimeException( "Failed to delete documents: " + e.getMessage(), e ) )
-				;
+				return Mono.zip( executeClassMono, fieldBuilder.buildCriteria() )
+					.flatMap( tuple -> deleteByFilter(
+						mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2().orElseGet( Document::new ), true
+					) );
 
 			}
 
@@ -6412,84 +5656,31 @@ public class ReactiveMongoDsl<K> {
 		 */
 		public class ExistsQueryBuilder extends QueryBuilderAccesser<ExistsExecute<E>, ExistsAggregation<E>> implements ExistsExecute<E>, ExistsAggregation<E> {
 
-			/**
-			 * Returns whether at least one document matches the current criteria.
-			 *
-			 * @return a {@link Mono} emitting {@code true} if a matching document exists
-			 */
 			@Override
 			public Mono<Boolean> execute() {
 
-				var queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					MongoQuery query = new MongoQuery();
-
-					if (criteriaOptional.isPresent()) {
-						query.addCriteria( criteriaOptional.get() );
-
-					}
-
-					applyQueryOptions( query );
-
-					return query;
-
-				} );
-				return Mono
-					.zip( executeClassMono, queryMono )
-					.flatMap( tuple -> {
-						var entityClass = tuple.getT1();
-						var query = tuple.getT2();
-						return exists( mongoExecutionContext, entityClass, collectionName, query );
-
-					} )
-				// .onErrorMap( e -> new RuntimeException( "Failed to check existence: " + e.getMessage(), e ) )
-				;
+				Mono<FindSpec> queryMono = fieldBuilder.buildCriteria()
+					.map( criteria -> applyQueryOptions( new FindSpec().filter( criteria.orElseGet( Document::new ) ) ) );
+				return Mono.zip( executeClassMono, queryMono )
+					.flatMap( tuple -> exists( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
 
 			}
 
-			/**
-			 * Returns whether at least one document matches the current criteria
-			 * when evaluated through an aggregation pipeline.
-			 *
-			 * @return a {@link Mono} emitting {@code true} if a matching document exists
-			 */
 			@Override
 			public Mono<Boolean> executeAggregation() {
 
-				Mono<MongoAggregation> aggMono = fieldBuilder.buildCriteria().map( criteriaOpt -> {
-					List<MongoAggregationOperation> ops = new ArrayList<>();
-					criteriaOpt.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
-					ops.add( MongoAggregation.limit( 1 ) ); // 한 건만 있으면 true
-					MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
-					return agg;
-
+				Mono<AggregationSpec> aggregationMono = fieldBuilder.buildCriteria().map( criteria -> {
+					List<Bson> operations = new ArrayList<>();
+					criteria.ifPresent( filter -> operations.add( Aggregates.match( filter ) ) );
+					operations.add( Aggregates.limit( 1 ) );
+					return applyAggOptions( operations );
 				} );
 
-				return Mono
-					.zip( executeClassMono, aggMono )
-					.flatMap( tp -> {
-						Class<E> entityClass = tp.getT1();
-						MongoAggregation agg = tp.getT2();
-
-						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, entityClass, collectionName, agg );
-
-						return docs.hasElements(); // 있으면 true
-
-					} );
+				return Mono.zip( executeClassMono, aggregationMono )
+					.flatMap( tuple -> aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ).hasElements() );
 
 			}
 
-			/**
-			 * Executes an existence check that includes a {@code $lookup} stage.
-			 *
-			 * @param rightBuilder
-			 *            the right-side query builder used as the join target
-			 * @param spec
-			 *            the lookup specification
-			 * @param <R2>
-			 *            the right-side mapped type
-			 * 
-			 * @return a {@link Mono} emitting a tuple containing left and right existence flags
-			 */
 			@Override
 			public <R2> Mono<ResultTuple<Boolean, Boolean>> executeLookup(
 				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
@@ -6497,244 +5688,81 @@ public class ReactiveMongoDsl<K> {
 
 				Mono<Class<E>> leftClassMono = executeClassMono;
 				Mono<Class<R2>> rightClassMono = rightBuilder.getExecuteClassMono();
-
-				Mono<MongoAggregation> aggMono = Mono
-					.zip(
-						fieldBuilder.buildCriteria(),
-						rightBuilder.getFieldBuilderCriteria(),
-						leftClassMono,
-						rightClassMono
-					)
-					.map( tp -> {
-						Optional<MongoCriteria> leftMatch = tp.getT1();
-						Optional<MongoCriteria> rightMatch = tp.getT2();
-						Class<E> leftClass = tp.getT3();
-						Class<R2> rightClass = tp.getT4();
-
-						String rightColl = (rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank())
+				Mono<AggregationSpec> aggregationMono = Mono
+					.zip( fieldBuilder.buildCriteria(), rightBuilder.getFieldBuilderCriteria(), leftClassMono, rightClassMono )
+					.map( tuple -> {
+						Optional<Bson> leftCriteria = tuple.getT1();
+						Optional<Bson> rightCriteria = tuple.getT2();
+						Class<R2> rightClass = tuple.getT4();
+						String rightCollection = rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank()
 							? rightBuilder.getCollectionName()
 							: rightBuilder.resolveCollectionName( rightClass );
+						String rightAs = spec.getAs() != null && ! spec.getAs().isBlank() ? spec.getAs() : simpleName( rightClass );
 
-						String rightAs = (spec.getAs() != null && ! spec.getAs().isBlank()) ? spec.getAs() : simpleName( rightClass );
+						List<Bson> operations = new ArrayList<>();
+						leftCriteria.ifPresent( filter -> operations.add( Aggregates.match( filter ) ) );
+						appendLookupStages( operations, rightCollection, rightAs, rightCriteria, spec );
 
-						List<MongoAggregationOperation> ops = new ArrayList<>();
-						leftMatch.ifPresent( c -> ops.add( MongoAggregation.match( c ) ) );
-
-						Document lk = new Document( "from", rightColl ).append( "as", rightAs );
-
-
-						// spec.pipelineDocs 분해: $limit(들)은 끝으로 보내기 위해 따로 모아둠
-						List<Document> userStages = rightBuilder.getMongoExecutionContext().mapAggregationPipeline(
-							rightClass, Optional.ofNullable( spec.getPipelineDocs() ).orElseGet( List::of )
-						);
-						List<Document> nonLimitStages = new ArrayList<>();
-						List<Document> limitStages = new ArrayList<>();
-
-						for (Document st : userStages) {
-							if (st.containsKey( "$limit" ))
-								limitStages.add( st );
-							else
-								nonLimitStages.add( st );
-
-						}
-
-						boolean needPipeline = (spec.getLocalField() == null || spec.getForeignField() == null) // 원래 pipeline 모드
-							|| rightMatch.isPresent() // 오른쪽 추가 필터 있음
-							|| ! nonLimitStages.isEmpty() || ! limitStages.isEmpty(); // 사용자가 넣은 stage 있음
-
-						if (! needPipeline) {
-							// 단순 모드: 평문 필드명 (접두 $ 넣지 않음)
-							lk
-								.append( "localField", mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) )
-								.append( "foreignField", rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ) );
-
-						} else {
-							List<Document> pipe = new ArrayList<>();
-
-							// 1) 오른쪽 일반 필터를 먼저 (인덱스 타게)
-							rightMatch.ifPresent( rc -> pipe.add( new Document( "$match", rightBuilder.getMongoExecutionContext().mapQuery( rightClass, rc.getCriteriaObject() ) ) ) );
-
-							// 2) local/foreign 있다면 $expr 조인식 추가 (let 필요)
-							if (spec.getLocalField() != null && spec.getForeignField() != null) {
-								String lfVar = "vlf"; // 반드시 영문자로 시작
-								lk.append( "let", new Document( lfVar, "$" + mongoExecutionContext.getMappedFieldName( leftClass, spec.getLocalField() ) ) );
-								pipe
-									.add(
-										new Document(
-											"$match",
-											new Document(
-												"$expr",
-												new Document( "$eq", Arrays.asList( "$" + rightBuilder.getMongoExecutionContext().getMappedFieldName( rightClass, spec.getForeignField() ), "$$" + lfVar ) )
-											)
-										)
-									);
-
-							} else {
-								// let 그대로 유지 (없으면 빈 Document)
-								lk.append( "let", Optional.ofNullable( spec.getLetDoc() ).orElseGet( Document::new ) );
-
-							}
-
-							boolean onlyProjects = ! nonLimitStages.isEmpty() && nonLimitStages.stream().allMatch( st -> st.containsKey( "$project" ) );
-
-							if (onlyProjects) {
-								// EXISTS 최적화: limit → project (후보를 1건으로 줄인 다음 project)
-								pipe.addAll( limitStages );
-								pipe.addAll( nonLimitStages );
-
-							} else {
-								// 일반 케이스: 기존 순서 유지
-								pipe.addAll( nonLimitStages );
-								pipe.addAll( limitStages );
-
-							}
-
-							lk.append( "pipeline", pipe );
-
-						}
-
-						ops.add( ctx -> new Document( "$lookup", lk ) );
-
-						if (spec.isUnwind()) {
-							ops
-								.add(
-									ctx -> new Document(
-										"$unwind",
-										new Document( "path", "$" + rightAs )
-											.append( "preserveNullAndEmptyArrays", spec.isPreserveNullAndEmptyArrays() )
-									)
-								);
-
-						}
-
-						if (spec.getOuterStages() != null) {
-							for (Document st : spec.getOuterStages())
-								ops.add( ctx -> st ); // ← lookup 이후 필터
-
-						}
-
-						// 오른쪽 존재 플래그 계산
-						Document rightExistsExpr = spec.isUnwind()
-							? new Document( "$gt", List.of( new Document( "$type", "$" + rightAs ), "missing" ) )
+						Bson rightExistsExpression = spec.isUnwind()
+							? new Document( "$ne", List.of( new Document( "$type", "$" + rightAs ), "missing" ) )
 							: new Document(
 								"$gt",
-								List
-									.of(
-										new Document(
-											"$size",
-											new Document( "$ifNull", List.of( "$" + rightAs, List.of() ) )
-										),
-										0
-									)
+								List.of( new Document( "$size", new Document( "$ifNull", List.of( "$" + rightAs, List.of() ) ) ), 0 )
 							);
-
-						ops
-							.add(
-								ctx -> new Document(
-									"$project",
-									new Document( "_rightExists", rightExistsExpr )
-								)
-							);
-
-						ops.add( MongoAggregation.limit( 1 ) ); // 왼쪽 존재여부 판정
-
-						MongoAggregation agg = applyAggOptions( MongoAggregation.newAggregation( ops ) );
-
-						agg.withOptions( MongoAggregation.newAggregationOptions().allowDiskUse( false ).build() );
-						return agg;
-
+						operations.add( new Document( "$project", new Document( "_rightExists", rightExistsExpression ) ) );
+						operations.add( Aggregates.limit( 1 ) );
+						return applyAggOptions( operations ).allowDiskUse( false );
 					} );
 
-				return Mono
-					.zip( leftClassMono, rightClassMono, aggMono )
-					.flatMap( tp -> {
-						Class<E> leftClass = tp.getT1();
-						Class<R2> rightClass = tp.getT2();
-						MongoAggregation agg = tp.getT3();
-
-						Flux<Document> docs = aggregateDocuments( mongoExecutionContext, leftClass, collectionName, agg );
-
-						String leftName = simpleName( leftClass );
-						String rightName = simpleName( rightClass );
-
-						Mono<Document> firstDocMono = docs.next();
-
-						return firstDocMono
-							.map( d -> {
-								boolean rightExists = Optional.ofNullable( d.get( "_rightExists", Boolean.class ) ).orElse( false );
-								return new ResultTuple<>( leftName, true, rightName, rightExists );
-
-							} )
-							.defaultIfEmpty( new ResultTuple<>( leftName, false, rightName, false ) );
-
-					} );
+				return Mono.zip( leftClassMono, rightClassMono, aggregationMono ).flatMap( tuple -> {
+					String leftName = simpleName( tuple.getT1() );
+					String rightName = simpleName( tuple.getT2() );
+					return aggregateDocuments( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT3() )
+						.next()
+						.map( document -> new ResultTuple<>(
+							leftName,
+							true,
+							rightName,
+							Optional.ofNullable( document.get( "_rightExists", Boolean.class ) ).orElse( false )
+						) )
+						.defaultIfEmpty( new ResultTuple<>( leftName, false, rightName, false ) );
+				} );
 
 			}
 
 		}
 
+
 		/**
-		 * Builder for atomic update operations using either document-based updates
-		 * ({@link MongoUpdate}) or pipeline-based updates ({@link MongoAggregationUpdate}).
+		 * Builder for atomic update operations using MongoDB driver update definitions or update pipelines.
 		 * <p>Auditing annotations such as {@code @CreatedDate} and {@code @LastModifiedDate}
 		 * are not applied automatically during atomic update operations. Set auditing fields
 		 * explicitly when needed.</p>
 		 */
 		public class AtomicUpdateQueryBuilder {
 
-			/**
-			 * Execution mode for an atomic update.
-			 */
 			private enum AtomicUpdateMode {
 				FIRST, MULTI, UPSERT_ONE
 			}
 
-			/**
-			 * Configures the update to affect only the first matching document.
-			 * <p>This is the default MongoDB/Spring Data single-update behavior, but it
-			 * is exposed explicitly so callers must choose the update cardinality before
-			 * choosing the update shape and operations.</p>
-			 *
-			 * @return a typed builder for choosing document or pipeline update operations
-			 */
 			public AtomicUpdateTypedBuilder first() {
 
 				return new AtomicUpdateTypedBuilder( AtomicUpdateMode.FIRST );
 
 			}
 
-			/**
-			 * Configures the update to affect all matching documents.
-			 *
-			 * @return a typed builder for choosing document or pipeline update operations
-			 */
 			public AtomicUpdateTypedBuilder multi() {
 
 				return new AtomicUpdateTypedBuilder( AtomicUpdateMode.MULTI );
 
 			}
 
-			/**
-			 * Configures a single-document upsert.
-			 * <p>MongoDB/Spring Data upsert is single-document oriented. This method name
-			 * intentionally includes {@code One} so callers do not mistake it for a
-			 * multi-upsert operation.</p>
-			 *
-			 * @return a typed builder for choosing document or pipeline update operations
-			 */
 			public AtomicUpsertTypedBuilder upsertOne() {
 
 				return new AtomicUpsertTypedBuilder();
 
 			}
 
-			/**
-			 * Configures a single-document upsert.
-			 *
-			 * @return a typed builder for choosing document or pipeline update operations
-			 *
-			 * @deprecated use {@link #upsertOne()} to make the single-document semantics explicit
-			 */
 			@Deprecated
 			public AtomicUpsertTypedBuilder upsert() {
 
@@ -6742,38 +5770,24 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			/**
-			 * Builder returned after the caller has explicitly selected the update mode.
-			 */
 			public class AtomicUpdateTypedBuilder {
 
 				private final AtomicUpdateMode mode;
 
 				protected AtomicUpdateTypedBuilder(
-													AtomicUpdateMode mode
+					AtomicUpdateMode mode
 				) {
 
 					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
 
 				}
 
-				/**
-				 * Selects regular MongoDB update operators such as {@code $set}, {@code $inc},
-				 * {@code $unset}, {@code $push}, {@code $pull}, and {@code $setOnInsert}.
-				 *
-				 * @return a document-update builder
-				 */
 				public AtomicDocumentUpdateBuilder document() {
 
 					return new AtomicDocumentUpdateBuilder( mode );
 
 				}
 
-				/**
-				 * Selects aggregation-pipeline update operators.
-				 *
-				 * @return a pipeline-update builder
-				 */
 				public AtomicPipelineUpdateBuilder pipeline() {
 
 					return new AtomicPipelineUpdateBuilder( mode );
@@ -6782,11 +5796,6 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			/**
-			 * Builder returned after the caller has explicitly selected single-document upsert mode.
-			 * <p>This type narrows {@link #document()} so {@code setOnInsert()} is available
-			 * only after {@code atomicUpdate().upsertOne().document()} at compile time.</p>
-			 */
 			public class AtomicUpsertTypedBuilder extends AtomicUpdateTypedBuilder {
 
 				private AtomicUpsertTypedBuilder() {
@@ -6795,11 +5804,6 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				/**
-				 * Selects regular MongoDB update operators for a single-document upsert.
-				 *
-				 * @return an upsert document-update builder that exposes {@code setOnInsert()}
-				 */
 				@Override
 				public AtomicUpsertDocumentBuilder document() {
 
@@ -6809,159 +5813,83 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			/**
-			 * Document-update builder for regular {@link MongoUpdate} operators.
-			 */
 			public class AtomicDocumentUpdateBuilder {
 
 				protected final AtomicUpdateMode mode;
-
 				protected final DocumentSpec doc = new DocumentSpec();
 
 				protected AtomicDocumentUpdateBuilder(
-														AtomicUpdateMode mode
+					AtomicUpdateMode mode
 				) {
 
 					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
 
 				}
 
-				/**
-				 * Increments the given field by the specified delta.
-				 *
-				 * @param field
-				 *            the target field
-				 * @param delta
-				 *            the increment amount
-				 *
-				 * @return this builder
-				 */
 				public AtomicDocumentUpdateBuilder inc(
 					String field, Number delta
 				) {
 
-					doc.inc( field, delta );
+					doc.add( Updates.inc( requireField( field ), delta ) );
 					return this;
 
 				}
 
-				/**
-				 * Sets the given field to the specified value.
-				 *
-				 * @param field
-				 *            the target field
-				 * @param value
-				 *            the value to assign
-				 *
-				 * @return this builder
-				 */
 				public AtomicDocumentUpdateBuilder set(
 					String field, Object value
 				) {
 
-					doc.set( field, value );
+					doc.add( Updates.set( requireField( field ), value ) );
 					return this;
 
 				}
 
-
-				/**
-				 * Removes the given field from the matched document.
-				 *
-				 * @param field
-				 *            the target field
-				 *
-				 * @return this builder
-				 */
 				public AtomicDocumentUpdateBuilder unset(
 					String field
 				) {
 
-					doc.unset( field );
+					doc.add( Updates.unset( requireField( field ) ) );
 					return this;
 
 				}
 
-				/**
-				 * Pushes the given value into the target array field.
-				 *
-				 * @param field
-				 *            the target array field
-				 * @param value
-				 *            the value to push
-				 *
-				 * @return this builder
-				 */
 				public AtomicDocumentUpdateBuilder push(
 					String field, Object value
 				) {
 
-					doc.push( field, value );
+					doc.add( Updates.push( requireField( field ), value ) );
 					return this;
 
 				}
 
-				/**
-				 * Adds the given value to the target array field if it is not already present.
-				 *
-				 * @param field
-				 *            the target array field
-				 * @param value
-				 *            the value to add
-				 *
-				 * @return this builder
-				 */
 				public AtomicDocumentUpdateBuilder addToSet(
 					String field, Object value
 				) {
 
-					doc.addToSet( field, value );
+					doc.add( Updates.addToSet( requireField( field ), value ) );
 					return this;
 
 				}
 
-				/**
-				 * Removes matching values from the target array field.
-				 *
-				 * @param field
-				 *            the target array field
-				 * @param value
-				 *            the value to remove
-				 *
-				 * @return this builder
-				 */
 				public AtomicDocumentUpdateBuilder pull(
 					String field, Object value
 				) {
 
-					doc.pull( field, value );
+					doc.add( Updates.pull( requireField( field ), value ) );
 					return this;
 
 				}
 
-				/**
-				 * Executes the configured document-based atomic update.
-				 *
-				 * @return a {@link Mono} emitting the update result
-				 */
 				public Mono<UpdateResult> execute() {
 
 					if (doc.isEmpty())
 						return Mono.error( new IllegalStateException( "No document update specified." ) );
-
-					MongoUpdateDefinition updateDefinition = doc.build();
-					return doExecute( mode, updateDefinition );
+					return doExecute( mode, doc.build() );
 
 				}
 
 			}
 
-			/**
-			 * Document-update builder for {@code atomicUpdate().upsertOne().document()}.
-			 * <p>This subclass is the only document-update builder that exposes
-			 * {@code setOnInsert()}, so {@code first().document()} and {@code multi().document()}
-			 * cannot call it at compile time.</p>
-			 */
 			public class AtomicUpsertDocumentBuilder extends AtomicDocumentUpdateBuilder {
 
 				private AtomicUpsertDocumentBuilder() {
@@ -6990,21 +5918,11 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				/**
-				 * Sets the given field only when the upsert inserts a new document.
-				 *
-				 * @param field
-				 *            the target field
-				 * @param value
-				 *            the value to assign on insert
-				 *
-				 * @return this builder
-				 */
 				public AtomicUpsertDocumentBuilder setOnInsert(
 					String field, Object value
 				) {
 
-					doc.setOnInsert( field, value );
+					doc.add( Updates.setOnInsert( requireField( field ), value ) );
 					return this;
 
 				}
@@ -7051,52 +5969,28 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
-			/**
-			 * Pipeline-update builder for {@link MongoAggregationUpdate} operators.
-			 */
 			public class AtomicPipelineUpdateBuilder {
 
 				private final AtomicUpdateMode mode;
-
 				private final PipelineSpec pipe = new PipelineSpec();
 
 				private AtomicPipelineUpdateBuilder(
-													AtomicUpdateMode mode
+					AtomicUpdateMode mode
 				) {
 
 					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
 
 				}
 
-				/**
-				 * Adds a pipeline-based {@code $set} expression for the given field.
-				 *
-				 * @param field
-				 *            the target field
-				 * @param valueOrExpr
-				 *            the assigned value or aggregation expression
-				 *
-				 * @return this builder
-				 */
 				public AtomicPipelineUpdateBuilder set(
-					String field, Object valueOrExpr
+					String field, Object valueOrExpression
 				) {
 
-					pipe.set( field, valueOrExpr );
+					pipe.set( field, valueOrExpression );
 					return this;
 
 				}
 
-				/**
-				 * Adds a pipeline-based increment expression for the given field.
-				 *
-				 * @param field
-				 *            the target field
-				 * @param delta
-				 *            the increment amount
-				 *
-				 * @return this builder
-				 */
 				public AtomicPipelineUpdateBuilder inc(
 					String field, Number delta
 				) {
@@ -7106,14 +6000,6 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				/**
-				 * Adds a pipeline-based {@code $unset} stage for the given fields.
-				 *
-				 * @param fields
-				 *            the fields to unset
-				 *
-				 * @return this builder
-				 */
 				public AtomicPipelineUpdateBuilder unset(
 					String... fields
 				) {
@@ -7123,16 +6009,9 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				/**
-				 * Appends a raw aggregation update stage.
-				 *
-				 * @param stage
-				 *            the raw stage document
-				 *
-				 * @return this builder
-				 */
+				/** Appends a raw MongoDB driver update-pipeline stage. */
 				public AtomicPipelineUpdateBuilder stage(
-					Document stage
+					Bson stage
 				) {
 
 					pipe.stage( stage );
@@ -7140,11 +6019,6 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				/**
-				 * Flushes the current pending pipeline stage and starts a new stage boundary.
-				 *
-				 * @return this builder
-				 */
 				public AtomicPipelineUpdateBuilder nextStage() {
 
 					pipe.nextStage();
@@ -7152,143 +6026,79 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				/**
-				 * Executes the configured pipeline-based atomic update.
-				 *
-				 * @return a {@link Mono} emitting the update result
-				 */
 				public Mono<UpdateResult> execute() {
 
 					if (pipe.isEmpty())
 						return Mono.error( new IllegalStateException( "No pipeline update specified." ) );
-
-					MongoUpdateDefinition updateDefinition = pipe.build();
-					return doExecute( mode, updateDefinition );
+					return doExecute( mode, pipe.build() );
 
 				}
 
 			}
 
 			private Mono<UpdateResult> doExecute(
-				AtomicUpdateMode mode, MongoUpdateDefinition updateDef
+				AtomicUpdateMode mode, UpdateSpec updateSpec
 			) {
 
-				Mono<MongoQuery> queryMono = fieldBuilder.buildCriteria().map( opt -> {
-					MongoQuery q = new MongoQuery();
-					opt.ifPresent( q::addCriteria );
-					// applyQueryOptions( q );
-					return q;
-
+				return Mono.zip( executeClassMono, fieldBuilder.buildCriteria() ).flatMap( tuple -> {
+					Bson filter = tuple.getT2().orElseGet( Document::new );
+					return switch (mode) {
+						case UPSERT_ONE -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, false, true );
+						case MULTI -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, true, false );
+						case FIRST -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, false, false );
+					};
 				} );
-
-				return Mono
-					.zip( executeClassMono, queryMono )
-					.flatMap( tp -> {
-						Class<E> entityClass = tp.getT1();
-						MongoQuery query = tp.getT2();
-
-						return switch (mode) {
-							case UPSERT_ONE -> update( mongoExecutionContext, entityClass, collectionName, query, updateDef, false, true );
-							case MULTI -> update( mongoExecutionContext, entityClass, collectionName, query, updateDef, true, false );
-							case FIRST -> update( mongoExecutionContext, entityClass, collectionName, query, updateDef, false, false );
-
-						};
-
-					} );
 
 			}
 
 			private class DocumentSpec {
 
-				private final MongoUpdate update = new MongoUpdate();
+				private final List<Bson> updates = new ArrayList<>();
 
-				void inc(
-					String f, Number d
+				void add(
+					Bson update
 				) {
 
-					update.inc( requireField( f ), d );
+					updates.add( update );
 
 				}
 
-				void set(
-					String f, Object v
-				) {
+				UpdateSpec build() {
 
-					update.set( requireField( f ), v );
+					return UpdateSpec.document( updates.size() == 1 ? updates.get( 0 ) : Updates.combine( updates ) );
 
 				}
 
-				void setOnInsert(
-					String f, Object v
-				) {
+				boolean isEmpty() {
 
-					update.setOnInsert( requireField( f ), v );
+					return updates.isEmpty();
 
 				}
-
-				void unset(
-					String f
-				) {
-
-					update.unset( requireField( f ) );
-
-				}
-
-				void push(
-					String f, Object v
-				) {
-
-					update.push( requireField( f ), v );
-
-				}
-
-				void addToSet(
-					String f, Object v
-				) {
-
-					update.addToSet( requireField( f ), v );
-
-				}
-
-				void pull(
-					String f, Object v
-				) {
-
-					update.pull( requireField( f ), v );
-
-				}
-
-				MongoUpdateDefinition build() {
-
-					return update;
-
-				}
-
-				boolean isEmpty() { return update.getUpdateObject() == null || update.getUpdateObject().isEmpty(); }
 
 			}
 
 			private class PipelineSpec {
 
-				private final List<MongoAggregationOperation> pipeline = new ArrayList<>();
-
+				private final List<Bson> pipeline = new ArrayList<>();
 				private Document pendingSet = new Document();
 
 				void set(
-					String f, Object vOrExpr
+					String field, Object valueOrExpression
 				) {
 
-					pendingSet.put( requireField( f ), vOrExpr );
+					pendingSet.put( requireField( field ), valueOrExpression );
 
 				}
 
 				void inc(
-					String f, Number d
+					String field, Number delta
 				) {
 
-					String ff = requireField( f );
-					Document expr = new Document( "$add", List.of( new Document( "$ifNull", List.of( "$" + ff, 0 ) ), d ) );
-					set( ff, expr );
+					String physicalField = requireField( field );
+					set(
+						physicalField,
+						new Document( "$add", List.of( new Document( "$ifNull", List.of( "$" + physicalField, 0 ) ), delta ) )
+					);
 
 				}
 
@@ -7297,19 +6107,24 @@ public class ReactiveMongoDsl<K> {
 				) {
 
 					flushSet();
-					List<String> keys = Arrays.stream( fields ).filter( Objects::nonNull ).map( String::trim ).filter( s -> ! s.isBlank() ).toList();
-					if (! keys.isEmpty())
-						pipeline.add( ctx -> new Document( "$unset", keys ) );
+					List<String> physicalFields = Arrays.stream( fields )
+						.filter( Objects::nonNull )
+						.map( String::trim )
+						.filter( value -> ! value.isBlank() )
+						.map( MongoFieldNameSupport::toMongoField )
+						.toList();
+					if (! physicalFields.isEmpty())
+						pipeline.add( new Document( "$unset", physicalFields.size() == 1 ? physicalFields.get( 0 ) : physicalFields ) );
 
 				}
 
 				void stage(
-					Document st
+					Bson stage
 				) {
 
 					flushSet();
-					if (st != null && ! st.isEmpty())
-						pipeline.add( ctx -> new Document( st ) );
+					if (stage != null)
+						pipeline.add( stage );
 
 				}
 
@@ -7319,27 +6134,24 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
-				MongoUpdateDefinition build() {
+				UpdateSpec build() {
 
 					flushSet();
-					return MongoAggregationUpdate.from( pipeline );
+					return UpdateSpec.pipeline( pipeline );
 
 				}
 
 				boolean isEmpty() {
 
-					flushSet();
-					return pipeline.isEmpty();
+					return pipeline.isEmpty() && pendingSet.isEmpty();
 
 				}
 
 				private void flushSet() {
 
-					if (pendingSet != null && ! pendingSet.isEmpty()) {
-						Document st = new Document( "$set", new Document( pendingSet ) );
-						pipeline.add( ctx -> st );
+					if (! pendingSet.isEmpty()) {
+						pipeline.add( new Document( "$set", new Document( pendingSet ) ) );
 						pendingSet = new Document();
-
 					}
 
 				}
@@ -7352,11 +6164,12 @@ public class ReactiveMongoDsl<K> {
 
 				if (field == null || field.isBlank())
 					throw new IllegalArgumentException( "field must not be null/blank" );
-				return field;
+				return MongoFieldNameSupport.toMongoField( field );
 
 			}
 
 		}
+
 
 
 
