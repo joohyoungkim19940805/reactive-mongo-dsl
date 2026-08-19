@@ -34,8 +34,11 @@ import com.mongodb.reactivestreams.client.MongoDatabase;
 import reactor.core.publisher.Mono;
 
 
+// 실제 DB에 접속하지 않고 DSL이 MongoDB Driver와 동일한 BSON/stage를 생성하는지 검증한다.
+// 따라서 이 클래스의 Search/Vector 테스트는 execute()가 아니라 생성된 Driver 표현을 직접 비교한다.
 class MongoDriverDelegationTest {
 
+	// text 편의 DSL이 MongoDB Driver의 text operator와 동일한 BSON을 생성하는지 검증한다.
 	@Test
 	void textConvenienceOperatorMatchesMongoDriverRendering() {
 
@@ -62,6 +65,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// 경로 기반 boost score 편의 API가 Driver SearchScore와 동일하게 위임되는지 검증한다.
 	@Test
 	void simpleScoreConvenienceDelegatesToMongoDriverScore() {
 
@@ -72,6 +76,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// Search path에 Enum을 넘겼을 때 Enum.toString() 값을 실제 MongoDB 필드명으로 사용하는지 검증한다.
 	@Test
 	void enumSearchPathUsesToStringAsPhysicalFieldName() {
 
@@ -86,6 +91,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// 숫자 range 편의 DSL이 Driver의 numberRange와 동일한 BSON을 생성하는지 검증한다.
 	@Test
 	void numericRangeConvenienceOperatorMatchesMongoDriverRendering() {
 
@@ -104,6 +110,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// Driver typed API에 없는 text.matchCriteria 기능을 DSL이 서버 문법 그대로 보존하는지 검증한다.
 	@Test
 	void textMatchCriteriaKeepsMongoSearchFeatureMissingFromDriverTypedApi() {
 
@@ -126,6 +133,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// Driver typed API가 직접 지원하지 않는 문자열 range를 DSL이 서버 문법으로 유지하는지 검증한다.
 	@Test
 	void stringRangeKeepsMongoSearchFeatureMissingFromDriverTypedApi() {
 
@@ -148,6 +156,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// SearchHighlightSpec 편의 빌더가 Driver SearchHighlight와 동일한 BSON을 생성하는지 검증한다.
 	@Test
 	void highlightConvenienceSpecMatchesMongoDriverRendering() {
 
@@ -168,6 +177,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// Search builder가 DSL wrapper뿐 아니라 Driver SearchHighlight를 직접 받아 동일한 search stage를 만드는지 검증한다.
 	@Test
 	void searchBuilderAcceptsDriverNativeHighlightDirectly() throws Exception {
 
@@ -194,6 +204,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// 기존 AtlasSearchOperator 확장 구현이 Driver SearchOperator로 계속 브리지되는지 호환성을 검증한다.
 	@Test
 	void legacyCustomSearchOperatorStillBridgesToDriverOperator() {
 
@@ -222,6 +233,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// Search builder의 operator/options가 Driver Aggregates.search와 동일한 stage로 조립되는지 검증한다.
 	@Test
 	void searchStageUsesDriverSearchStageAndOptions() throws Exception {
 
@@ -248,6 +260,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// compound 편의 API에서도 Enum path의 toString() 물리 필드명이 유지되는지 검증한다.
 	@Test
 	void compoundConvenienceEnumPathUsesToStringAsPhysicalFieldName() throws Exception {
 
@@ -274,6 +287,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// Search field sort는 Driver Sorts를 사용하면서 searchScore 정렬 편의 기능도 함께 보존하는지 검증한다.
 	@Test
 	void searchSortUsesDriverSortForFieldsAndKeepsScoreConvenience() throws Exception {
 
@@ -305,6 +319,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// score 정렬과 SortSpec을 섞었을 때 호출 순서가 최종 Search sort 우선순위에 그대로 반영되는지 검증한다.
 	@Test
 	void searchScoreAndSortSpecPreserveCallPriority() throws Exception {
 
@@ -337,6 +352,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// findAll의 SortSpec이 지정 순서를 보존하고 id/Enum 필드명 정규화 규칙을 공통으로 사용하는지 검증한다.
 	@Test
 	void findAllSortSpecPreservesOrderAndUsesSharedFieldNormalization() throws Exception {
 
@@ -365,6 +381,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// readPreference/isAllowDiskUse 같은 공통 옵션 호출 후에도 동일 concrete builder가 반환되어 전용 DSL 체이닝이 유지되는지 검증한다.
 	@Test
 	void commonQueryOptionsKeepConcreteBuilderFluency() {
 
@@ -426,6 +443,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// SortSpec sub-DSL에서 Driver Bson sort를 순서대로 추가하고 end()로 원래 query builder에 복귀하는지 검증한다.
 	@Test
 	void sortSpecCanWrapDriverSortsAndReturnToParentBuilder() throws Exception {
 
@@ -458,6 +476,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// Lookup pipeline도 query와 동일한 SortSpec DSL을 사용해 정렬 순서를 보존하는지 검증한다.
 	@Test
 	void lookupSortAcceptsSameOrderedSortSpec() {
 
@@ -482,6 +501,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// 일반 문자열의 *를 자동 wildcard로 해석하지 않고 SearchPaths.wildcard를 통한 명시적 wildcard만 허용하는지 검증한다.
 	@Test
 	void wildcardSearchPathMustBeExplicit() {
 
@@ -501,6 +521,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// DSL 문자열 path의 id는 _id로 정규화하되 사용자가 직접 넘긴 Driver SearchPath는 변경하지 않는지 검증한다.
 	@Test
 	void searchConveniencePathNormalizesIdButDriverPathIsPreserved() {
 
@@ -524,6 +545,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// 수동 query vector의 Vector Search DSL이 Driver Aggregates.vectorSearch와 동일한 stage를 생성하는지 검증한다.
 	@Test
 	void vectorStageUsesDriverVectorSearchStage() throws Exception {
 
@@ -554,6 +576,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// text query/model을 사용하는 automated embedding Vector Search가 Driver VectorSearchQuery 형태와 동일한지 검증한다.
 	@Test
 	void automatedEmbeddingVectorQueryUsesDriverQueryShape() throws Exception {
 
@@ -583,6 +606,7 @@ class MongoDriverDelegationTest {
 
 	}
 
+	// DSL operator에 Driver SearchScore를 직접 전달해도 변형 없이 최종 operator에 반영되는지 검증한다.
 	@Test
 	void driverNativeScoreCanPassThroughConvenienceOperator() {
 
@@ -599,6 +623,7 @@ class MongoDriverDelegationTest {
 		assertEquals( MongoBsonSupport.toDocument( expected ), MongoBsonSupport.toDocument( actual ) );
 
 	}
+
 
 	private static MongoExecutionContext context() {
 

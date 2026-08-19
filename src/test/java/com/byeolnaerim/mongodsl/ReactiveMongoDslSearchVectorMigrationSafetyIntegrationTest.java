@@ -33,6 +33,8 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 
+// 실제 Atlas 환경에서 Search/Vector index를 준비하고 DSL의 Search/Vector 쿼리가 끝까지 실행되는지 검증한다.
+// 비용을 줄이기 위해 고정 fixture 3개와 기존 index를 재사용하며, index 생성 이후에는 fixture를 자동 수정하지 않는다.
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class ReactiveMongoDslSearchVectorMigrationSafetyIntegrationTest {
 
@@ -87,6 +89,7 @@ class ReactiveMongoDslSearchVectorMigrationSafetyIntegrationTest {
 
 	private ReactiveMongoDsl<TestMongo> mongoDsl;
 
+	// 실제 Atlas에 연결해 고정 fixture를 인덱스보다 먼저 준비하고, 없는 Search/Vector index만 생성한 뒤 READY/queryable 상태까지 기다린다.
 	@BeforeAll
 	void connectAndInitializeSearchIndexes() {
 
@@ -216,6 +219,7 @@ class ReactiveMongoDslSearchVectorMigrationSafetyIntegrationTest {
 
 	}
 
+	// Search/Vector fixture와 index는 재사용하도록 남겨두고 MongoClient만 종료한다.
 	@AfterAll
 	void disconnect() {
 
@@ -226,6 +230,7 @@ class ReactiveMongoDslSearchVectorMigrationSafetyIntegrationTest {
 
 	}
 
+	// 준비된 Atlas Search index에 DSL search를 execute/subscribe하여 실제 결과와 search score가 반환되는지 검증한다.
 	@Test
 	void atlasSearchExecutesAgainstReadySearchIndex() {
 
@@ -255,6 +260,7 @@ class ReactiveMongoDslSearchVectorMigrationSafetyIntegrationTest {
 
 	}
 
+	// 준비된 Vector Search index에 DSL vectorSearch를 execute/subscribe하여 필터, 최근접 결과, vector score가 정상 반환되는지 검증한다.
 	@Test
 	void vectorSearchExecutesAgainstReadyVectorIndex() {
 

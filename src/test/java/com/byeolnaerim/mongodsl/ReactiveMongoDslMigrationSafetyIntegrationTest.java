@@ -45,6 +45,7 @@ import reactor.test.StepVerifier;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.json.JsonMapper;
 
+// 실제 MongoDB에 접속해 기존 DSL의 CRUD, bulk, backup/history, aggregation, lookup, transaction 동작을 회귀 검증한다.
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class ReactiveMongoDslMigrationSafetyIntegrationTest {
 
@@ -67,6 +68,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 	private DriverMongoExecutionContext driverContext;
 	private final ObjectMapper objectMapper = JsonMapper.builder().findAndAddModules().build();
 
+	// 실제 테스트 MongoDB에 연결하고 codec/context/DSL 및 테스트용 collection을 초기화한다.
 	@BeforeAll
 	void connect() {
 		TestEnvironment environment = TestEnvironment.load();
@@ -113,6 +115,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			.block();
 	}
 
+	// 각 테스트가 서로 영향을 주지 않도록 테스트용 collection의 데이터를 매번 비운다.
 	@BeforeEach
 	void cleanCollections() {
 		Flux
@@ -122,6 +125,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			.block();
 	}
 
+	// 통합 테스트가 끝나면 테스트 DB를 제거하고 MongoClient를 종료한다.
 	@AfterAll
 	void disconnect() {
 		if (mongoDatabase != null)
@@ -130,6 +134,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			mongoClient.close();
 	}
 
+	// save/find/count/exists 전 과정을 실제 DB에서 실행해 String id↔ObjectId 및 물리 필드명 매핑이 round-trip 되는지 검증한다.
 	@Test
 	void saveFindCountExistsAndSpringLikeIdMappingRoundTrip() {
 		ProductionLikeEntity entity = entity("account-a", "join-a", 2026, 101, "READY", 1000L);
@@ -177,6 +182,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		);
 	}
 
+	// 중첩 객체의 id와 물리 필드명이 실제 저장/조회에서도 올바른 dot path로 유지되는지 검증한다.
 	@Test
 	void nestedProductionPathsPreserveEmbeddedIdAndFieldMapping() {
 		ProductionLikeEntity entity = entity("nested-path", "join-nested", 2026, 111, "READY", 1000L);
@@ -207,6 +213,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(entity.getAuction().getId(), found.getAuction().getId());
 	}
 
+	// 자동 생성된 String id entity를 다시 save할 때 중복 insert가 아니라 기존 문서를 replace하는지 검증한다.
 	@Test
 	void repeatedSaveWithGeneratedStringIdReplacesInsteadOfInsertingDuplicate() {
 		ProductionLikeEntity entity = entity("account-a", "join-a", 2026, 102, "READY", 1000L);
@@ -223,6 +230,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(2500L, raw.get("amount", Number.class).longValue());
 	}
 
+	// saveAllBulk가 여러 entity에 id를 생성하고 실제 저장 후 동일 값으로 다시 읽을 수 있는지 검증한다.
 	@Test
 	void saveAllBulkAssignsGeneratedIdsAndRoundTrips() {
 		List<ProductionLikeEntity> entities = List.of(
@@ -242,6 +250,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(3L, Mono.from(mongoDatabase.getCollection(ENTITY_COLLECTION).countDocuments()).block());
 	}
 
+	// id 기준 bulk upsert가 신규 insert와 기존 update를 기존 의미대로 처리하는지 검증한다.
 	@Test
 	void bulkUpsertByIdMatchesLegacyInsertAndUpdateSemantics() {
 		ProductionLikeEntity existing = entity("existing", "join-a", 2026, 301, "READY", 100L);
@@ -262,6 +271,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals("DONE", raw.getString("status"));
 	}
 
+	// business key 기준 bulk upsert가 Java 필드명이 아니라 매핑된 MongoDB 물리 필드명을 사용하는지 검증한다.
 	@Test
 	void bulkUpsertByBusinessKeyUsesMappedMongoFields() {
 		ProductionLikeEntity original = entity("business-key", "join-a", 2026, 401, "READY", 100L);
@@ -289,6 +299,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(999L, updated.get("amount", Number.class).longValue());
 	}
 
+	// 단건 deleteWithBackup이 backup snapshot을 남긴 뒤 원본 문서를 제거하는지 검증한다.
 	@Test
 	void deleteWithBackupCreatesSnapshotAndRemovesSource() {
 		ProductionLikeEntity entity = entity("remove", "join-a", 2026, 501, "READY", 100L);
@@ -309,6 +320,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals("remove", backup.getString("account_name"));
 	}
 
+	// 단건 backup 실패 시에도 기존 delete-first 순서/실패 의미가 유지되는지 검증한다.
 	@Test
 	void singleDeleteBackupFailureKeepsLegacyDeleteFirstSemantics() {
 		ProductionLikeEntity entity = entity("delete-before-backup-failure", "join-a", 2026, 502, "READY", 100L);
@@ -324,6 +336,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertNull(rawEntity(entity.getId()));
 	}
 
+	// bulk deleteWithBackup이 삭제 대상 전체의 backup snapshot을 보존하고 원본을 제거하는지 검증한다.
 	@Test
 	void deleteBulkWithBackupPreservesAllSnapshots() {
 		List<ProductionLikeEntity> entities = new ArrayList<>(List.of(
@@ -338,6 +351,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(2L, Mono.from(mongoDatabase.getCollection(ENTITY_COLLECTION + "_remove").countDocuments()).block());
 	}
 
+	// bulk backup 실패 시 기존 backup-first 의미에 따라 원본 삭제가 진행되지 않는지 검증한다.
 	@Test
 	void bulkDeleteBackupFailureKeepsLegacyBackupFirstSemantics() {
 		List<ProductionLikeEntity> entities = new ArrayList<>(List.of(
@@ -361,6 +375,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(2L, Mono.from(mongoDatabase.getCollection(ENTITY_COLLECTION).countDocuments()).block());
 	}
 
+	// createHistory가 원본을 깊은 복사하고 history 문서에 독립적인 id를 생성하는지 검증한다.
 	@Test
 	void createHistoryDeepClonesAndGeneratesIndependentId() {
 		ProductionLikeEntity entity = entity("history-before", "join-a", 2026, 601, "READY", 100L);
@@ -380,6 +395,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals("history-before", history.getString("account_name"));
 	}
 
+	// atomic document update와 pipeline update가 매핑된 실제 MongoDB 필드명을 사용해 적용되는지 검증한다.
 	@Test
 	void atomicDocumentAndPipelineUpdatesUsePhysicalMongoFields() {
 		ProductionLikeEntity entity = entity("atomic-before", "join-a", 2026, 701, "READY", 100L);
@@ -416,6 +432,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(4, raw.get("retryCount", Number.class).intValue());
 	}
 
+	// findAll/aggregation 경로에서 물리 필드 기준 sort, paging, projection 결과가 일관되게 유지되는지 검증한다.
 	@Test
 	void findAllAndAggregationPreservePhysicalSortPagingAndProjection() {
 		List<ProductionLikeEntity> entities = List.of(
@@ -455,6 +472,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertTrue(aggregation.stream().allMatch(value -> value.getStatus() == null));
 	}
 
+	// aggregation paging 결과의 data/totalCount 구조가 실제 운영용 page contract와 동일한지 검증한다.
 	@Test
 	void aggregationPageResultMatchesProductionPagingAndCountShape() {
 		List<ProductionLikeEntity> entities = List.of(
@@ -482,6 +500,8 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(List.of("page-charlie", "page-bravo"), page.getData().stream().map(ProductionLikeEntity::getAccountName).toList());
 	}
 
+
+	// lookup이 좌/우 매핑 필드를 정확히 사용하고 오른쪽 결과는 오른쪽 execution context로 decode하는지 검증한다.
 	@Test
 	void lookupMapsLeftAndRightFieldsAndUsesRightExecutionContextForMapping() {
 		ProductionLikeEntity left = entity("lookup-left", "join-lookup", 2026, 901, "READY", 100L);
@@ -526,6 +546,89 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals("ACTIVE", result.getFirst().getRight().getFirst().getStatus());
 	}
 
+	// lookup 결과를 unwind하면 MongoDB가 오른쪽 값을 배열이 아닌 단일 Document로 반환해도 singleton List로 안전하게 매핑되는지 회귀 검증한다.
+	@Test
+	void lookupUnwindMapsSingleDocumentBackToSingletonRightList() {
+		ProductionLikeEntity left = entity("lookup-unwind", "join-unwind", 2026, 906, "READY", 100L);
+		mongoDsl.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT).save(left).block();
+		mongoDsl
+			.executeEntity(ProductionLikeChild.class, TestMongo.RIGHT)
+			.saveAllBulk(List.of(
+				child("join-unwind", "ACTIVE", "selected-a"),
+				child("join-unwind", "ACTIVE", "selected-b"),
+				child("join-unwind", "INACTIVE", "ignored")
+			))
+			.collectList()
+			.block();
+
+		var leftBuilder = mongoDsl
+			.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
+			.fields(pair("_id", new ObjectId(left.getId())))
+			.end();
+		var rightBuilder = mongoDsl
+			.executeEntity(ProductionLikeChild.class, TestMongo.RIGHT)
+			.fields(pair("child_status", "ACTIVE"))
+			.end()
+			.findAll();
+
+		List<ResultTuple<ProductionLikeEntity, List<ProductionLikeChild>>> result = leftBuilder
+			.findAll()
+			.executeLookup(
+				rightBuilder,
+				LookupSpec
+					.builder()
+					.as("childHit")
+					.bindConditionFields("left_join_key", Condition.eq, "right_join_key")
+					.unwind(false)
+					.build()
+			)
+			.collectList()
+			.block();
+
+		assertEquals(2, result.size());
+		assertTrue(result.stream().allMatch(tuple -> tuple.getRight().size() == 1));
+		assertEquals(
+			List.of("selected-a", "selected-b"),
+			result.stream().map(tuple -> tuple.getRight().getFirst().getValue()).sorted().toList()
+		);
+	}
+
+	// preserveNullAndEmptyArrays=true인 unwind에서 매칭 결과가 없어도 left row를 유지하고 오른쪽 값을 빈 List로 매핑하는지 검증한다.
+	@Test
+	void lookupUnwindPreservesLeftRowAndMapsMissingRightValueToEmptyList() {
+		ProductionLikeEntity left = entity("lookup-unwind-empty", "join-unwind-empty", 2026, 907, "READY", 100L);
+		mongoDsl.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT).save(left).block();
+
+		var leftBuilder = mongoDsl
+			.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
+			.fields(pair("_id", new ObjectId(left.getId())))
+			.end();
+		var rightBuilder = mongoDsl
+			.executeEntity(ProductionLikeChild.class, TestMongo.RIGHT)
+			.fields(pair("child_status", "ACTIVE"))
+			.end()
+			.findAll();
+
+		List<ResultTuple<ProductionLikeEntity, List<ProductionLikeChild>>> result = leftBuilder
+			.findAll()
+			.executeLookup(
+				rightBuilder,
+				LookupSpec
+					.builder()
+					.as("childHit")
+					.bindConditionFields("left_join_key", Condition.eq, "right_join_key")
+					.unwind(true)
+					.build()
+			)
+			.collectList()
+			.block();
+
+		assertEquals(1, result.size());
+		assertEquals(left.getId(), result.getFirst().getLeft().getId());
+		assertTrue(result.getFirst().getRight().isEmpty());
+	}
+
+	// lookup+count가 facet paging의 total/data 구조와 오른쪽 entity 매핑을 함께 보존하는지 검증한다.
 	@Test
 	void lookupAndCountMatchesProductionFacetPagingAndRightMapping() {
 		ProductionLikeEntity first = entity("lookup-count-a", "join-count-a", 2026, 911, "READY", 100L);
@@ -583,6 +686,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		);
 	}
 
+	// 트랜잭션 안의 순차 write가 모두 성공하면 commit되어 실제 DB에 반영되는지 검증한다.
 	@Test
 	void transactionCommitsSequentialWrites() {
 		ProductionLikeEntity first = entity("tx-commit-a", "join-a", 2026, 1001, "READY", 100L);
@@ -597,6 +701,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(2L, Mono.from(mongoDatabase.getCollection(ENTITY_COLLECTION).countDocuments()).block());
 	}
 
+	// 트랜잭션 중 오류가 발생하면 앞서 수행한 write까지 전부 rollback되는지 검증한다.
 	@Test
 	void transactionRollsBackAllWritesOnError() {
 		ProductionLikeEntity first = entity("tx-rollback-a", "join-a", 2026, 1011, "READY", 100L);
@@ -619,6 +724,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(0L, Mono.from(mongoDatabase.getCollection(ENTITY_COLLECTION).countDocuments()).block());
 	}
 
+	// 트랜잭션 작업 publisher가 empty로 끝나더라도 완료된 write는 정상 commit되는지 검증한다.
 	@Test
 	void emptyTransactionalPublisherStillCommitsCompletedWrites() {
 		ProductionLikeEntity entity = entity("tx-empty", "join-a", 2026, 1021, "READY", 100L);
@@ -631,11 +737,13 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(1L, Mono.from(mongoDatabase.getCollection(ENTITY_COLLECTION).countDocuments()).block());
 	}
 
+	// MongoTemplateResolver/MongoExecutionContext 추상화 뒤에서도 구현체의 native 객체를 타입으로 다시 얻을 수 있는지 검증한다.
 	@Test
 	void nativeObjectRemainsAvailableThroughResolverAbstraction() {
 		assertSame(leftContext.nativeMarker(), mongoDsl.getMongoTemplate(TestMongo.LEFT).getNative(NativeMarker.class));
 	}
 
+	// Driver context가 생성한 String ObjectId를 조회 조건과 재-save에 사용해도 중복 문서 없이 동일 entity를 갱신하는지 검증한다.
 	@Test
 	void driverContextGeneratedStringIdCanBeQueriedAndSavedAgainWithoutDuplicate() {
 		DriverPojo pojo = new DriverPojo();

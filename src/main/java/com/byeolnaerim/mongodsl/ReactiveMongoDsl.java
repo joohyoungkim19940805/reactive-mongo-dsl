@@ -52,6 +52,7 @@ import com.byeolnaerim.mongodsl.search.TextClause;
 import com.byeolnaerim.mongodsl.sort.SortSpec;
 import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
 import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
+import com.mongodb.ExplainVerbosity;
 import com.mongodb.ReadPreference;
 import com.mongodb.bulk.BulkWriteResult;
 import com.mongodb.client.model.Accumulators;
@@ -574,20 +575,23 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
+	private String resolveCollectionName(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName
+	) {
+
+		return explicitCollectionName != null && ! explicitCollectionName.isBlank()
+			? explicitCollectionName
+			: executionContext.getCollectionName( entityClass );
+
+	}
+
 	private Mono<MongoCollection<Document>> resolveCollection(
 		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName
 	) {
 
 		return executionContext
 			.getDatabase()
-			.map(
-				database -> database
-					.getCollection(
-						explicitCollectionName != null && ! explicitCollectionName.isBlank()
-							? explicitCollectionName
-							: executionContext.getCollectionName( entityClass )
-					)
-			);
+			.map( database -> database.getCollection( resolveCollectionName( executionContext, entityClass, explicitCollectionName ) ) );
 
 	}
 
@@ -661,6 +665,168 @@ public class ReactiveMongoDsl<K> {
 			publisher = publisher.allowDiskUse( aggregation.allowDiskUse );
 		aggregation.customizer.accept( publisher );
 		return publisher;
+
+	}
+
+	private Document previewFind(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, String operation, FindSpec query
+	) {
+
+		Document preview = new Document( "operation", operation )
+			.append( "collection", resolveCollectionName( executionContext, entityClass, explicitCollectionName ) )
+			.append( "filter", MongoBsonSupport.toDocument( query.filter ) );
+
+		if (query.sort != null)
+			preview.append( "sort", MongoBsonSupport.toDocument( query.sort ) );
+		if (query.projection != null)
+			preview.append( "projection", MongoBsonSupport.toDocument( query.projection ) );
+		if (query.skip > 0)
+			preview.append( "skip", query.skip );
+		if (query.limit > 0)
+			preview.append( "limit", query.limit );
+		if (query.readPreference != null)
+			preview.append( "readPreference", query.readPreference.toString() );
+		if (query.allowDiskUse != null)
+			preview.append( "allowDiskUse", query.allowDiskUse );
+
+		return preview;
+
+	}
+
+	private Document previewCount(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, FindSpec query
+	) {
+
+		Document preview = new Document( "operation", "count" )
+			.append( "collection", resolveCollectionName( executionContext, entityClass, explicitCollectionName ) )
+			.append( "filter", MongoBsonSupport.toDocument( query.filter ) );
+
+		if (query.skip > 0)
+			preview.append( "skip", query.skip );
+		if (query.limit > 0)
+			preview.append( "limit", query.limit );
+		if (query.readPreference != null)
+			preview.append( "readPreference", query.readPreference.toString() );
+
+		return preview;
+
+	}
+
+	private Document previewAggregation(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, AggregationSpec aggregation
+	) {
+
+		Document preview = new Document( "operation", "aggregate" )
+			.append( "collection", resolveCollectionName( executionContext, entityClass, explicitCollectionName ) )
+			.append( "pipeline", MongoBsonSupport.toDocuments( aggregation.pipeline ) );
+
+		if (aggregation.readPreference != null)
+			preview.append( "readPreference", aggregation.readPreference.toString() );
+		if (aggregation.allowDiskUse != null)
+			preview.append( "allowDiskUse", aggregation.allowDiskUse );
+
+		return preview;
+
+	}
+
+	private Mono<Document> explainFind(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, FindSpec query
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> applyQuery( collection, query, session ).explain(),
+					() -> applyQuery( collection, query, null ).explain()
+				)
+			);
+
+	}
+
+	private Mono<Document> explainFind(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, FindSpec query, ExplainVerbosity verbosity
+	) {
+
+		Objects.requireNonNull( verbosity, "verbosity" );
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> applyQuery( collection, query, session ).explain( verbosity ),
+					() -> applyQuery( collection, query, null ).explain( verbosity )
+				)
+			);
+
+	}
+
+	private Mono<Document> explainFindFirst(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, FindSpec query
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> applyQuery( collection, query, session ).limit( -1 ).explain(),
+					() -> applyQuery( collection, query, null ).limit( -1 ).explain()
+				)
+			);
+
+	}
+
+	private Mono<Document> explainFindFirst(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, FindSpec query, ExplainVerbosity verbosity
+	) {
+
+		Objects.requireNonNull( verbosity, "verbosity" );
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> applyQuery( collection, query, session ).limit( -1 ).explain( verbosity ),
+					() -> applyQuery( collection, query, null ).limit( -1 ).explain( verbosity )
+				)
+			);
+
+	}
+
+	private Mono<Document> explainAggregation(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, AggregationSpec aggregation
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> applyAggregation( collection, aggregation, session ).explain(),
+					() -> applyAggregation( collection, aggregation, null ).explain()
+				)
+			);
+
+	}
+
+	private Mono<Document> explainAggregation(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, AggregationSpec aggregation, ExplainVerbosity verbosity
+	) {
+
+		Objects.requireNonNull( verbosity, "verbosity" );
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMap(
+				collection -> executeWithSession(
+					session -> applyAggregation( collection, aggregation, session ).explain( verbosity ),
+					() -> applyAggregation( collection, aggregation, null ).explain( verbosity )
+				)
+			);
+
+	}
+
+	private <T> Flux<T> distinct(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, String field, Bson filter, Class<T> resultClass
+	) {
+
+		return resolveCollection( executionContext, entityClass, explicitCollectionName )
+			.flatMapMany(
+				collection -> executeFluxWithSession(
+					session -> collection.distinct( session, field, filter, resultClass ),
+					() -> collection.distinct( field, filter, resultClass )
+				)
+			);
 
 	}
 
@@ -1989,6 +2155,14 @@ public class ReactiveMongoDsl<K> {
 
 				Flux<E> execute();
 
+				Mono<Document> preview();
+
+				Mono<Document> explain();
+
+				Mono<Document> explain(
+					ExplainVerbosity verbosity
+				);
+
 				/**
 				 * Executes the current query as a reactive page.
 				 * <p>The data part remains a {@link Flux}; use {@code data()} for streaming
@@ -2036,6 +2210,14 @@ public class ReactiveMongoDsl<K> {
 
 				Mono<E> executeFirst();
 
+				Mono<Document> preview();
+
+				Mono<Document> explain();
+
+				Mono<Document> explain(
+					ExplainVerbosity verbosity
+				);
+
 			}
 
 			public interface FindAggregation<E> extends Runner {
@@ -2052,6 +2234,8 @@ public class ReactiveMongoDsl<K> {
 			public interface CountExecute<E> extends Runner {
 
 				Mono<Long> execute();
+
+				Mono<Document> preview();
 
 
 			}
@@ -2070,6 +2254,14 @@ public class ReactiveMongoDsl<K> {
 			public interface ExistsExecute<E> extends Runner {
 
 				Mono<Boolean> execute();
+
+				Mono<Document> preview();
+
+				Mono<Document> explain();
+
+				Mono<Document> explain(
+					ExplainVerbosity verbosity
+				);
 
 
 			}
@@ -2455,6 +2647,26 @@ public class ReactiveMongoDsl<K> {
 			public CountQueryBuilder count() {
 
 				return new CountQueryBuilder();
+
+			}
+
+			/**
+			 * Creates a query builder for distinct values of the given field.
+			 *
+			 * @param <R>
+			 *            the distinct result type
+			 * @param field
+			 *            the field name or enum-backed field identifier
+			 * @param resultClass
+			 *            the Driver decode target type
+			 *
+			 * @return a distinct query builder
+			 */
+			public <R> DistinctQueryBuilder<R> distinct(
+				Object field, Class<R> resultClass
+			) {
+
+				return new DistinctQueryBuilder<>( field, resultClass );
 
 			}
 
@@ -4022,6 +4234,54 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
+				public Mono<Document> preview() {
+
+					return Mono
+						.zip( executeClassMono, postFilterBuilder.buildCriteria() )
+						.map(
+							tuple -> previewAggregation(
+								mongoExecutionContext,
+								tuple.getT1(),
+								collectionName,
+								applyAggOptions( buildAggregationOps( tuple.getT2(), true, true, searchCountType != null, true ) )
+							)
+						);
+
+				}
+
+				public Mono<Document> explain() {
+
+					return Mono
+						.zip( executeClassMono, postFilterBuilder.buildCriteria() )
+						.flatMap(
+							tuple -> explainAggregation(
+								mongoExecutionContext,
+								tuple.getT1(),
+								collectionName,
+								applyAggOptions( buildAggregationOps( tuple.getT2(), true, true, searchCountType != null, true ) )
+							)
+						);
+
+				}
+
+				public Mono<Document> explain(
+					ExplainVerbosity verbosity
+				) {
+
+					return Mono
+						.zip( executeClassMono, postFilterBuilder.buildCriteria() )
+						.flatMap(
+							tuple -> explainAggregation(
+								mongoExecutionContext,
+								tuple.getT1(),
+								collectionName,
+								applyAggOptions( buildAggregationOps( tuple.getT2(), true, true, searchCountType != null, true ) ),
+								verbosity
+							)
+						);
+
+				}
+
 				/**
 				 * Executes the Atlas Search query and collects both the current page data and
 				 * the total pipeline result count.
@@ -4056,6 +4316,27 @@ public class ReactiveMongoDsl<K> {
 			 */
 			public class SearchFindQueryBuilder<T extends E> {
 
+				private Mono<AggregationSpec> buildFirstAggregation() {
+
+					return postFilterBuilder.buildCriteria().map( criteria -> {
+						Integer oldPageNumber = pageNumber;
+						Integer oldPageSize = pageSize;
+
+						try {
+							pageNumber = 0;
+							pageSize = 1;
+							return applyAggOptions( buildAggregationOps( criteria, true, true, searchCountType != null, true ) );
+
+						} finally {
+							pageNumber = oldPageNumber;
+							pageSize = oldPageSize;
+
+						}
+
+					} );
+
+				}
+
 				/**
 				 * Executes the Atlas Search query and returns at most one mapped entity.
 				 *
@@ -4088,6 +4369,32 @@ public class ReactiveMongoDsl<K> {
 							pageSize = oldPageSize;
 
 						} );
+
+				}
+
+				public Mono<Document> preview() {
+
+					return Mono
+						.zip( executeClassMono, buildFirstAggregation() )
+						.map( tuple -> previewAggregation( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ).append( "first", true ) );
+
+				}
+
+				public Mono<Document> explain() {
+
+					return Mono
+						.zip( executeClassMono, buildFirstAggregation() )
+						.flatMap( tuple -> explainAggregation( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
+
+				}
+
+				public Mono<Document> explain(
+					ExplainVerbosity verbosity
+				) {
+
+					return Mono
+						.zip( executeClassMono, buildFirstAggregation() )
+						.flatMap( tuple -> explainAggregation( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2(), verbosity ) );
 
 				}
 
@@ -4131,6 +4438,42 @@ public class ReactiveMongoDsl<K> {
 								.defaultIfEmpty( 0L );
 
 						} );
+
+				}
+
+				private AggregationSpec buildCountAggregation(
+					Optional<Bson> criteria
+				) {
+
+					List<Bson> ops = buildAggregationOps( criteria, false, false, searchCountType != null, false );
+					ops.add( Aggregates.count( "count" ) );
+					return applyAggOptions( ops );
+
+				}
+
+				public Mono<Document> preview() {
+
+					return Mono
+						.zip( executeClassMono, postFilterBuilder.buildCriteria().map( this::buildCountAggregation ) )
+						.map( tuple -> previewAggregation( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
+
+				}
+
+				public Mono<Document> explain() {
+
+					return Mono
+						.zip( executeClassMono, postFilterBuilder.buildCriteria().map( this::buildCountAggregation ) )
+						.flatMap( tuple -> explainAggregation( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
+
+				}
+
+				public Mono<Document> explain(
+					ExplainVerbosity verbosity
+				) {
+
+					return Mono
+						.zip( executeClassMono, postFilterBuilder.buildCriteria().map( this::buildCountAggregation ) )
+						.flatMap( tuple -> explainAggregation( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2(), verbosity ) );
 
 				}
 
@@ -4194,6 +4537,26 @@ public class ReactiveMongoDsl<K> {
 				public Mono<Boolean> execute() {
 
 					return count().execute().map( count -> count > 0L );
+
+				}
+
+				public Mono<Document> preview() {
+
+					return count().preview();
+
+				}
+
+				public Mono<Document> explain() {
+
+					return count().explain();
+
+				}
+
+				public Mono<Document> explain(
+					ExplainVerbosity verbosity
+				) {
+
+					return count().explain( verbosity );
 
 				}
 
@@ -5021,6 +5384,54 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
+				public Mono<Document> preview() {
+
+					return Mono
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.map(
+							tuple -> previewAggregation(
+								mongoExecutionContext,
+								tuple.getT1(),
+								collectionName,
+								applyAggOptions( buildAggregationOps( tuple.getT2(), tuple.getT3(), true, true ) )
+							)
+						);
+
+				}
+
+				public Mono<Document> explain() {
+
+					return Mono
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.flatMap(
+							tuple -> explainAggregation(
+								mongoExecutionContext,
+								tuple.getT1(),
+								collectionName,
+								applyAggOptions( buildAggregationOps( tuple.getT2(), tuple.getT3(), true, true ) )
+							)
+						);
+
+				}
+
+				public Mono<Document> explain(
+					ExplainVerbosity verbosity
+				) {
+
+					return Mono
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.flatMap(
+							tuple -> explainAggregation(
+								mongoExecutionContext,
+								tuple.getT1(),
+								collectionName,
+								applyAggOptions( buildAggregationOps( tuple.getT2(), tuple.getT3(), true, true ) ),
+								verbosity
+							)
+						);
+
+				}
+
 			}
 
 			/**
@@ -5050,6 +5461,26 @@ public class ReactiveMongoDsl<K> {
 				public Mono<E> executeFirst() {
 
 					return new VectorFindAllQueryBuilder<T>().execute().next();
+
+				}
+
+				public Mono<Document> preview() {
+
+					return new VectorFindAllQueryBuilder<T>().preview().map( preview -> preview.append( "first", true ) );
+
+				}
+
+				public Mono<Document> explain() {
+
+					return new VectorFindAllQueryBuilder<T>().explain();
+
+				}
+
+				public Mono<Document> explain(
+					ExplainVerbosity verbosity
+				) {
+
+					return new VectorFindAllQueryBuilder<T>().explain( verbosity );
 
 				}
 
@@ -5086,6 +5517,50 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
+				private AggregationSpec buildCountAggregation(
+					Optional<Bson> preCriteria, Optional<Bson> postCriteria
+				) {
+
+					List<Bson> ops = buildAggregationOps( preCriteria, postCriteria, false, false );
+					ops.add( Aggregates.count( "count" ) );
+					return applyAggOptions( ops );
+
+				}
+
+				public Mono<Document> preview() {
+
+					return Mono
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.map( tuple -> previewAggregation( mongoExecutionContext, tuple.getT1(), collectionName, buildCountAggregation( tuple.getT2(), tuple.getT3() ) ) );
+
+				}
+
+				public Mono<Document> explain() {
+
+					return Mono
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.flatMap( tuple -> explainAggregation( mongoExecutionContext, tuple.getT1(), collectionName, buildCountAggregation( tuple.getT2(), tuple.getT3() ) ) );
+
+				}
+
+				public Mono<Document> explain(
+					ExplainVerbosity verbosity
+				) {
+
+					return Mono
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.flatMap(
+							tuple -> explainAggregation(
+								mongoExecutionContext,
+								tuple.getT1(),
+								collectionName,
+								buildCountAggregation( tuple.getT2(), tuple.getT3() ),
+								verbosity
+							)
+						);
+
+				}
+
 			}
 
 			/**
@@ -5101,6 +5576,26 @@ public class ReactiveMongoDsl<K> {
 				public Mono<Boolean> execute() {
 
 					return count().execute().map( count -> count > 0L );
+
+				}
+
+				public Mono<Document> preview() {
+
+					return count().preview();
+
+				}
+
+				public Mono<Document> explain() {
+
+					return count().explain();
+
+				}
+
+				public Mono<Document> explain(
+					ExplainVerbosity verbosity
+				) {
+
+					return count().explain( verbosity );
 
 				}
 
@@ -5348,28 +5843,60 @@ public class ReactiveMongoDsl<K> {
 			 *
 			 * @return a {@link Flux} emitting all matching entities
 			 */
+			private FindSpec buildFindSpec(
+				Optional<Bson> criteriaOptional
+			) {
+
+				FindSpec query = new FindSpec().filter( criteriaOptional.orElseGet( Document::new ) );
+
+				if (paging != null)
+					query.skip( (long) paging.pageNumber * paging.pageSize ).limit( paging.pageSize );
+				if (sort != null)
+					query.sort( sort );
+				if (excludes != null && excludes.length > 0)
+					query.projection( Projections.exclude( excludes ) );
+
+				return applyQueryOptions( query );
+
+			}
+
 			@Override
 			public Flux<E> execute() {
 
-				Mono<FindSpec> queryMono = fieldBuilder.buildCriteria().map( criteriaOptional -> {
-					FindSpec query = new FindSpec().filter( criteriaOptional.orElseGet( Document::new ) );
-
-					if (paging != null)
-						query.skip( (long) paging.pageNumber * paging.pageSize ).limit( paging.pageSize );
-					if (sort != null)
-						query.sort( sort );
-					if (excludes != null && excludes.length > 0)
-						query.projection( Projections.exclude( excludes ) );
-
-					return applyQueryOptions( query );
-
-				} );
-
 				return Mono
-					.zip( executeClassMono, queryMono )
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( this::buildFindSpec ) )
 					.flatMapMany(
 						tuple -> find( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() )
 					);
+
+			}
+
+			@Override
+			public Mono<Document> preview() {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( this::buildFindSpec ) )
+					.map( tuple -> previewFind( mongoExecutionContext, tuple.getT1(), collectionName, "find", tuple.getT2() ) );
+
+			}
+
+			@Override
+			public Mono<Document> explain() {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( this::buildFindSpec ) )
+					.flatMap( tuple -> explainFind( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
+
+			}
+
+			@Override
+			public Mono<Document> explain(
+				ExplainVerbosity verbosity
+			) {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( this::buildFindSpec ) )
+					.flatMap( tuple -> explainFind( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2(), verbosity ) );
 
 			}
 
@@ -5764,6 +6291,35 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			@Override
+			public Mono<Document> preview() {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( criteria -> buildFindSpec( criteria, false ) ) )
+					.map( tuple -> previewFind( mongoExecutionContext, tuple.getT1(), collectionName, "find", tuple.getT2() ).append( "first", true ) );
+
+			}
+
+			@Override
+			public Mono<Document> explain() {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( criteria -> buildFindSpec( criteria, false ) ) )
+					.flatMap( tuple -> explainFindFirst( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
+
+			}
+
+			@Override
+			public Mono<Document> explain(
+				ExplainVerbosity verbosity
+			) {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( criteria -> buildFindSpec( criteria, false ) ) )
+					.flatMap( tuple -> explainFindFirst( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2(), verbosity ) );
+
+			}
+
+			@Override
 			public Mono<E> executeAggregation() {
 
 				Mono<AggregationSpec> aggregationMono = fieldBuilder.buildCriteria().map( criteria -> {
@@ -5882,6 +6438,18 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			@Override
+			public Mono<Document> preview() {
+
+				return Mono
+					.zip(
+						executeClassMono,
+						fieldBuilder.buildCriteria().map( criteria -> applyQueryOptions( new FindSpec().filter( criteria.orElseGet( Document::new ) ) ) )
+					)
+					.map( tuple -> previewCount( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
+
+			}
+
+			@Override
 			public Mono<Long> executeAggregation() {
 
 				Mono<AggregationSpec> aggregationMono = fieldBuilder.buildCriteria().map( criteria -> {
@@ -5993,6 +6561,71 @@ public class ReactiveMongoDsl<K> {
 
 
 		/**
+		 * Builder for MongoDB Driver-native distinct queries on top of the current criteria.
+		 *
+		 * @param <R>
+		 *            the decoded distinct value type
+		 */
+		public class DistinctQueryBuilder<R> {
+
+			private final String field;
+
+			private final Class<R> resultClass;
+
+			private DistinctQueryBuilder(
+											Object field,
+											Class<R> resultClass
+			) {
+
+				this.field = MongoFieldNameSupport.toMongoField( Objects.requireNonNull( field, "field" ) );
+				this.resultClass = Objects.requireNonNull( resultClass, "resultClass" );
+
+			}
+
+			/**
+			 * Executes the Driver distinct query using the current criteria as its filter.
+			 *
+			 * @return a {@link Flux} emitting distinct values
+			 */
+			public Flux<R> execute() {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria() )
+					.flatMapMany(
+						tuple -> distinct(
+							mongoExecutionContext,
+							tuple.getT1(),
+							collectionName,
+							field,
+							tuple.getT2().orElseGet( Document::new ),
+							resultClass
+						)
+					);
+
+			}
+
+			/**
+			 * Returns a diagnostic snapshot of the distinct operation without resolving a MongoDB database.
+			 *
+			 * @return a local preview of the distinct field and filter
+			 */
+			public Mono<Document> preview() {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria() )
+					.map(
+						tuple -> new Document( "operation", "distinct" )
+							.append( "collection", resolveCollectionName( mongoExecutionContext, tuple.getT1(), collectionName ) )
+							.append( "field", field )
+							.append( "filter", MongoBsonSupport.toDocument( tuple.getT2().orElseGet( Document::new ) ) )
+							.append( "resultClass", resultClass.getName() )
+					);
+
+			}
+
+		}
+
+		/**
 		 * Builder for criteria-based delete operations.
 		 */
 		public class DeleteQueryBuilder {
@@ -6045,15 +6678,49 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+			private FindSpec buildExistsFindSpec(
+				Optional<Bson> criteria
+			) {
+
+				return applyQueryOptions( new FindSpec().filter( criteria.orElseGet( Document::new ) ).limit( 1 ) );
+
+			}
+
 			@Override
 			public Mono<Boolean> execute() {
 
-				Mono<FindSpec> queryMono = fieldBuilder
-					.buildCriteria()
-					.map( criteria -> applyQueryOptions( new FindSpec().filter( criteria.orElseGet( Document::new ) ) ) );
 				return Mono
-					.zip( executeClassMono, queryMono )
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( this::buildExistsFindSpec ) )
 					.flatMap( tuple -> exists( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
+
+			}
+
+			@Override
+			public Mono<Document> preview() {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( this::buildExistsFindSpec ) )
+					.map( tuple -> previewFind( mongoExecutionContext, tuple.getT1(), collectionName, "exists", tuple.getT2() ).append( "first", true ) );
+
+			}
+
+			@Override
+			public Mono<Document> explain() {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( this::buildExistsFindSpec ) )
+					.flatMap( tuple -> explainFindFirst( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2() ) );
+
+			}
+
+			@Override
+			public Mono<Document> explain(
+				ExplainVerbosity verbosity
+			) {
+
+				return Mono
+					.zip( executeClassMono, fieldBuilder.buildCriteria().map( this::buildExistsFindSpec ) )
+					.flatMap( tuple -> explainFindFirst( mongoExecutionContext, tuple.getT1(), collectionName, tuple.getT2(), verbosity ) );
 
 			}
 

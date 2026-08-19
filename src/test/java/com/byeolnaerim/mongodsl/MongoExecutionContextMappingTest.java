@@ -11,6 +11,7 @@ import java.lang.reflect.Proxy;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
+import org.bson.BsonRegularExpression;
 import org.bson.Document;
 import org.bson.codecs.configuration.CodecRegistries;
 import org.bson.codecs.configuration.CodecRegistry;
@@ -35,8 +36,10 @@ import com.mongodb.reactivestreams.client.MongoDatabase;
 import reactor.core.publisher.Mono;
 
 
+// 실제 DB 요청 없이 field/id 매핑, codec 위임, resolver cache, criteria/lookup 렌더링 규칙을 검증한다.
 class MongoExecutionContextMappingTest {
 
+	// FieldsPair가 id/_id 규칙과 Enum.toString()을 포함한 물리 MongoDB 필드명 변환을 정확히 적용하는지 검증한다.
 	@Test
 	void fieldsPairUsesPhysicalMongoFieldNamesExceptIdConvention() {
 
@@ -66,6 +69,7 @@ class MongoExecutionContextMappingTest {
 
 	}
 
+	// Lookup의 local/foreign field 정규화와 raw/outer Driver stage가 불필요하게 변형되지 않는지 검증한다.
 	@Test
 	void lookupRawStagesAndPhysicalPathsRemainUnchanged() {
 
@@ -95,6 +99,7 @@ class MongoExecutionContextMappingTest {
 
 	}
 
+	// MongoExecutionContext 기본 read/write가 Driver POJO codec과 String/ObjectId id 변환을 정상 처리하는지 검증한다.
 	@Test
 	void executionContextProvidesDefaultDriverPojoCodecReadWrite() {
 
@@ -158,6 +163,7 @@ class MongoExecutionContextMappingTest {
 
 	}
 
+	// 동일 entity class의 id field metadata를 반복 탐색하지 않고 캐시된 Field 인스턴스를 재사용하는지 검증한다.
 	@Test
 	void mongoIdFieldResolverCachesResolvedFieldMetadata() {
 
@@ -168,6 +174,7 @@ class MongoExecutionContextMappingTest {
 
 	}
 
+	// DriverMongoExecutionContext의 opt-in collection-name cache가 class별로 한 번만 resolver를 호출하는지 검증한다.
 	@Test
 	void driverCollectionNameResolverCacheIsExplicitAndPerClass() {
 
@@ -186,6 +193,7 @@ class MongoExecutionContextMappingTest {
 
 	}
 
+	// Driver context의 entity codec 매핑과 DSL query field 정규화 책임이 섞이지 않고 각각 올바르게 동작하는지 검증한다.
 	@Test
 	void driverContextKeepsEntityCodecResponsibilitySeparateFromQueryFields() {
 
@@ -227,6 +235,7 @@ class MongoExecutionContextMappingTest {
 
 	}
 
+	// eq/between/in/like/notEq/range 등 기존 FieldsPair condition의 BSON 의미가 변경되지 않았는지 회귀 검증한다.
 	@Test
 	void fieldsPairRenderingKeepsLegacyConditionSemantics() {
 
@@ -239,9 +248,12 @@ class MongoExecutionContextMappingTest {
 			new Document( "status", new Document( "$in", List.of( "READY", "DONE" ) ) ),
 			criteria( pair( "status", List.of( "READY", "DONE" ), Condition.in ) )
 		);
-		Document like = criteria( pair( "accountName", "alpha", Condition.like ) );
-		assertEquals( "alpha", ((Document) like.get( "accountName" )).getString( "$regex" ) );
-		assertEquals( "i", ((Document) like.get( "accountName" )).getString( "$options" ) );
+		BsonRegularExpression like = assertInstanceOf(
+			BsonRegularExpression.class,
+			criteria( pair( "accountName", "alpha", Condition.like ) ).get( "accountName" )
+		);
+		assertEquals( "alpha", like.getPattern() );
+		assertEquals( "i", like.getOptions() );
 		assertEquals( new Document( "status", new Document( "$ne", "READY" ) ), criteria( pair( "status", "READY", Condition.notEq ) ) );
 		assertEquals( new Document( "retryCount", new Document( "$gt", 1 ) ), criteria( pair( "retryCount", 1, Condition.gt ) ) );
 		assertEquals( new Document( "retryCount", new Document( "$gte", 1 ) ), criteria( pair( "retryCount", 1, Condition.gte ) ) );
@@ -251,7 +263,10 @@ class MongoExecutionContextMappingTest {
 			new Document( "status", new Document( "$nin", List.of( "DELETED", "BLOCKED" ) ) ),
 			criteria( pair( "status", List.of( "DELETED", "BLOCKED" ), Condition.notIn ) )
 		);
-		assertEquals( new Document( "status", new Document( "$regex", "^READY$" ) ), criteria( pair( "status", "^READY$", Condition.regex ) ) );
+		assertEquals(
+			new BsonRegularExpression( "^READY$" ),
+			criteria( pair( "status", "^READY$", Condition.regex ) ).get( "status" )
+		);
 		assertEquals( new Document( "status", new Document( "$exists", true ) ), criteria( pair( "status", true, Condition.exists ) ) );
 		assertEquals( new Document( "deletedAt", null ), criteria( pair( "deletedAt", Condition.isNull ) ) );
 		assertEquals( new Document( "deletedAt", new Document( "$ne", null ) ), criteria( pair( "deletedAt", Condition.isNotNull ) ) );
@@ -301,6 +316,7 @@ class MongoExecutionContextMappingTest {
 
 	}
 
+	// 여러 FieldsPair를 결합할 때 필요한 $and/$or만 생성되고 불필요한 논리 연산자가 추가되지 않는지 검증한다.
 	@Test
 	void fieldsPairLogicalCombinationKeepsOnlyRequiredLogicalOperators() {
 
