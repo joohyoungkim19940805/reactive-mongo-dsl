@@ -178,6 +178,9 @@ public class DriverMongoExecutionContext implements MongoExecutionContext {
 	}
 
 	@Override
+	public Object getSessionScope() { return mongoClient; }
+
+	@Override
 	public Object getNative() { return mongoDatabase; }
 
 	@Override

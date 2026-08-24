@@ -117,6 +117,8 @@ public class ReactiveMongoDsl<K> {
 
 	private static final Object CLIENT_SESSION_CONTEXT_KEY = new Object();
 
+	private record SessionBinding(Object sessionScope, ClientSession session) {}
+
 	/**
 	 * Creates a new DSL instance using the given resolver and a default {@link ObjectMapper}.
 	 * The mapper is retained for source/API compatibility; history snapshots use the active Mongo
@@ -194,7 +196,7 @@ public class ReactiveMongoDsl<K> {
 					session.startTransaction();
 					return Mono
 						.defer( supplier )
-						.contextWrite( context -> context.put( CLIENT_SESSION_CONTEXT_KEY, session ) )
+						.contextWrite( context -> context.put( CLIENT_SESSION_CONTEXT_KEY, new SessionBinding( executionContext.getSessionScope(), session ) ) )
 						.flatMap( value -> commitTransaction( session ).thenReturn( value ) )
 						.switchIfEmpty( commitTransaction( session ).then( Mono.empty() ) );
 
@@ -550,28 +552,32 @@ public class ReactiveMongoDsl<K> {
 	}
 
 	private <T> Mono<T> executeWithSession(
-		Function<ClientSession, ? extends Publisher<T>> withSession, Supplier<? extends Publisher<T>> withoutSession
+		MongoExecutionContext executionContext, Function<ClientSession, ? extends Publisher<T>> withSession, Supplier<? extends Publisher<T>> withoutSession
 	) {
 
 		return Mono
-			.deferContextual(
-				context -> context.hasKey( CLIENT_SESSION_CONTEXT_KEY )
-					? Mono.from( withSession.apply( context.get( CLIENT_SESSION_CONTEXT_KEY ) ) )
-					: Mono.from( withoutSession.get() )
-			);
+			.deferContextual( context -> {
+				SessionBinding binding = context.getOrDefault( CLIENT_SESSION_CONTEXT_KEY, null );
+				return binding != null && binding.sessionScope() == executionContext.getSessionScope()
+					? Mono.from( withSession.apply( binding.session() ) )
+					: Mono.from( withoutSession.get() );
+
+			} );
 
 	}
 
 	private <T> Flux<T> executeFluxWithSession(
-		Function<ClientSession, ? extends Publisher<T>> withSession, Supplier<? extends Publisher<T>> withoutSession
+		MongoExecutionContext executionContext, Function<ClientSession, ? extends Publisher<T>> withSession, Supplier<? extends Publisher<T>> withoutSession
 	) {
 
 		return Flux
-			.deferContextual(
-				context -> context.hasKey( CLIENT_SESSION_CONTEXT_KEY )
-					? Flux.from( withSession.apply( context.get( CLIENT_SESSION_CONTEXT_KEY ) ) )
-					: Flux.from( withoutSession.get() )
-			);
+			.deferContextual( context -> {
+				SessionBinding binding = context.getOrDefault( CLIENT_SESSION_CONTEXT_KEY, null );
+				return binding != null && binding.sessionScope() == executionContext.getSessionScope()
+					? Flux.from( withSession.apply( binding.session() ) )
+					: Flux.from( withoutSession.get() );
+
+			} );
 
 	}
 
@@ -628,6 +634,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMapMany(
 				collection -> executeFluxWithSession(
+					executionContext,
 					session -> applyQuery( collection, query, session ),
 					() -> applyQuery( collection, query, null )
 				)
@@ -643,6 +650,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> applyQuery( collection, query, session ).first(),
 					() -> applyQuery( collection, query, null ).first()
 				)
@@ -736,6 +744,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> applyQuery( collection, query, session ).explain(),
 					() -> applyQuery( collection, query, null ).explain()
 				)
@@ -751,6 +760,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> applyQuery( collection, query, session ).explain( verbosity ),
 					() -> applyQuery( collection, query, null ).explain( verbosity )
 				)
@@ -765,6 +775,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> applyQuery( collection, query, session ).limit( -1 ).explain(),
 					() -> applyQuery( collection, query, null ).limit( -1 ).explain()
 				)
@@ -780,6 +791,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> applyQuery( collection, query, session ).limit( -1 ).explain( verbosity ),
 					() -> applyQuery( collection, query, null ).limit( -1 ).explain( verbosity )
 				)
@@ -794,6 +806,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> applyAggregation( collection, aggregation, session ).explain(),
 					() -> applyAggregation( collection, aggregation, null ).explain()
 				)
@@ -809,6 +822,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> applyAggregation( collection, aggregation, session ).explain( verbosity ),
 					() -> applyAggregation( collection, aggregation, null ).explain( verbosity )
 				)
@@ -823,6 +837,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMapMany(
 				collection -> executeFluxWithSession(
+					executionContext,
 					session -> collection.distinct( session, field, filter, resultClass ),
 					() -> collection.distinct( field, filter, resultClass )
 				)
@@ -837,6 +852,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMapMany(
 				collection -> executeFluxWithSession(
+					executionContext,
 					session -> applyAggregation( collection, aggregation, session ),
 					() -> applyAggregation( collection, aggregation, null )
 				)
@@ -853,30 +869,46 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
+	private <T> Mono<T> preparePersistEntity(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, T entity
+	) {
+
+		return executionContext.beforePersist( entity, resolveCollectionName( executionContext, entityClass, explicitCollectionName ) );
+
+	}
+
 	private <T> Mono<T> saveEntity(
 		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, T entity
 	) {
 
-		Document document = executionContext.write( entity );
-		Object id = executionContext.getId( entity );
-		return resolveCollection( executionContext, entityClass, explicitCollectionName ).flatMap( collection -> {
+		String collectionName = resolveCollectionName( executionContext, entityClass, explicitCollectionName );
+		return preparePersistEntity( executionContext, entityClass, collectionName, entity ).flatMap( preparedEntity -> {
+			Document document = executionContext.write( preparedEntity );
+			Object id = executionContext.getId( preparedEntity );
+			return resolveCollection( executionContext, entityClass, collectionName ).flatMap( collection -> {
 
-			if (id == null) {
+				if (id == null) {
+					return executeWithSession(
+						executionContext,
+						session -> collection.insertOne( session, document ),
+						() -> collection.insertOne( document )
+					)
+						.doOnSuccess( ignored -> {
+							if (document.get( "_id" ) != null)
+								executionContext.setId( preparedEntity, document.get( "_id" ) );
+
+						} )
+						.then( Mono.defer( () -> executionContext.afterPersist( preparedEntity, document, collectionName ) ) );
+
+				}
+
 				return executeWithSession(
-					session -> collection.insertOne( session, document ),
-					() -> collection.insertOne( document )
-				).doOnSuccess( ignored -> {
-					if (document.get( "_id" ) != null)
-						executionContext.setId( entity, document.get( "_id" ) );
+					executionContext,
+					session -> collection.replaceOne( session, new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) ),
+					() -> collection.replaceOne( new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) )
+				).then( Mono.defer( () -> executionContext.afterPersist( preparedEntity, document, collectionName ) ) );
 
-				} ).thenReturn( entity );
-
-			}
-
-			return executeWithSession(
-				session -> collection.replaceOne( session, new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) ),
-				() -> collection.replaceOne( new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) )
-			).thenReturn( entity );
+			} );
 
 		} );
 
@@ -892,6 +924,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> collection.insertMany( session, documents ),
 					() -> collection.insertMany( documents )
 				)
@@ -919,6 +952,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> collection.insertMany( session, documents ),
 					() -> collection.insertMany( documents )
 				)
@@ -936,6 +970,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> collection.bulkWrite( session, writes, new BulkWriteOptions().ordered( false ) ),
 					() -> collection.bulkWrite( writes, new BulkWriteOptions().ordered( false ) )
 				)
@@ -950,6 +985,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> many ? collection.deleteMany( session, filter ) : collection.deleteOne( session, filter ),
 					() -> many ? collection.deleteMany( filter ) : collection.deleteOne( filter )
 				)
@@ -971,6 +1007,7 @@ public class ReactiveMongoDsl<K> {
 			if (query.limit > 0)
 				options.limit( query.limit );
 			return executeWithSession(
+				executionContext,
 				session -> target.countDocuments( session, query.filter, options ),
 				() -> target.countDocuments( query.filter, options )
 			);
@@ -987,6 +1024,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> applyQuery( collection, query, session ).first(),
 					() -> applyQuery( collection, query, null ).first()
 				).hasElement()
@@ -1001,6 +1039,7 @@ public class ReactiveMongoDsl<K> {
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
 			.flatMap(
 				collection -> executeWithSession(
+					executionContext,
 					session -> {
 						UpdateOptions options = new UpdateOptions().upsert( upsert );
 

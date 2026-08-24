@@ -66,6 +66,45 @@ public interface MongoExecutionContext {
 	) {}
 
 	/**
+	 * Applies environment-specific entity preparation immediately before save-style persistence
+	 * converts the entity to BSON. The default implementation is a no-op. Framework adapters can
+	 * use this hook for their save lifecycle semantics (for example, auditing callbacks) without
+	 * making the DSL core depend on that framework. Bulk/history/remove paths intentionally do not
+	 * invoke this hook.
+	 */
+	default <T> Mono<T> beforePersist(
+		T entity, String collectionName
+	) {
+
+		return Mono.just( Objects.requireNonNull( entity, "entity must not be null" ) );
+
+	}
+
+	/**
+	 * Applies environment-specific entity lifecycle work immediately after a save-style MongoDB
+	 * write succeeds. The supplied document is the BSON document used for the write and includes a
+	 * generated {@code _id} when one was assigned. The default implementation is a no-op.
+	 * <p>This hook means <em>after the individual MongoDB write</em>, not after a surrounding
+	 * transaction commits; a later transaction failure can still roll the write back. Bulk/history/
+	 * remove paths intentionally do not invoke this hook.</p>
+	 */
+	default <T> Mono<T> afterPersist(
+		T entity, Document document, String collectionName
+	) {
+
+		Objects.requireNonNull( document, "document must not be null" );
+		return Mono.just( Objects.requireNonNull( entity, "entity must not be null" ) );
+
+	}
+
+	/**
+	 * Returns a stable identity token for MongoDB client-session compatibility. Contexts backed by
+	 * the same MongoClient may override this method to return the same token. The default keeps a
+	 * session scoped to this context instance.
+	 */
+	default Object getSessionScope() { return this; }
+
+	/**
 	 * Returns an environment-specific native object represented by this context.
 	 * Framework adapters can expose their own native Mongo object without leaking that framework
 	 * dependency into the DSL core.

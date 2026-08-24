@@ -16,11 +16,14 @@ import com.byeolnaerim.mongodsl.result.ResultTuple;
 import com.byeolnaerim.mongodsl.spi.DriverMongoExecutionContext;
 import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
 import com.mongodb.MongoClientSettings;
+import com.mongodb.client.model.IndexOptions;
+import com.mongodb.client.model.Indexes;
 import com.mongodb.client.model.Sorts;
 import com.mongodb.reactivestreams.client.ClientSession;
 import com.mongodb.reactivestreams.client.MongoClient;
 import com.mongodb.reactivestreams.client.MongoClients;
 import com.mongodb.reactivestreams.client.MongoDatabase;
+import java.math.BigDecimal;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -28,11 +31,13 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.bson.Document;
 import org.bson.codecs.configuration.CodecRegistries;
 import org.bson.codecs.configuration.CodecRegistry;
 import org.bson.codecs.pojo.PojoCodecProvider;
 import org.bson.codecs.pojo.annotations.BsonProperty;
+import org.bson.types.Decimal128;
 import org.bson.types.ObjectId;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -52,19 +57,26 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 	private static final String ENTITY_COLLECTION = "production_like_entity";
 	private static final String CHILD_COLLECTION = "production_like_child";
 	private static final String DRIVER_COLLECTION = "driver_pojo";
+	private static final String LIFECYCLE_COLLECTION = "production_like_lifecycle";
 	private static final List<String> COLLECTIONS = List.of(
 		ENTITY_COLLECTION,
 		ENTITY_COLLECTION + "_remove",
 		ENTITY_COLLECTION + "_history",
 		CHILD_COLLECTION,
-		DRIVER_COLLECTION
+		DRIVER_COLLECTION,
+		LIFECYCLE_COLLECTION,
+		LIFECYCLE_COLLECTION + "_history",
+		LIFECYCLE_COLLECTION + "_remove"
 	);
 
 	private MongoClient mongoClient;
+	private MongoClient isolatedMongoClient;
 	private MongoDatabase mongoDatabase;
+	private MongoDatabase isolatedMongoDatabase;
 	private ReactiveMongoDsl<TestMongo> mongoDsl;
 	private ProductionLikeMongoExecutionContext leftContext;
 	private ProductionLikeMongoExecutionContext rightContext;
+	private ProductionLikeMongoExecutionContext isolatedRightContext;
 	private DriverMongoExecutionContext driverContext;
 	private final ObjectMapper objectMapper = JsonMapper.builder().findAndAddModules().build();
 
@@ -81,17 +93,24 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			org.junit.jupiter.api.Assumptions.assumeTrue(false, "MongoDB TEST_* environment variables are not configured");
 		}
 
-		mongoClient = MongoClients.create(environment.connectionString());
+		String connectionString = environment.connectionString();
+		String databaseName = environment.databaseName();
+		mongoClient = MongoClients.create(connectionString);
+		isolatedMongoClient = MongoClients.create(connectionString);
 		CodecRegistry codecRegistry = CodecRegistries.fromRegistries(
 			MongoClientSettings.getDefaultCodecRegistry(),
 			CodecRegistries.fromProviders(PojoCodecProvider.builder().automatic(true).build())
 		);
 		mongoDatabase = mongoClient
-			.getDatabase(environment.databaseName())
+			.getDatabase(databaseName)
+			.withCodecRegistry(codecRegistry);
+		isolatedMongoDatabase = isolatedMongoClient
+			.getDatabase(databaseName)
 			.withCodecRegistry(codecRegistry);
 
 		leftContext = ProductionLikeMongoExecutionContext.left(mongoClient, mongoDatabase);
 		rightContext = ProductionLikeMongoExecutionContext.right(mongoClient, mongoDatabase);
+		isolatedRightContext = ProductionLikeMongoExecutionContext.isolatedRight(isolatedMongoClient, isolatedMongoDatabase);
 		driverContext = new DriverMongoExecutionContext(
 			mongoClient,
 			mongoDatabase,
@@ -105,6 +124,7 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		mongoDsl = new ReactiveMongoDsl<>(key -> switch (key) {
 			case LEFT -> leftContext;
 			case RIGHT -> rightContext;
+			case ISOLATED_RIGHT -> isolatedRightContext;
 			case DRIVER -> driverContext;
 		}, objectMapper);
 
@@ -113,11 +133,21 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 			.concatMap(collection -> Mono.from(mongoDatabase.createCollection(collection)))
 			.then()
 			.block();
+		Mono
+			.from(
+				mongoDatabase
+					.getCollection(LIFECYCLE_COLLECTION)
+					.createIndex(Indexes.ascending("account_name"), new IndexOptions().unique(true))
+			)
+			.block();
 	}
 
 	// 각 테스트가 서로 영향을 주지 않도록 테스트용 collection의 데이터를 매번 비운다.
 	@BeforeEach
 	void cleanCollections() {
+		leftContext.resetLifecycleCalls();
+		rightContext.resetLifecycleCalls();
+		isolatedRightContext.resetLifecycleCalls();
 		Flux
 			.fromIterable(COLLECTIONS)
 			.concatMap(collection -> Mono.from(mongoDatabase.getCollection(collection).deleteMany(new Document())))
@@ -130,6 +160,8 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 	void disconnect() {
 		if (mongoDatabase != null)
 			Mono.from(mongoDatabase.drop()).onErrorResume(ignored -> Mono.empty()).block();
+		if (isolatedMongoClient != null)
+			isolatedMongoClient.close();
 		if (mongoClient != null)
 			mongoClient.close();
 	}
@@ -737,6 +769,168 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		assertEquals(1L, Mono.from(mongoDatabase.getCollection(ENTITY_COLLECTION).countDocuments()).block());
 	}
 
+	// Spring mapping으로 저장된 enum/Decimal128과 동일한 BSON 표현을 Driver-native criteria/update 값도 유지하는지 검증한다.
+	@Test
+	void driverValueCodecsPreserveEnumAndBigDecimalSemantics() {
+		Mono
+			.from(
+				mongoDatabase
+					.getCollection(DRIVER_COLLECTION)
+					.insertOne(new Document("business_key", "driver-value-codecs").append("status", "READY"))
+			)
+			.block();
+
+		Document found = mongoDsl
+			.executeCustomClass(Document.class, TestMongo.DRIVER, DRIVER_COLLECTION)
+			.fields(pair("business_key", "driver-value-codecs"), pair("status", DriverStatus.READY))
+			.end()
+			.find()
+			.execute()
+			.block();
+
+		assertNotNull(found);
+
+		mongoDsl
+			.executeCustomClass(Document.class, TestMongo.DRIVER, DRIVER_COLLECTION)
+			.fields(pair("business_key", "driver-value-codecs"))
+			.end()
+			.atomicUpdate()
+			.first()
+			.document()
+			.set("refundAmount", new BigDecimal("12345.67"))
+			.execute()
+			.block();
+
+		Document raw = Mono
+			.from(mongoDatabase.getCollection(DRIVER_COLLECTION).find(new Document("business_key", "driver-value-codecs")).first())
+			.block();
+
+		assertNotNull(raw);
+		assertInstanceOf(Decimal128.class, raw.get("refundAmount"));
+		assertEquals(new BigDecimal("12345.67"), ((Decimal128) raw.get("refundAmount")).bigDecimalValue());
+	}
+
+	// save/saveAll은 before/after lifecycle hook을 적용하되 raw bulk 경로는 callback-free semantics를 유지하는지 검증한다.
+	@Test
+	void saveLifecycleHooksAreSymmetricAndDoNotLeakIntoBulkPaths() {
+		var builder = mongoDsl.executeCustomClass(ProductionLikeEntity.class, TestMongo.LEFT, LIFECYCLE_COLLECTION);
+
+		ProductionLikeEntity saved = builder.save(entity("lifecycle-save", "join-a", 2026, 1031, "READY", 100L)).block();
+		assertNotNull(saved);
+		assertEquals(1, leftContext.beforePersistCalls());
+		assertEquals(1, leftContext.afterPersistCalls());
+		assertEquals(saved.getId(), leftContext.lastAfterPersistEntityId());
+		assertEquals(saved.getId(), leftContext.lastAfterPersistDocumentId());
+
+		leftContext.resetLifecycleCalls();
+		builder
+			.saveAll(
+				List.of(
+					entity("lifecycle-save-all-a", "join-b", 2026, 1032, "READY", 100L),
+					entity("lifecycle-save-all-b", "join-c", 2026, 1033, "READY", 100L)
+				)
+			)
+			.collectList()
+			.block();
+		assertEquals(2, leftContext.beforePersistCalls());
+		assertEquals(2, leftContext.afterPersistCalls());
+
+		leftContext.resetLifecycleCalls();
+		builder
+			.saveAllBulk(
+				List.of(
+					entity("lifecycle-bulk-a", "join-d", 2026, 1034, "READY", 100L),
+					entity("lifecycle-bulk-b", "join-e", 2026, 1035, "READY", 100L)
+				)
+			)
+			.collectList()
+			.block();
+
+		assertEquals(0, leftContext.beforePersistCalls());
+		assertEquals(0, leftContext.afterPersistCalls());
+
+		ProductionLikeEntity snapshotSource = builder
+			.save(entity("lifecycle-snapshot", "join-f", 2026, 1038, "READY", 100L))
+			.block();
+		leftContext.resetLifecycleCalls();
+		builder.createHistory(snapshotSource, "history", objectMapper).block();
+		assertEquals(0, leftContext.beforePersistCalls());
+		assertEquals(0, leftContext.afterPersistCalls());
+
+		leftContext.resetLifecycleCalls();
+		builder.delete(snapshotSource, true).block();
+		assertEquals(0, leftContext.beforePersistCalls());
+		assertEquals(0, leftContext.afterPersistCalls());
+	}
+
+	// write 자체가 실패하면 before hook은 실행되어도 after hook은 절대 실행되지 않는지 검증한다.
+	@Test
+	void failedSaveDoesNotInvokeAfterPersist() {
+		var builder = mongoDsl.executeCustomClass(ProductionLikeEntity.class, TestMongo.LEFT, LIFECYCLE_COLLECTION);
+		builder.save(entity("lifecycle-duplicate", "join-a", 2026, 1036, "READY", 100L)).block();
+
+		leftContext.resetLifecycleCalls();
+		StepVerifier
+			.create(builder.save(entity("lifecycle-duplicate", "join-b", 2026, 1037, "READY", 100L)))
+			.expectError()
+			.verify();
+
+		assertEquals(1, leftContext.beforePersistCalls());
+		assertEquals(0, leftContext.afterPersistCalls());
+	}
+
+	// 같은 MongoClient scope의 서로 다른 execution context는 하나의 ClientSession transaction에 함께 참여하는지 검증한다.
+	@Test
+	void transactionSharesSessionAcrossContextsWithSameScope() {
+		ProductionLikeEntity left = entity("tx-shared-left", "join-shared", 2026, 1041, "READY", 100L);
+		ProductionLikeChild right = child("join-shared", "ACTIVE", "shared");
+
+		StepVerifier
+			.create(
+				mongoDsl.getTxJob(
+					TestMongo.LEFT,
+					() -> mongoDsl
+						.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
+						.save(left)
+						.then(mongoDsl.executeEntity(ProductionLikeChild.class, TestMongo.RIGHT).save(right))
+						.then(Mono.error(new IllegalStateException("rollback-shared")))
+				)
+			)
+			.expectErrorMatches(error -> error instanceof IllegalStateException && "rollback-shared".equals(error.getMessage()))
+			.verify();
+
+		assertEquals(0L, Mono.from(mongoDatabase.getCollection(ENTITY_COLLECTION).countDocuments()).block());
+		assertEquals(0L, Mono.from(mongoDatabase.getCollection(CHILD_COLLECTION).countDocuments()).block());
+		assertEquals(1, leftContext.afterPersistCalls());
+		assertEquals(1, rightContext.afterPersistCalls());
+	}
+
+	// 실제 두 번째 MongoClient의 context는 첫 번째 client가 만든 transaction session을 재사용하지 않고 독립 실행되는지 검증한다.
+	@Test
+	void transactionDoesNotLeakSessionIntoDifferentScope() {
+		ProductionLikeEntity left = entity("tx-isolated-left", "join-isolated", 2026, 1051, "READY", 100L);
+		ProductionLikeChild isolated = child("join-isolated", "ACTIVE", "isolated");
+
+		StepVerifier
+			.create(
+				mongoDsl.getTxJob(
+					TestMongo.LEFT,
+					() -> mongoDsl
+						.executeEntity(ProductionLikeEntity.class, TestMongo.LEFT)
+						.save(left)
+						.then(mongoDsl.executeEntity(ProductionLikeChild.class, TestMongo.ISOLATED_RIGHT).save(isolated))
+						.then(Mono.error(new IllegalStateException("rollback-isolated")))
+				)
+			)
+			.expectErrorMatches(error -> error instanceof IllegalStateException && "rollback-isolated".equals(error.getMessage()))
+			.verify();
+
+		assertEquals(0L, Mono.from(mongoDatabase.getCollection(ENTITY_COLLECTION).countDocuments()).block());
+		assertEquals(1L, Mono.from(mongoDatabase.getCollection(CHILD_COLLECTION).countDocuments()).block());
+		assertEquals(1, leftContext.afterPersistCalls());
+		assertEquals(1, isolatedRightContext.afterPersistCalls());
+	}
+
 	// MongoTemplateResolver/MongoExecutionContext 추상화 뒤에서도 구현체의 native 객체를 타입으로 다시 얻을 수 있는지 검증한다.
 	@Test
 	void nativeObjectRemainsAvailableThroughResolverAbstraction() {
@@ -830,9 +1024,14 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		return child;
 	}
 
+	private enum DriverStatus {
+		READY
+	}
+
 	private enum TestMongo {
 		LEFT,
 		RIGHT,
+		ISOLATED_RIGHT,
 		DRIVER
 	}
 
@@ -892,27 +1091,60 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 		private final MongoClient mongoClient;
 		private final MongoDatabase mongoDatabase;
 		private final boolean left;
+		private final Object sessionScope;
 		private final NativeMarker nativeMarker;
+		private final AtomicInteger beforePersistCalls = new AtomicInteger();
+		private final AtomicInteger afterPersistCalls = new AtomicInteger();
+		private String lastAfterPersistEntityId;
+		private String lastAfterPersistDocumentId;
 
 		private ProductionLikeMongoExecutionContext(
-			MongoClient mongoClient, MongoDatabase mongoDatabase, boolean left
+			MongoClient mongoClient, MongoDatabase mongoDatabase, boolean left, Object sessionScope
 		) {
 			this.mongoClient = mongoClient;
 			this.mongoDatabase = mongoDatabase;
 			this.left = left;
+			this.sessionScope = sessionScope;
 			this.nativeMarker = new NativeMarker(left ? "left-native" : "right-native");
 		}
 
 		static ProductionLikeMongoExecutionContext left(MongoClient mongoClient, MongoDatabase mongoDatabase) {
-			return new ProductionLikeMongoExecutionContext(mongoClient, mongoDatabase, true);
+			return new ProductionLikeMongoExecutionContext(mongoClient, mongoDatabase, true, mongoClient);
 		}
 
 		static ProductionLikeMongoExecutionContext right(MongoClient mongoClient, MongoDatabase mongoDatabase) {
-			return new ProductionLikeMongoExecutionContext(mongoClient, mongoDatabase, false);
+			return new ProductionLikeMongoExecutionContext(mongoClient, mongoDatabase, false, mongoClient);
+		}
+
+		static ProductionLikeMongoExecutionContext isolatedRight(MongoClient mongoClient, MongoDatabase mongoDatabase) {
+			return new ProductionLikeMongoExecutionContext(mongoClient, mongoDatabase, false, mongoClient);
 		}
 
 		NativeMarker nativeMarker() {
 			return nativeMarker;
+		}
+
+		int beforePersistCalls() {
+			return beforePersistCalls.get();
+		}
+
+		int afterPersistCalls() {
+			return afterPersistCalls.get();
+		}
+
+		String lastAfterPersistEntityId() {
+			return lastAfterPersistEntityId;
+		}
+
+		String lastAfterPersistDocumentId() {
+			return lastAfterPersistDocumentId;
+		}
+
+		void resetLifecycleCalls() {
+			beforePersistCalls.set(0);
+			afterPersistCalls.set(0);
+			lastAfterPersistEntityId = null;
+			lastAfterPersistDocumentId = null;
 		}
 
 		@Override
@@ -1033,6 +1265,27 @@ class ReactiveMongoDslMigrationSafetyIntegrationTest {
 				assertSupported(ProductionLikeChild.class);
 				value.setId(fromMongoId(id));
 			}
+		}
+
+		@Override
+		public <T> Mono<T> beforePersist(T entity, String collectionName) {
+			beforePersistCalls.incrementAndGet();
+			return Mono.just(entity);
+		}
+
+		@Override
+		public <T> Mono<T> afterPersist(T entity, Document document, String collectionName) {
+			afterPersistCalls.incrementAndGet();
+			if (entity instanceof ProductionLikeEntity value) {
+				lastAfterPersistEntityId = value.getId();
+				lastAfterPersistDocumentId = fromMongoId(document.get("_id"));
+			}
+			return Mono.just(entity);
+		}
+
+		@Override
+		public Object getSessionScope() {
+			return sessionScope;
 		}
 
 		@Override
