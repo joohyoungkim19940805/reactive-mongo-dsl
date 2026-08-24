@@ -112,6 +112,48 @@ public abstract class SortSpec<P> implements Bson {
 	}
 
 	/**
+	 * Appends a sort dynamically according to the given direction.
+	 * Direction is matched case-insensitively against {@code asc} and {@code desc}.
+	 */
+	public SortSpec<P> of(
+		String direction, String field, String... fields
+	) {
+
+		return of( direction, (Object) field, (Object[]) fields );
+
+	}
+
+	/**
+	 * Appends a dynamic sort for enum-backed physical field names.
+	 * Direction is matched case-insensitively against {@code asc} and {@code desc}.
+	 */
+	public SortSpec<P> of(
+		String direction, Enum<?> field, Enum<?>... fields
+	) {
+
+		return of( direction, (Object) field, (Object[]) fields );
+
+	}
+
+	/**
+	 * Fallback dynamic sort for custom field-name wrappers.
+	 * Direction is matched case-insensitively against {@code asc} and {@code desc}.
+	 */
+	public SortSpec<P> of(
+		String direction, Object field, Object... fields
+	) {
+
+		Objects.requireNonNull( direction, "direction" );
+
+		if ("asc".equalsIgnoreCase( direction )) { return asc( field, fields ); }
+
+		if ("desc".equalsIgnoreCase( direction )) { return desc( field, fields ); }
+
+		throw new IllegalArgumentException( "Unsupported sort direction: " + direction );
+
+	}
+
+	/**
 	 * Appends a MongoDB driver-native sort component without rewriting it.
 	 *
 	 * @param sort
