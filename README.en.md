@@ -1,42 +1,1851 @@
 # Reactive Mongo DSL (reactive-mongo-dsl)
 
-A fluent DSL built on top of Spring Data **ReactiveMongoTemplate**, designed to make **dynamic criteria / aggregation / `$lookup` joins / atomic updates / bulk operations / Atlas Search** easier to compose in reactive pipelines.
+A fluent DSL built on the MongoDB **Reactive Streams Driver** and Project Reactor for **dynamic conditions / querying / paging / aggregation / `$lookup` / grouping / atomic updates / bulk operations / Atlas Search / Vector Search**.
+
+The `reactive-mongo-dsl` core does not directly depend on Spring Data MongoDB. Mongo execution is abstracted through `MongoExecutionContext`, and the default `DriverMongoExecutionContext` implementation uses the MongoDB Reactive Streams Driver directly.
 
 ---
 
-## Core ideas
+## Current version
 
-### 1) Template / transaction routing via `MongoTemplateResolver<K>`
+The current source version in `build.gradle` is:
 
-`ReactiveMongoDsl<K>` delegates template and transaction resolution to `MongoTemplateResolver<K>`, so you can keep a single DSL while targeting multiple templates (multi DB / multi cluster / multi tenant).
+- `reactive-mongo-dsl`: `1.0.0`
+- Java: 21+
+- MongoDB Java Driver BOM: `5.10.0`
+- Reactor BOM: `2025.0.7`
 
-### 2) Query flow: classic query vs Atlas Search query
+Gradle:
 
-There are now **two distinct entry flows**:
-
-#### Classic Mongo query flow
-
-`execute* -> fields(...) -> end() -> find/findAll/count/delete/exists/atomicUpdate`
-
-1. Choose execution context with `executeEntity(...)`, `executeRepository(...)`, or `executeCustomClass(...)`
-2. Build ordinary Mongo criteria with `fields(...)`
-3. Switch to terminal query builders with `end()`
-4. Execute with `find()`, `findAll()`, `count()`, `delete()`, `exists()`, `atomicUpdate()`
-
-###
-
-# Atlas Search
-
-## SearchBuilder overview
-
-Entry points:
-
-```java
-search()
-search("indexName")
+```gradle
+dependencies {
+    implementation 'com.byeolnaerim:reactive-mongo-dsl:1.0.0'
+}
 ```
 
-Root search styles:
+Maven:
+
+```xml
+<dependency>
+    <groupId>com.byeolnaerim</groupId>
+    <artifactId>reactive-mongo-dsl</artifactId>
+    <version>1.0.0</version>
+</dependency>
+```
+
+---
+
+## Requirements
+
+- Java 21+
+- An environment compatible with MongoDB Reactive Streams Driver 5.9.x (5.10.0 Available)
+- Project Reactor
+- A MongoDB Atlas Search index when using Atlas Search
+- A MongoDB Vector Search index when using Vector Search
+- Application-side Reactive MongoDB configuration (`ReactiveMongoTemplate`, `MongoClient`) when integrating with Spring Data MongoDB
+
+Spring Data MongoDB is not a required dependency of the core library. The DSL can be used in a Spring application, but its execution contract is based on `MongoExecutionContext` and the MongoDB Reactive Streams Driver.
+
+---
+
+## Core concepts
+
+### 1) Execution context routing: `MongoTemplateResolver<K>` + `MongoExecutionContext`
+
+`ReactiveMongoDsl<K>` obtains a `MongoExecutionContext` for each key through `MongoTemplateResolver<K>`.
+
+```java
+public interface MongoTemplateResolver<K> {
+    MongoExecutionContext getTemplate(K key);
+}
+```
+
+`MongoExecutionContext` is responsible for:
+
+- providing a `MongoDatabase`
+- starting a `ClientSession`
+- resolving collection names by entity type
+- converting entities to and from BSON `Document`
+- reading entity ids and applying generated ids back to entities
+- `beforePersist` / `afterPersist` lifecycle hooks for save operations
+- `getSessionScope()` for identifying contexts that share the same Mongo client/session scope
+
+`DriverMongoExecutionContext` is provided as the default implementation.
+
+This lets the same DSL be used across multiple databases, clusters, or tenants by changing only the resolver key.
+
+---
+
+### 2) Standard query flow
+
+The normal query/update flow is:
+
+```text
+executeEntity(...) / executeCustomClass(...)
+    -> fields(...) / driverFilter(...)
+    -> end()
+    -> findAll / find / count / distinct / delete / exists / atomicUpdate
+    -> execute...
+```
+
+Example:
+
+```java
+Flux<User> users = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(
+        pair("status", "ACTIVE"),
+        pair("age", 20, Condition.gte)
+    )
+    .end()
+    .findAll()
+    .execute();
+```
+
+Operations that do not need a condition builder, such as `save`, `saveAll`, bulk operations, and `createHistory`, can be called directly from `executeEntity(...)` or `executeCustomClass(...)`.
+
+There is no separate public `update()` terminal. Conditional updates are executed through `atomicUpdate()` after selecting `first()`, `multi()`, or `upsertOne()`.
+
+---
+
+### 3) Atlas Search / Vector Search use separate entry points
+
+Atlas Search and Vector Search are separated from the ordinary `fields(...).end()` flow because of their first aggregation stage constraints.
+
+```text
+executeEntity(...)
+    -> search(...)
+    -> Atlas Search operator
+    -> findAll / find / count / existsQuery
+```
+
+```text
+executeEntity(...)
+    -> vectorSearch(...)
+    -> vector query / filter
+    -> findAll / find / count / existsQuery
+```
+
+The meaning and placement of ordinary Mongo conditions differ from Search/Vector conditions, so they are documented separately in the dedicated sections below.
+
+---
+
+## Quick start
+
+### 1) Configure `DriverMongoExecutionContext`
+
+```java
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl;
+import com.byeolnaerim.mongodsl.spi.DriverMongoExecutionContext;
+import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
+import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
+import com.mongodb.reactivestreams.client.MongoClient;
+import com.mongodb.reactivestreams.client.MongoClients;
+import com.mongodb.reactivestreams.client.MongoDatabase;
+
+public enum MongoTemplateName {
+    FRONT,
+    BACK
+}
+
+MongoClient frontClient = MongoClients.create(frontConnectionString);
+MongoClient backClient = MongoClients.create(backConnectionString);
+
+MongoDatabase frontDatabase = frontClient.getDatabase("front");
+MongoDatabase backDatabase = backClient.getDatabase("back");
+
+MongoExecutionContext frontContext =
+    new DriverMongoExecutionContext(frontClient, frontDatabase);
+
+MongoExecutionContext backContext =
+    new DriverMongoExecutionContext(backClient, backDatabase);
+
+MongoTemplateResolver<MongoTemplateName> resolver = key ->
+    key == MongoTemplateName.BACK ? backContext : frontContext;
+
+ReactiveMongoDsl<MongoTemplateName> dsl = new ReactiveMongoDsl<>(resolver);
+```
+
+By default, `DriverMongoExecutionContext` resolves collection names by decapitalizing the entity's simple class name.
+
+Example:
+
+```text
+User -> user
+AuctionHistory -> auctionHistory
+```
+
+If your application uses a different collection naming rule, provide a resolver:
+
+```java
+MongoExecutionContext context = new DriverMongoExecutionContext(
+    mongoClient,
+    mongoDatabase,
+    entityClass -> collectionNameResolver(entityClass)
+);
+```
+
+If collection-name resolution is completely stable for the lifetime of the application, you can use the caching helper:
+
+```java
+new DriverMongoExecutionContext(
+    mongoClient,
+    mongoDatabase,
+    DriverMongoExecutionContext.cachedCollectionNameResolver(
+        entityClass -> collectionNameResolver(entityClass)
+    )
+);
+```
+
+Do not use this caching helper when collection names can vary by tenant, request, time, or another runtime condition.
+
+---
+
+### 2) Using it in a Spring Data MongoDB project
+
+The `reactive-mongo-dsl` core does not directly depend on Spring Data MongoDB, so the application provides a `MongoExecutionContext` adapter when it wants to use an existing `ReactiveMongoTemplate` configuration.
+
+To retain the existing Spring application's **collection naming / `MongoConverter` / custom conversions / reactive auditing**, connect those facilities through the adapter and return that adapter from the resolver.
+
+With Spring Boot, keep the normal Reactive MongoDB starter in the application:
+
+```gradle
+dependencies {
+    implementation 'com.byeolnaerim:reactive-mongo-dsl:1.0.0-alpha.4'
+    implementation 'org.springframework.boot:spring-boot-starter-data-mongodb-reactive'
+}
+```
+
+The Spring dependency belongs to the consuming application; it does not need to be added to the DSL core.
+
+#### `SpringReactiveMongoExecutionContext` adapter
+
+The following adapter connects a `ReactiveMongoTemplate` and its corresponding `MongoClient` to `MongoExecutionContext`:
+
+```java
+import java.util.Objects;
+
+import org.bson.Document;
+import org.bson.types.ObjectId;
+import org.springframework.data.mapping.PersistentPropertyAccessor;
+import org.springframework.data.mapping.callback.ReactiveEntityCallbacks;
+import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
+import org.springframework.data.mongodb.core.convert.MongoConverter;
+import org.springframework.data.mongodb.core.mapping.MongoPersistentEntity;
+import org.springframework.data.mongodb.core.mapping.MongoPersistentProperty;
+import org.springframework.data.mongodb.core.mapping.event.ReactiveAfterSaveCallback;
+import org.springframework.data.mongodb.core.mapping.event.ReactiveBeforeConvertCallback;
+
+import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
+import com.mongodb.reactivestreams.client.ClientSession;
+import com.mongodb.reactivestreams.client.MongoClient;
+import com.mongodb.reactivestreams.client.MongoDatabase;
+
+import reactor.core.publisher.Mono;
+
+public class SpringReactiveMongoExecutionContext implements MongoExecutionContext {
+
+    private final ReactiveMongoTemplate reactiveMongoTemplate;
+    private final MongoClient mongoClient;
+    private final MongoConverter mongoConverter;
+    private final ReactiveEntityCallbacks entityCallbacks;
+
+    public SpringReactiveMongoExecutionContext(
+        ReactiveMongoTemplate reactiveMongoTemplate,
+        MongoClient mongoClient,
+        ReactiveEntityCallbacks entityCallbacks
+    ) {
+        this.reactiveMongoTemplate = Objects.requireNonNull(
+            reactiveMongoTemplate,
+            "reactiveMongoTemplate must not be null"
+        );
+        this.mongoClient = Objects.requireNonNull(
+            mongoClient,
+            "mongoClient must not be null"
+        );
+        this.mongoConverter = reactiveMongoTemplate.getConverter();
+        this.entityCallbacks = Objects.requireNonNull(
+            entityCallbacks,
+            "entityCallbacks must not be null"
+        );
+    }
+
+    @Override
+    public Mono<MongoDatabase> getDatabase() {
+        return reactiveMongoTemplate.getMongoDatabase();
+    }
+
+    @Override
+    public Mono<ClientSession> startSession() {
+        return Mono.from(mongoClient.startSession());
+    }
+
+    @Override
+    public String getCollectionName(Class<?> entityClass) {
+        return reactiveMongoTemplate.getCollectionName(entityClass);
+    }
+
+    @Override
+    public Document write(Object source) {
+        Document document = new Document();
+        mongoConverter.write(source, document);
+        return document;
+    }
+
+    @Override
+    public <T> T read(Class<T> targetType, Document source) {
+        return mongoConverter.read(targetType, source);
+    }
+
+    @Override
+    public Object getId(Object entity) {
+        MongoPersistentEntity<?> persistentEntity = getPersistentEntity(entity.getClass());
+
+        if (persistentEntity == null || !persistentEntity.hasIdProperty()) {
+            return null;
+        }
+
+        Object id = persistentEntity.getIdentifierAccessor(entity).getIdentifier();
+
+        if (id == null) {
+            return null;
+        }
+
+        Document document = new Document();
+        mongoConverter.write(entity, document);
+        return document.get("_id");
+    }
+
+    @Override
+    @SuppressWarnings({ "rawtypes", "unchecked" })
+    public void setId(Object entity, Object id) {
+        MongoPersistentEntity persistentEntity = getPersistentEntity(entity.getClass());
+
+        if (persistentEntity == null || !persistentEntity.hasIdProperty()) {
+            return;
+        }
+
+        MongoPersistentProperty idProperty =
+            (MongoPersistentProperty) persistentEntity.getRequiredIdProperty();
+
+        Object targetId = id;
+
+        if (id instanceof ObjectId objectId && idProperty.getType() == String.class) {
+            targetId = objectId.toHexString();
+        } else if (
+            id != null
+                && !idProperty.getType().isInstance(id)
+                && mongoConverter.getConversionService()
+                    .canConvert(id.getClass(), idProperty.getType())
+        ) {
+            targetId = mongoConverter.getConversionService()
+                .convert(id, idProperty.getType());
+        }
+
+        PersistentPropertyAccessor accessor = persistentEntity.getPropertyAccessor(entity);
+        accessor.setProperty(idProperty, targetId);
+    }
+
+    @Override
+    public <T> Mono<T> beforePersist(T entity, String collectionName) {
+        return entityCallbacks.callback(
+            ReactiveBeforeConvertCallback.class,
+            entity,
+            collectionName
+        );
+    }
+
+    @Override
+    public <T> Mono<T> afterPersist(
+        T entity,
+        Document document,
+        String collectionName
+    ) {
+        return entityCallbacks.callback(
+            ReactiveAfterSaveCallback.class,
+            entity,
+            document,
+            collectionName
+        );
+    }
+
+    @Override
+    public Object getSessionScope() {
+        return mongoClient;
+    }
+
+    @Override
+    public Object getNative() {
+        return reactiveMongoTemplate;
+    }
+
+    @Override
+    public <T> T getNative(Class<T> nativeType) {
+        if (nativeType.isInstance(reactiveMongoTemplate)) {
+            return nativeType.cast(reactiveMongoTemplate);
+        }
+
+        if (nativeType.isInstance(mongoClient)) {
+            return nativeType.cast(mongoClient);
+        }
+
+        return MongoExecutionContext.super.getNative(nativeType);
+    }
+
+    private MongoPersistentEntity<?> getPersistentEntity(Class<?> entityClass) {
+        return mongoConverter.getMappingContext().getPersistentEntity(entityClass);
+    }
+}
+```
+
+With this adapter, entity write/read conversion goes through Spring Data's `MongoConverter`, so Spring mapping configuration such as `@Document`, `@Id`, `@Field`, and `MongoCustomConversions` continues to apply to entity conversion.
+
+Because `beforePersist(...)` is connected to `ReactiveBeforeConvertCallback`, reactive auditing callbacks such as `@CreatedDate`, `@LastModifiedDate`, `@CreatedBy`, and `@LastModifiedBy` are also applied to `save()` operations when reactive auditing is enabled in the Spring application.
+
+The DSL does not call Spring `ReactiveMongoTemplate` CRUD methods themselves. MongoDB operations are executed with the Reactive Streams Driver, while the adapter connects Spring **mapping / collection naming / selected entity lifecycle callbacks**.
+
+#### Resolver configuration
+
+For a single MongoDB, a resolver can still use a single key. Applications with multiple `ReactiveMongoTemplate` instances can create one `MongoExecutionContext` per template/client pair and route them by key.
+
+```java
+public enum MongoTemplateName {
+    FRONT,
+    BACK
+}
+```
+
+```java
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.ApplicationContext;
+import org.springframework.data.mapping.callback.ReactiveEntityCallbacks;
+import org.springframework.data.mongodb.core.ReactiveMongoTemplate;
+import org.springframework.stereotype.Component;
+
+import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
+import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
+import com.mongodb.reactivestreams.client.MongoClient;
+
+@Component
+public class MongoTemplateNameResolver
+    implements MongoTemplateResolver<MongoTemplateName> {
+
+    private final MongoExecutionContext frontExecutionContext;
+    private final MongoExecutionContext backExecutionContext;
+
+    public MongoTemplateNameResolver(
+        @Qualifier("frontMongoTemplate") ReactiveMongoTemplate frontTemplate,
+        @Qualifier("frontMongoClient") MongoClient frontMongoClient,
+        @Qualifier("backMongoTemplate") ReactiveMongoTemplate backTemplate,
+        @Qualifier("backMongoClient") MongoClient backMongoClient,
+        ApplicationContext applicationContext
+    ) {
+        ReactiveEntityCallbacks entityCallbacks =
+            ReactiveEntityCallbacks.create(applicationContext);
+
+        this.frontExecutionContext = new SpringReactiveMongoExecutionContext(
+            frontTemplate,
+            frontMongoClient,
+            entityCallbacks
+        );
+
+        this.backExecutionContext = new SpringReactiveMongoExecutionContext(
+            backTemplate,
+            backMongoClient,
+            entityCallbacks
+        );
+    }
+
+    @Override
+    public MongoExecutionContext getTemplate(MongoTemplateName key) {
+        return switch (key) {
+            case FRONT -> frontExecutionContext;
+            case BACK -> backExecutionContext;
+        };
+    }
+}
+```
+
+Pass a `ReactiveMongoTemplate` and `MongoClient` that belong to the **same Mongo configuration**. Collection/database access is based on the template, while `ClientSession` is started from the provided `MongoClient`.
+
+When multiple database contexts use the same `MongoClient`, their `getSessionScope()` values are the same and the DSL can share one session across them inside a transaction. Contexts backed by different `MongoClient` instances cannot be combined into one DSL transaction session.
+
+#### Register `ReactiveMongoDsl` as a bean
+
+After registering the resolver, register `ReactiveMongoDsl` itself as a Spring bean and inject it into application services.
+
+```java
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl;
+import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
+
+@Configuration
+public class ReactiveMongoDslConfiguration {
+
+    @Bean
+    public ReactiveMongoDsl<MongoTemplateName> reactiveMongoDsl(
+        MongoTemplateResolver<MongoTemplateName> resolver
+    ) {
+        return new ReactiveMongoDsl<>(resolver);
+    }
+}
+```
+
+Then inject it into any Spring bean:
+
+```java
+import org.springframework.stereotype.Service;
+
+import com.byeolnaerim.mongodsl.ReactiveMongoDsl;
+
+@Service
+public class UserService {
+
+    private final ReactiveMongoDsl<MongoTemplateName> dsl;
+
+    public UserService(ReactiveMongoDsl<MongoTemplateName> dsl) {
+        this.dsl = dsl;
+    }
+}
+```
+
+#### What the Spring adapter applies
+
+| Item | Applied | Description |
+| --- | --- | --- |
+| `@Document(collection = ...)` | Yes | Uses `ReactiveMongoTemplate#getCollectionName(...)` |
+| `@Id` / id conversion | Yes | Uses `MongoConverter` and Spring mapping metadata |
+| `@Field` / custom conversion | Yes | Uses `MongoConverter` for entity ↔ `Document` conversion |
+| Reactive auditing | Yes (`save()` operations) | Applied through `ReactiveBeforeConvertCallback` |
+| `ReactiveAfterSaveCallback` | Yes (`save()` operations) | Called immediately after a successful write |
+| `ReactiveBeforeSaveCallback` | No | `MongoExecutionContext` currently has no post-conversion/pre-write hook |
+| `ReactiveAfterConvertCallback` | No | The DSL `read(...)` contract is synchronous and does not invoke a separate reactive callback |
+| Spring query field mapping | No | String field paths in the DSL use MongoDB document field names |
+| Spring `DataAccessException` translation | No | MongoDB operations are executed by the Reactive Streams Driver |
+| Automatic participation in Spring `@Transactional` | No | DSL transactions use their own `ClientSession` flow |
+
+When a Java property and stored field name differ, such as `@Field("user_name")`, Spring mapping applies to entity write/read conversion, but DSL conditions should use the actual MongoDB field name.
+
+```java
+@Field("user_name")
+private String userName;
+```
+
+```java
+// O: MongoDB document field name
+.fields(pair("user_name", "kim"))
+
+// Not automatically remapped through Spring QueryMapper
+.fields(pair("userName", "kim"))
+```
+
+The `id` path is normalized to `_id` by the DSL's own path rule.
+
+Lifecycle hooks apply to `save()` operations. Bulk/history/remove paths do not invoke them, and `atomicUpdate()` does not pass through the entity save lifecycle, so auditing fields required by an atomic update should be included explicitly in the update itself.
+
+---
+
+### 3) Basic query
+
+```java
+import static com.byeolnaerim.mongodsl.criteria.FieldsPair.pair;
+import static com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition.*;
+
+Flux<User> users = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(
+        pair("status", "ACTIVE"),
+        pair("age", 20, gte),
+        pair("name", "kim", like)
+    )
+    .end()
+    .findAll()
+    .execute();
+```
+
+Single result:
+
+```java
+Mono<User> user = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("id", userId))
+    .end()
+    .find()
+    .execute();
+```
+
+Both `find().execute()` and `find().executeFirst()` return `Mono<E>`. `executeFirst()` explicitly applies `limit(1)` to the query spec before reading the first result.
+
+---
+
+## Execution context
+
+### `executeEntity(...)`
+
+Select the target entity type and resolver key.
+
+```java
+var userDsl = dsl.executeEntity(User.class, MongoTemplateName.FRONT);
+```
+
+The collection name is resolved by `MongoExecutionContext#getCollectionName(User.class)`.
+
+---
+
+### `executeCustomClass(...)`
+
+Use this when the read/write type and the physical collection name need to be specified directly.
+
+```java
+Mono<Document> raw = dsl
+    .executeCustomClass(Document.class, MongoTemplateName.FRONT, "user_archive")
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .find()
+    .execute();
+```
+
+---
+
+## Field names and `id` rules
+
+String field names in the DSL are treated as **physical MongoDB field names** by default.
+
+Spring Data property mapping is not automatically applied to these field paths.
+
+When an exact path segment is named `id`, however, it is normalized to MongoDB `_id`.
+
+```java
+pair("id", value)             // -> _id
+pair("parent.id", value)      // -> parent._id
+pair("incidentId", value)     // -> incidentId unchanged
+pair("_id", value)            // -> _id unchanged
+```
+
+When the `id` alias is used and its value is a valid 24-character hexadecimal string, it is automatically converted to `ObjectId`.
+
+```java
+pair("id", "64f0...")
+```
+
+The condition above can therefore render as an `_id: ObjectId(...)` comparison.
+
+When `_id` is specified directly, a String value is not automatically converted to `ObjectId`.
+
+```java
+pair("_id", new ObjectId(id))
+```
+
+Provide the correct value type explicitly when using `_id` directly.
+
+Enum field names use `Enum#toString()`. If physical Mongo field names are represented by an enum, define `toString()` to return the actual stored field name.
+
+---
+
+## Conditions: `FieldsPair`
+
+Basic forms:
+
+```java
+FieldsPair.pair(field, value)
+FieldsPair.pair(field, value, condition)
+FieldsPair.pair(field, condition)
+```
+
+Supported `Condition` values:
+
+| Condition | Meaning |
+|---|---|
+| `eq` | equal |
+| `notEq` | not equal |
+| `between` | inclusive range |
+| `gt` / `gte` | greater than / greater than or equal |
+| `lt` / `lte` | less than / less than or equal |
+| `in` / `notIn` | in / not in |
+| `like` | case-insensitive regex |
+| `regex` | regex |
+| `exists` | field existence |
+| `isNull` / `isNotNull` | null / not-null comparison |
+| `all` | array `$all` |
+| `near` | legacy 2d near |
+| `nearSphere` | spherical near |
+| `elemMatch` | array element condition |
+
+Example:
+
+```java
+.fields(
+    pair("status", List.of("READY", "ACTIVE"), in),
+    pair("price", List.of(10_000L, 50_000L), between),
+    pair("deletedAt", isNull)
+)
+```
+
+`like` does not escape the input as an ordinary literal substring. It passes the input as a MongoDB regex pattern and applies the `i` option.
+
+---
+
+### `autoRangePair(...)`
+
+Automatically selects `between`, `gte`, or `lte` depending on whether `from` and `to` are present.
+
+```java
+FieldsPair<String, Object> createdAt =
+    FieldsPair.autoRangePair("createdAt", from, to);
+```
+
+Behavior:
+
+```text
+from != null && to != null -> between
+from != null && to == null -> gte
+from == null && to != null -> lte
+from == null && to == null -> null
+```
+
+Overloads are provided for `Instant`, `LocalDateTime`, `LocalDate`, and `[from, to]` list forms.
+
+When both values are absent, the method returns `null`, so it can be omitted naturally when assembling dynamic conditions.
+
+---
+
+## AND / OR / NOT grouping
+
+`FieldBuilder` supports `and`, `or`, `not`, `notAny`, and `notAll`.
+
+```java
+Flux<User> users = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields()
+    .and(f -> f.fields(
+        pair("status", List.of("ACTIVE_1", "ACTIVE_2"), in),
+        pair("age", 20, gte)
+    ))
+    .or(f -> f.fields(
+        pair("name", "kim", like),
+        pair("name", "lee", like)
+    ))
+    .notAny(f -> f.fields(
+        pair("banned", true)
+    ))
+    .end()
+    .findAll()
+    .execute();
+```
+
+You can also choose the root logical operator directly.
+
+```java
+.fields(ReactiveMongoDsl.LogicalOperator.OR,
+    pair("status", "READY"),
+    pair("status", "ACTIVE")
+)
+```
+
+---
+
+## Driver-native filter escape hatch
+
+MongoDB Driver filters that do not have a dedicated DSL `Condition` can be inserted directly.
+
+```java
+import com.mongodb.client.model.Filters;
+
+Flux<User> users = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .driverFilter(
+        Filters.and(
+            Filters.eq("status", "ACTIVE"),
+            Filters.size("tags", 3)
+        )
+    )
+    .end()
+    .findAll()
+    .execute();
+```
+
+Raw `Bson` passed this way is not reinterpreted or field-mapped by the DSL; the Driver definition is used as-is.
+
+---
+
+## Querying: `findAll()` / `find()`
+
+### `findAll()`
+
+```java
+Flux<User> users = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort
+        .desc("createdAt")
+        .asc("id")
+    )
+    .excludes("largePayload")
+    .execute();
+```
+
+Main options:
+
+- `paging(pageNumber, pageSize)`
+- `sorts()` / `sorts(callback)`
+- `excludes(...)`
+- `readPreference(...)`
+- `isAllowDiskUse(...)`
+- `customizeQuery(...)`
+- `customizeAggregation(...)`
+
+---
+
+### Sorting: `SortSpec`
+
+Sort keys preserve the order in which they are added.
+
+```java
+.findAll()
+.sorts(sort -> sort
+    .desc("score")
+    .asc("createdAt")
+    .desc("id")
+)
+.execute();
+```
+
+Dynamic direction:
+
+```java
+.sorts(sort -> sort.of(direction, field))
+
+.sorts( sortSpec -> sorts.stream().filter( e -> ! e.trim().isBlank() ).limit( 10 ).forEach( e -> {
+				String[] paths = e.split( "=" );
+				if (paths.length != 2 || Stream.of( paths ).anyMatch( String::isBlank ))
+					return;
+
+				sortSpec.of( paths[1], paths[0].trim() );
+
+			} ) )
+```
+
+Supported direction values are `asc` and `desc`, case-insensitive.
+
+Driver-native sorts can be mixed in as well.
+
+```java
+.sorts(sort -> sort
+    .driver(Sorts.metaTextScore("score"))
+    .desc("id")
+)
+```
+
+---
+
+### `find()`
+
+```java
+Mono<User> one = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .find()
+    .sorts(sort -> sort.desc("createdAt"))
+    .executeFirst();
+```
+
+`find()` also supports `sorts`, `excludes`, `readPreference`, `isAllowDiskUse`, and query/aggregation customizers.
+
+---
+
+## Paging
+
+### Standard find paging
+
+```java
+Flux<User> users = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .paging(0, 20)
+    .sorts(sort -> sort.desc("id"))
+    .execute();
+```
+
+`pageNumber` is zero-based.
+
+The nested builder style is also supported.
+
+```java
+.findAll()
+.paging()
+    .pageNumber(0)
+    .pageSize(20)
+    .and()
+.execute();
+```
+
+---
+
+### `PageStream<T>`
+
+Use `executePageStream()` when you want to keep page data as a `Flux` instead of collecting it into a `List` first.
+
+```java
+PageStream<User> page = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .paging(0, 20)
+    .executePageStream();
+
+Flux<User> data = page.data();
+Mono<Long> totalCount = page.totalCount();
+```
+
+For batch or streaming processing, `PageStream` can be preferable to collecting immediately into `PageResult`.
+
+---
+
+## Aggregation execution
+
+Ordinary condition builders can also be executed as aggregation pipelines.
+
+```java
+Flux<User> stream = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .paging(0, 20)
+    .sorts(sort -> sort.desc("id"))
+    .executeAggregationStream();
+```
+
+Reactive page:
+
+```java
+PageStream<User> page = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .paging(0, 20)
+    .executeAggregationPageStream();
+```
+
+When the traditional `PageResult<T>` form is needed:
+
+```java
+Mono<PageResult<User>> page = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .paging(0, 20)
+    .executeAggregation();
+```
+
+`executeAggregation()` collects the reactive page data into a final `List` and creates a `PageResult`.
+
+For a single result, use `find().executeAggregation()`.
+
+---
+
+## `count()` / `exists()` / `delete()` / `distinct()`
+
+### count
+
+```java
+Mono<Long> count = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .count()
+    .execute();
+```
+
+Aggregation count:
+
+```java
+Mono<Long> count = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .count()
+    .executeAggregation();
+```
+
+---
+
+### exists
+
+```java
+Mono<Boolean> exists = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("id", userId))
+    .end()
+    .exists()
+    .execute();
+```
+
+Aggregation-based existence checks are also supported.
+
+```java
+.exists().executeAggregation();
+```
+
+---
+
+### Conditional delete
+
+```java
+Mono<DeleteResult> deleted = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "REMOVED"))
+    .end()
+    .delete()
+    .execute();
+```
+
+This `delete().execute()` terminal deletes all documents matching the current criteria through `deleteMany` semantics.
+
+To delete one entity by its id, use the separate `executeEntity(...).delete(entity)` API.
+
+---
+
+### distinct
+
+`distinct` returns `Flux<R>` and does not collect results into a `List` internally.
+
+```java
+Flux<String> statuses = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("caseYear", 2026))
+    .end()
+    .distinct("status", String.class)
+    .execute();
+```
+
+Collect only when the caller actually needs a list.
+
+```java
+Mono<List<String>> statusList = statuses.collectList();
+```
+
+Enum-backed field names are also supported.
+
+```java
+.distinct(UserField.STATUS, String.class)
+```
+
+---
+
+## Saving: `save()` / `saveAll()`
+
+### `save()`
+
+```java
+Mono<User> saved = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .save(user);
+```
+
+Current behavior:
+
+- no id: `insertOne`
+- id present: `replaceOne(..., upsert=true)` by `_id`
+- when MongoDB generates `_id`, it is applied back to the entity through `MongoExecutionContext#setId(...)` when possible
+
+`save()` passes through the `MongoExecutionContext.beforePersist(...)` and `afterPersist(...)` lifecycle hooks.
+
+---
+
+### `saveAll()`
+
+```java
+Flux<User> saved = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .saveAll(users);
+```
+
+Overloads are provided for `Iterable`, `Collection`, and `Flux`.
+
+`saveAll()` executes `save()` for each entity, so the save lifecycle hooks are applied to each entity as well.
+
+---
+
+## Bulk operations
+
+### `saveAllBulk()`
+
+```java
+Flux<User> inserted = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .saveAllBulk(users);
+```
+
+The current implementation collects the entities and executes `insertMany`.
+
+- this is a **bulk insert**, not an update by existing id
+- generated `_id` values are applied back to original entities when possible
+- `beforePersist` / `afterPersist` hooks are not invoked
+
+---
+
+### `saveAllBulkUpsert()`
+
+Bulk upserts by entity id.
+
+```java
+Mono<BulkWriteResult> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .saveAllBulkUpsert(users);
+```
+
+Behavior:
+
+- no id: `InsertOneModel`
+- id present: `_id` filter + `$set` + `upsert(true)`
+
+Bulk writes run with `ordered(false)`.
+
+---
+
+### `saveAllBulkUpsertByKey()`
+
+Upsert by business composite key:
+
+```java
+Mono<BulkWriteResult> result = dsl
+    .executeEntity(Auction.class, MongoTemplateName.FRONT)
+    .saveAllBulkUpsertByKey(
+        auctions,
+        "caseNo",
+        "caseYear",
+        "court"
+    );
+```
+
+If any specified key is missing, that entity is inserted instead.
+
+When all keys are present:
+
+- key fields: `$setOnInsert`
+- all document fields except `_id` and key fields: `$set`
+- `upsert(true)`
+
+Bulk APIs do not invoke save lifecycle hooks.
+
+---
+
+## Entity deletion and remove backup
+
+An entity instance can be deleted directly.
+
+```java
+Mono<DeleteResult> deleted = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .delete(user);
+```
+
+When the entity has an id, deletion uses `_id`. When it has no id, the entity is converted to BSON and that document is used as the filter.
+
+To keep a copy in a remove collection:
+
+```java
+dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .delete(user, true);
+```
+
+Backup collection name:
+
+```text
+<sourceCollection>_remove
+```
+
+Bulk delete:
+
+```java
+Mono<BulkWriteResult> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .deleteBulk(users, true);
+```
+
+In the current implementation, `delete(entity, true)` performs the actual delete and then writes the backup to the remove collection. `deleteBulk(..., true)` writes the backup first and then performs the bulk delete. The actual deletion set of `deleteBulk(...)` consists of entities that have an id.
+
+If deletion and backup need to be atomic for `delete(..., true)` or `deleteBulk(..., true)`, wrap the operation in a caller-controlled `getTxJob(...)` transaction.
+
+---
+
+## History snapshots
+
+`createHistory(entity[, prefix])` deep-copies the current `MongoExecutionContext.write(...)` result, removes `_id`, and inserts the snapshot into a separate collection.
+
+```java
+Mono<Void> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .createHistory(user);
+```
+
+Default collection:
+
+```text
+<sourceCollection>_history
+```
+
+Custom prefix:
+
+```java
+.createHistory(user, "snapshot")
+```
+
+Result:
+
+```text
+<sourceCollection>_snapshot
+```
+
+A leading underscore in a prefix such as `_snapshot` is normalized so duplicate underscores are not produced.
+
+History writes do not invoke save lifecycle hooks.
+
+---
+
+## Transactions: `getTxJob(...)`
+
+Transactions use MongoDB `ClientSession` directly.
+
+```java
+Mono<String> result = dsl.getTxJob(
+    MongoTemplateName.FRONT,
+    () -> dsl
+        .executeEntity(User.class, MongoTemplateName.FRONT)
+        .save(user)
+        .then(
+            dsl.executeEntity(Audit.class, MongoTemplateName.FRONT)
+                .save(audit)
+        )
+        .thenReturn("committed")
+);
+```
+
+`getTxJob(...)` performs the following flow:
+
+1. `MongoExecutionContext.startSession()`
+2. `session.startTransaction()`
+3. place the session in Reactor Context
+4. commit on normal completion
+5. abort an active transaction on error/cancel
+6. close the session
+
+A transaction session is propagated only to DSL executions whose `MongoExecutionContext#getSessionScope()` is the same.
+
+`DriverMongoExecutionContext` uses its `MongoClient` as the default session scope, so contexts sharing the same client can participate in the same transaction session.
+
+Contexts using different `MongoClient` instances cannot be combined into the same transaction.
+
+`getTxJob(...)` does not automatically retry MongoDB transaction errors such as `TransientTransactionError`. Retry policy belongs to the calling application and should be applied explicitly according to the operation's business semantics.
+
+### Transactions in Spring applications
+
+Using the Spring adapter does not change how DSL transactions work.
+
+`@Transactional`, `ReactiveMongoTransactionManager`, and `TransactionalOperator` define transaction boundaries managed by Spring Data MongoDB. `ReactiveMongoDsl#getTxJob(...)` instead starts a `ClientSession` through `MongoExecutionContext.startSession()` and propagates that session through Reactor Context.
+
+Do not assume that DSL operations automatically join a Spring-bound Mongo session just because they are called inside a Spring `@Transactional` block. Likewise, do not assume that `ReactiveMongoTemplate` or Spring Data Repository operations called inside `getTxJob(...)` automatically use the DSL session.
+
+Use `getTxJob(...)` for transactions composed of DSL operations, and Spring's transaction infrastructure for transactions composed of Spring Data Template/Repository operations. If both execution models must participate in one transaction, the application must explicitly design the session integration.
+
+---
+
+## `$lookup` joins
+
+### `LookupSpec`
+
+`LookupSpec` supports both simple `localField / foreignField` joins and `let + pipeline + $expr` joins.
+
+Simple join:
+
+```java
+LookupSpec spec = LookupSpec.builder()
+    .as("orders")
+    .localField("id")
+    .foreignField("userId")
+    .build();
+```
+
+Condition-based join:
+
+```java
+import static com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition.*;
+
+LookupSpec spec = LookupSpec.builder()
+    .as("orders")
+    .bindConditionFields("id", eq, "userId")
+    .bindConditionConst("DONE", eq, "status")
+    .limit(10)
+    .sorts(sort -> sort.desc("createdAt"))
+    .build();
+```
+
+Main builder methods:
+
+- `localField(...)`
+- `foreignField(...)`
+- `bindConditionFields(leftField, condition, rightField)`
+- `bindConditionFieldsLeftToObjectId(leftField, condition, rightField)`
+- `bindConditionConst(value, condition, rightField)`
+- `bindConditionBetween(low, high, rightField)`
+- `bindConditionLike(pattern, rightField, options)`
+- `bindConditionExists(rightField, exists)`
+- `bindConditionIsNull(rightField)`
+- `bindConditionIsNotNull(rightField)`
+- `limit(...)`
+- `sorts(...)`
+- `rawStage(Bson)`
+- `unwind(preserveNullAndEmptyArrays)`
+- `outerStage(Bson)` / `outerStages(...)`
+- `outerMatchExpr(Document)`
+
+`bindConditionFieldsLeftToObjectId(...)` converts the left field through `$convert: { to: "objectId" }` before comparing it with the right field.
+
+Field-name rules are the same as in the normal DSL, so `id` is normalized to `_id`.
+
+---
+
+### `findAll().executeLookup(...)`
+
+```java
+var left = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .paging(0, 20);
+
+var right = dsl
+    .executeEntity(Order.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "DONE"))
+    .end()
+    .findAll();
+
+Flux<ResultTuple<User, List<Order>>> joined =
+    left.executeLookup(right, spec);
+```
+
+Without `LookupSpec.unwind(...)`, the default lookup returns the right side as `List<R>`.
+
+---
+
+### `executeLookupAndCount(...)`
+
+```java
+Mono<PageResult<ResultTuple<User, List<Order>>>> page =
+    left.executeLookupAndCount(right, spec);
+```
+
+This returns data and `totalCount` together using a `$facet(data, count)` pipeline.
+
+---
+
+### `find().executeLookup(...)`
+
+Use the `find()` path when you need a single left result and a single right result.
+
+```java
+Mono<ResultTuple<User, Order>> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("id", userId))
+    .end()
+    .find()
+    .executeLookup(rightFindBuilder, spec);
+```
+
+---
+
+### count / exists lookup
+
+Lookup-based left/right counts or existence results can be returned together as well.
+
+```java
+Mono<ResultTuple<Long, Long>> counts = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .count()
+    .executeLookup(right, spec);
+```
+
+```java
+Mono<ResultTuple<Boolean, Boolean>> exists = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("id", userId))
+    .end()
+    .exists()
+    .executeLookup(right, spec);
+```
+
+---
+
+## Grouping aggregation
+
+Group from a query terminal builder with `group(keyType, valueType)`.
+
+```java
+Mono<Map<String, GroupResult>> grouped = dsl
+    .executeEntity(Order.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "DONE"))
+    .end()
+    .findAll()
+    .group(String.class, GroupResult.class)
+    .by("userId")
+    .count()
+    .sum("amount", "totalAmount")
+    .execute();
+```
+
+Supported accumulator helpers:
+
+- `count()` / `countAs(alias)`
+- `sum(field, alias)`
+- `avg(field, alias)`
+- `min(field, alias)`
+- `max(field, alias)`
+- `addToSet(field, alias)`
+- `push(field, alias)`
+- `accumulator(BsonField)`
+
+Use `accumulator(...)` for a Driver-native accumulator.
+
+To customize key/value mapping directly:
+
+```java
+.group(String.class, GroupResult.class)
+.keyConverter(document -> ...)
+.valueConverter(document -> ...)
+```
+
+Grouping also supports `executeLookup(rightBuilder, spec)`.
+
+---
+
+## Atomic updates: `atomicUpdate()`
+
+The API makes both the target scope and update representation explicit before update operations are added.
+
+```text
+atomicUpdate()
+    -> first() / multi() / upsertOne()
+    -> document() / pipeline()
+    -> update operations
+    -> execute()
+```
+
+---
+
+### Document update
+
+Single document:
+
+```java
+Mono<UpdateResult> updated = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("id", userId))
+    .end()
+    .atomicUpdate()
+    .first()
+    .document()
+    .inc("loginCount", 1)
+    .set("lastLoginAt", Instant.now())
+    .execute();
+```
+
+Multiple documents:
+
+```java
+.atomicUpdate()
+.multi()
+.document()
+.set("status", "ARCHIVED")
+.execute();
+```
+
+Single-document upsert:
+
+```java
+.atomicUpdate()
+.upsertOne()
+.document()
+.set("status", "ACTIVE")
+.setOnInsert("createdAt", Instant.now())
+.execute();
+```
+
+Document update helpers:
+
+- `inc(field, delta)`
+- `set(field, value)`
+- `unset(field)`
+- `push(field, value)`
+- `addToSet(field, value)`
+- `pull(field, value)`
+- `driverUpdate(Bson)`
+
+`setOnInsert(...)` is available only with `upsertOne().document()`.
+
+---
+
+### Pipeline update
+
+```java
+Mono<UpdateResult> updated = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("id", userId))
+    .end()
+    .atomicUpdate()
+    .first()
+    .pipeline()
+    .set("updatedAt", "$$NOW")
+    .inc("loginCount", 1)
+    .nextStage()
+    .unset("legacyField")
+    .execute();
+```
+
+Supported helpers:
+
+- `set(field, valueOrExpression)`
+- `inc(field, delta)`
+- `unset(fields...)`
+- `stage(Bson)`
+- `nextStage()`
+
+`nextStage()` flushes the currently pending `$set` operations into one pipeline stage.
+
+To append a pipeline stage directly:
+
+```java
+.stage(Aggregates.set(new Field<>("normalized", ...)))
+```
+
+---
+
+### Auditing / lifecycle note
+
+`atomicUpdate()` is not an entity save; it executes Driver update operations directly.
+
+It therefore does not pass through `MongoExecutionContext.beforePersist(...)` or `afterPersist(...)`.
+
+Even when a Spring adapter provides auditing hooks, automatic entity-save auditing should not be expected for atomic updates.
+
+Set required values explicitly:
+
+```java
+.atomicUpdate()
+.first()
+.document()
+.set("updatedAt", Instant.now())
+.execute();
+```
+
+---
+
+## Query / Aggregation Driver customizers
+
+Caller code can add Driver publisher options that are not directly exposed by the standard DSL.
+
+Find publisher:
+
+```java
+.findAll()
+.customizeQuery(publisher -> publisher.batchSize(500))
+.execute();
+```
+
+Aggregation publisher:
+
+```java
+.findAll()
+.customizeAggregation(publisher -> publisher.batchSize(500))
+.executeAggregationStream();
+```
+
+Common options also include:
+
+```java
+.readPreference(ReadPreference.secondaryPreferred())
+.isAllowDiskUse(true)
+```
+
+---
+
+## `preview()` / `explain()`
+
+### `preview()`
+
+`preview()` does not execute a MongoDB query. It renders the current DSL state to a diagnostic `Document`.
+
+Example:
+
+```java
+Mono<Document> preview = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .paging(0, 20)
+    .sorts(sort -> sort.desc("id"))
+    .preview();
+```
+
+In addition to ordinary queries, preview is supported by:
+
+- classic `findAll`
+- classic `find`
+- classic `count`
+- classic `exists`
+- `distinct`
+- Atlas Search `findAll/find/count/existsQuery`
+- Vector Search `findAll/find/count/existsQuery`
+
+`preview()` is a **local diagnostic representation of the query/pipeline built by the DSL**, not a database execution plan.
+
+---
+
+### `explain()`
+
+`explain()` invokes the actual MongoDB Driver explain operation.
+
+```java
+Mono<Document> explain = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .explain();
+```
+
+With explicit verbosity:
+
+```java
+import com.mongodb.ExplainVerbosity;
+
+.explain(ExplainVerbosity.QUERY_PLANNER)
+```
+
+Supported paths pass Driver `ExplainVerbosity` values such as `QUERY_PLANNER`, `EXECUTION_STATS`, and `ALL_PLANS_EXECUTIONS` through directly.
+
+Unlike `preview()`, `explain()` requires a real database connection.
+
+---
+
+## Result types
+
+### `PageResult<T>`
+
+Traditional page shape:
+
+```text
+List<T> data
+Long totalCount
+```
+
+Use this when the final result should be collected into memory.
+
+---
+
+### `PageStream<T>`
+
+Reactive-friendly page shape:
+
+```text
+Flux<T> data
+Mono<Long> totalCount
+```
+
+This is suitable for batch/streaming work that needs to preserve the data stream.
+
+If needed:
+
+```java
+page.collectToPageResult()
+```
+
+converts it to `PageResult<T>`.
+
+---
+
+### `ResultTuple<L, R>`
+
+A container used by lookup/group operations to carry left/right results or a name/value pair together.
+
+---
+
+## Lifecycle / mapping extension
+
+The default `DriverMongoExecutionContext` uses the MongoDB Driver POJO codec.
+
+For framework-specific or application-specific mapping, implement or extend `MongoExecutionContext` and customize:
+
+```java
+Document write(Object source)
+<T> T read(Class<T> targetType, Document source)
+Object getId(Object entity)
+void setId(Object entity, Object id)
+<T> Mono<T> beforePersist(T entity, String collectionName)
+<T> Mono<T> afterPersist(T entity, Document document, String collectionName)
+```
+
+When using Spring Data MongoDB, connect `ReactiveMongoTemplate` conversion, collection naming, and reactive lifecycle behavior through the adapter shown in **Using it in a Spring Data MongoDB project**.
+
+The core library itself remains framework-independent.
+
+---
+
+## Driver-first design
+
+This DSL is an application-level convenience layer, not a replacement for the MongoDB Java Driver.
+
+The main principles are:
+
+1. Prefer Driver typed builders when the Driver already provides them.
+2. Let the DSL simplify repetitive composition and Reactor integration.
+3. When the Driver introduces a capability first, expose a raw/driver escape hatch so it can be used immediately.
+
+Representative escape hatches:
+
+- `driverFilter(Bson)`
+- `SortSpec.driver(Bson)`
+- `LookupSpec.rawStage(Bson)`
+- `Grouping.accumulator(BsonField)`
+- `atomicUpdate().*.document().driverUpdate(Bson)`
+- `atomicUpdate().*.pipeline().stage(Bson)`
+- `SearchOperators.driver(String operatorName, SearchOperator operator)`
+- `search().operator(SearchOperator)`
+- `search().driverOptions(...)`
+- `vectorSearch().query(VectorSearchQuery)`
+- `vectorSearch().driverOptions(...)`
+- `customizeQuery(...)`
+- `customizeAggregation(...)`
+
+---
+
+## Notes
+
+### Standard queries
+
+- String field names refer to physical MongoDB fields, not Java property names.
+- Only an exact `id` path segment is treated as an `_id` alias.
+- A String passed directly to `_id` is not automatically converted to `ObjectId`.
+- `like` is a case-insensitive regex and does not escape the input into a literal substring search.
+- `near` / `nearSphere` use `Double[]{longitude, latitude, maxDistance[, minDistance]}`. `nearSphere` accepts distance values in meters and converts them internally to the earth-radius-based unit expected by the legacy operator; the MongoDB geo index and stored coordinate format must also match.
+- `saveAllBulk()` is `insertMany`, not an upsert operation.
+- Bulk/history/remove paths do not invoke save lifecycle hooks.
+- `atomicUpdate()` does not invoke save lifecycle or auditing hooks.
+- `getTxJob(...)` does not provide a transaction retry policy.
+
+### `$lookup`
+
+- Ordinary conditions in the lookup sub-pipeline are composed from the right-side builder criteria and the `LookupSpec` pipeline.
+- `bindConditionFieldsLeftToObjectId(...)` converts the left-side value to `ObjectId`.
+- Lookup `$expr` helpers do not support `near`, `nearSphere`, or `elemMatch`; use `rawStage(Bson)` when these are needed.
+
+### Atlas Search
+
+- An Atlas Search index must already be configured.
+- `$search` / `$searchMeta` must satisfy the first-stage pipeline constraint.
+- `autocomplete` currently supports a single path.
+- `text.fuzzy` and `text.synonyms` cannot be used together.
+- `search().fields(...)` is a normal `$match` after `$search`, not a filter inside `$search`.
+- `count().execute()` and `count().executeSearchMeta()` have different count semantics.
+- Deterministic sorting is recommended for stable sequence-token pagination.
+
+### Vector Search
+
+- `vectorSearch(index)` requires an explicit vector index name.
+- `$vectorSearch` must be the first pipeline stage.
+- ANN requires `numCandidates(...)` / `approximate(...)`.
+- ENN uses `exact()`.
+- `filterFields(...)` / `filter(...)` are `$vectorSearch.filter` pre-filters.
+- `fields(...)` is a normal `$match` post-filter after `$vectorSearch`.
+- `count()` counts pipeline results after the vector `limit`.
+- Vector Search currently does not provide Atlas Search-style `executePage()`, sequence-token pagination, or metadata count terminals.
+
+---
+
+## Which API should I use?
+
+A simple decision guide:
+
+- ordinary Mongo condition query: `fields(...).end()`
+- pass a Driver filter directly: `driverFilter(...)`
+- multiple results: `findAll()`
+- single result: `find()`
+- count: `count()`
+- existence check: `exists()`
+- distinct stream: `distinct(field, resultClass)`
+- conditional multi-delete: `end().delete()`
+- entity save: `save()` / `saveAll()`
+- bulk insert: `saveAllBulk()`
+- id-based bulk upsert: `saveAllBulkUpsert()`
+- business-key bulk upsert: `saveAllBulkUpsertByKey()`
+- atomic update: `atomicUpdate()`
+- join: `executeLookup(...)`
+- grouped aggregation: `group(...)`
+- inspect a query/pipeline before execution: `preview()`
+- inspect the real execution plan: `explain()`
+- Atlas Search: `search(...)`
+- Vector Search: `vectorSearch(...)`
+- transaction: `getTxJob(...)`
+
+Search/Vector are additional search layers on top of the normal Mongo query DSL. They do not replace the existing query/save/update flow.
+
+---
+
+## Extensions: Atlas Search / Vector Search
+
+Atlas Search and Vector Search do not replace the existing `fields(...).end()` DSL. Keep ordinary query/save/update/lookup flows as-is, and use the dedicated entry points only when a search-specific first aggregation stage is required.
+
+## Atlas Search
+
+Atlas Search uses a separate entry flow because `$search` / `$searchMeta` must be the first stage of the aggregation pipeline.
+
+### Basic entry points
+
+Default index:
+```java
+.search()
+```
+
+Explicit index:
+
+```java
+.search("articles_default")
+```
+
+Example:
+
+```java
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text
+        .path("title")
+        .query("reactive mongo dsl")
+    )
+    .findAll()
+    .execute();
+```
+
+---
+
+### Search root operators
+
+`SearchBuilder` can configure the following operators directly:
 
 - `text(...)`
 - `phrase(...)`
@@ -46,273 +1855,231 @@ Root search styles:
 - `in(...)`
 - `range(...)`
 - `compound(...)`
-- `operator(...)` for directly passing a ready-made `AtlasSearchOperator`
+- `operator(AtlasSearchOperator)`
+- `operator(SearchOperator)`
 
-Post-search features:
-
-- `fields(...)` for **post-search ordinary Mongo `$match`**
-- `highlight(SearchHighlightSpec)`
-- `highlight(spec -> ... )`
-- `addFieldsHighlights()`
-- `addFieldsScore()`
-- `addFieldsScoreDetails()`
-- `addFieldsSequenceToken()`
-- `sorts(SearchSortSpec...)`
-- `firstSortScore()`
-- `paging(pageNumber, pageSize)`
-- `searchAfter(token)` / `searchBefore(token)`
-- `countType(SearchCountType)`
-- `scoreDetails(true)`
-- `excludes(...)`
-
-Terminal builders:
-
-- `findAll().execute()`
-- `findAll().executePage()`
-- `find().execute()` / `find().executeFirst()`
-- `count().execute()`
-- `count().executeSearchMeta()`
-- `existsQuery().execute()`
-
----
-
-## Search semantics: clause vs post-filter
-
-This distinction is important.
-
-### Search clauses
-
-Search clauses become part of the `$search` body and therefore participate in Atlas Search scoring / indexing behavior.
-
-Examples:
-
-- `TextClause`
-- `PhraseClause`
-- `AutocompleteClause`
-- `RangeClause`
-- clauses inside `compound.must / should / filter / mustNot`
-
-### Post-search `fields(...)`
-
-`search().fields(...)` does **not** become part of `$search`.
-It is converted into an ordinary Mongo `$match` stage **after** `$search`.
-
-Use this when you want to:
-
-- reuse the existing `FieldsPair` DSL
-- apply a regular Mongo match after Atlas Search has already selected candidates
-- keep non-search conditions out of the search clause layer
-
-Example:
+When the MongoDB Driver supports a new operator before the DSL adds a convenience wrapper, a Driver-native operator can be passed directly.
 
 ```java
-import static com.byeolnaerim.mongodsl.criteria.FieldsPair.pair;
+SearchOperator driverSearchOperator = ...;
 
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .text(t -> t
-         .path(ArticleField.title)
-         .query("spring data mongo")
-     )
-     .fields(
-         pair("deleted", false),
-         pair("status", "PUBLISHED")
-     )
-     .findAll()
-     .execute();
+.search("articles_default")
+.operator(driverSearchOperator)
+.findAll()
+.execute();
+```
+
+To wrap and reuse it with an explicit operator name:
+
+```java
+AtlasSearchOperator custom = SearchOperators.driver(
+    "custom",
+    driverSearchOperator
+);
+
+.search("articles_default")
+.operator(custom)
+.findAll()
+.execute();
 ```
 
 ---
 
-## Clause factories
+### Search path
 
-Use `SearchOperators` as the static entry point for building reusable clauses.
+Search clause paths accept:
+
+- `String`
+- `Enum<?>`
+- Driver-native `SearchPath` / `FieldSearchPath`
+- custom wrappers through `toString()` fallback
+
+Search-specific helpers:
 
 ```java
-import com.byeolnaerim.mongodsl.search.SearchOperators;
+SearchPaths.field("title")
+SearchPaths.wildcard("content.*")
+```
 
-TextClause<ArticleField> titleClause = SearchOperators.<ArticleField>text()
-    .path(ArticleField.title)
+As with the ordinary DSL, String/Enum paths normalize an exact `id` segment to `_id`.
+
+---
+
+### `SearchOperators`
+
+Reusable clauses can be created through `SearchOperators`.
+
+```java
+TextClause titleClause = SearchOperators.text()
+    .path("title")
     .query("atlas search");
 ```
 
 Available factories:
 
-- `SearchOperators.text()`
-- `SearchOperators.phrase()`
-- `SearchOperators.autocomplete()`
-- `SearchOperators.equals()`
-- `SearchOperators.exists()`
-- `SearchOperators.in()`
-- `SearchOperators.range()`
-
-These return **mutable fluent builders** that render themselves to `Document` only at execution time.
+```java
+SearchOperators.text()
+SearchOperators.phrase()
+SearchOperators.autocomplete()
+SearchOperators.equals()
+SearchOperators.in()
+SearchOperators.exists()
+SearchOperators.range()
+SearchOperators.driver(operatorName, operator)
+```
 
 ---
 
-## `TextClause`
+### `text`
 
-`TextClause` models the Atlas Search `text` operator.
+Supported options:
 
-Supported fluent options:
-
-- `path(K path)`
-- `paths(Collection<K> paths)`
-- `query(String query)`
-- `queries(Collection<String> queries)`
+- `path(...)`
+- `paths(...)`
+- `query(...)`
+- `queries(...)`
 - `fuzzy(maxEdits, prefixLength, maxExpansions)`
-- `matchCriteria(SearchMatchCriteria)`
-- `synonyms(String synonyms)`
+- `matchCriteria(SearchMatchCriteria.ANY/ALL)`
+- `synonyms(mappingName)`
 - `score(SearchScoreSpec)`
+- `score(SearchScore)`
 
-### Example
+Example:
 
 ```java
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .text(t -> t
-         .paths(List.of(ArticleField.title, ArticleField.summary))
-         .query("reactive mongo dsl")
-         .matchCriteria(SearchMatchCriteria.ALL)
-         .fuzzy(1, 1, 50)
-         .score(SearchScoreSpec.boost(3.0))
-     )
-     .findAll()
-     .execute();
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text
+        .paths("title", "summary")
+        .query("reactive mongo dsl")
+        .matchCriteria(SearchMatchCriteria.ALL)
+        .fuzzy(1, 1, 50)
+        .score(SearchScoreSpec.boost(3.0))
+    )
+    .findAll()
+    .execute();
 ```
 
-### Validation note
+`fuzzy(...)` currently allows only 1 or 2 for `maxEdits`.
 
-`TextClause` intentionally rejects using **both** `fuzzy(...)` and `synonyms(...)` together, because the implementation treats them as mutually exclusive.
+`fuzzy(...)` and `synonyms(...)` cannot be used together.
+
+For `matchCriteria(...)`, the DSL narrowly fills the BSON option only where Driver 5.9.x does not yet provide a dedicated typed method.
 
 ---
 
-## `PhraseClause`
+### `phrase`
 
-`PhraseClause` models the Atlas Search `phrase` operator.
+Supported options:
 
-Supported fluent options:
-
-- `path(K path)` / `paths(Collection<K> paths)`
-- `query(String query)` / `queries(Collection<String> queries)`
-- `slop(int slop)`
-- `synonyms(String synonyms)`
-- `score(SearchScoreSpec)`
-
-### Example
+- `path(...)` / `paths(...)`
+- `query(...)` / `queries(...)`
+- `slop(...)`
+- `synonyms(...)`
+- `score(...)`
 
 ```java
-Flux<Article> exactish =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .phrase(p -> p
-         .path(ArticleField.title)
-         .query("reactive mongo dsl")
-         .slop(2)
-         .score(SearchScoreSpec.boost(2.0))
-     )
-     .findAll()
-     .execute();
-```
-
-Use `phrase` when term order matters more than with ordinary `text` queries.
-
----
-
-## `AutocompleteClause`
-
-`AutocompleteClause` models the Atlas Search `autocomplete` operator.
-
-Supported fluent options:
-
-- `path(K path)`
-- `query(String query)` / `queries(Collection<String> queries)`
-- `tokenOrder(SearchTokenOrder)`
-- `fuzzy(maxEdits, prefixLength, maxExpansions)`
-- `score(SearchScoreSpec)`
-
-### Example
-
-```java
-Flux<Article> suggest =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_autocomplete")
-     .autocomplete(a -> a
-         .path(ArticleField.titleAutocomplete)
-         .query("rea mon")
-         .tokenOrder(SearchTokenOrder.SEQUENTIAL)
-         .fuzzy(1, 1, 20)
-     )
-     .firstSortScore()
-     .findAll()
-     .execute();
-```
-
-### Important note
-
-This DSL intentionally exposes only **single-path** `path(...)` for `AutocompleteClause`, because the current implementation treats autocomplete as a single-path operator.
-
----
-
-## `EqualsClause`
-
-`EqualsClause` is intended for exact equality matching inside Atlas Search.
-
-Supported value overloads include:
-
-- `String`
-- `Boolean`
-- `Integer`
-- `Long`
-- `Double`
-- `Float`
-- `Instant`
-- `ObjectId`
-- `UUID`
-- `valueNull()`
-
-### Example
-
-```java
-Flux<Article> exactStatus =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .equals(e -> e
-         .path(ArticleField.status)
-         .value("PUBLISHED")
-     )
-     .findAll()
-     .execute();
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .phrase(phrase -> phrase
+        .path("title")
+        .query("reactive mongo dsl")
+        .slop(2)
+        .score(SearchScoreSpec.boost(2.0))
+    )
+    .findAll()
+    .execute();
 ```
 
 ---
 
-## `ExistsClause`
+### `autocomplete`
 
-`ExistsClause` checks whether an indexed field path exists.
+Autocomplete currently uses a single path.
+
+Supported options:
+
+- `path(...)`
+- `query(...)` / `queries(...)`
+- `tokenOrder(SearchTokenOrder.ANY/SEQUENTIAL)`
+- `fuzzy(...)`
+- `score(...)`
 
 ```java
-Flux<Article> withImage =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .exists(e -> e
-         .path(ArticleField.thumbnailUrl)
-     )
-     .findAll()
-     .execute();
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_autocomplete")
+    .autocomplete(auto -> auto
+        .path("titleAutocomplete")
+        .query("rea mon")
+        .tokenOrder(SearchTokenOrder.SEQUENTIAL)
+        .fuzzy(1, 1, 20)
+    )
+    .findAll()
+    .execute();
 ```
-
-This is especially useful inside `compound.filter(...)` or `compound.mustNot(...)`.
 
 ---
 
-## `InClause`
+### `equals`
 
-`InClause` provides a strongly typed wrapper around Atlas Search `in`.
+`equals` compares one path with one value.
 
-Supported value methods include:
+```java
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .equals(eq -> eq
+        .path("status")
+        .value("PUBLISHED")
+    )
+    .findAll()
+    .execute();
+```
+
+The current clause provides typed value overloads supported by the Driver for String, Boolean, integral/floating-point numbers, `Instant`, `ObjectId`, UUID, and others, plus `valueNull()`.
+
+---
+
+### `exists`
+
+```java
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .exists(exists -> exists.path("publishedAt"))
+    .findAll()
+    .execute();
+```
+
+The name is similar to the ordinary Mongo `end().exists()` terminal, but the meanings differ:
+
+- `search().exists(...)`: Atlas Search operator
+- `search()....existsQuery()`: terminal that checks whether the search result contains at least one document
+
+---
+
+### `in`
+
+`InClause` provides APIs that distinguish the value type explicitly.
+
+Example:
+
+```java
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .in(in -> in
+        .path("status")
+        .valuesStrings(List.of("PUBLISHED", "ARCHIVED"))
+    )
+    .findAll()
+    .execute();
+```
+
+Main value helpers:
 
 - `valuesStrings(...)`
 - `valuesBooleans(...)`
@@ -324,145 +2091,79 @@ Supported value methods include:
 - `valuesUuids(...)`
 - `valuesRaw(...)`
 
-### Example
-
-```java
-Flux<Article> visibleStatuses =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .in(i -> i
-         .path(ArticleField.status)
-         .valuesStrings(List.of("PUBLISHED", "SCHEDULED"))
-     )
-     .findAll()
-     .execute();
-```
-
-`valuesRaw(...)` exists as an escape hatch, but prefer the typed methods in ordinary application code.
-
 ---
 
-## `RangeClause`
+### `range`
 
-`RangeClause` supports numeric, date, tokenized string, and objectId range queries.
+```java
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .range(range -> range
+        .path("publishedAt")
+        .gte(from)
+        .lt(to)
+    )
+    .findAll()
+    .execute();
+```
 
-Supported fluent methods:
+Supported boundaries:
 
 - `gt(...)`
 - `gte(...)`
 - `lt(...)`
 - `lte(...)`
-- `score(SearchScoreSpec)`
 
-### Example: date range
-
-```java
-Flux<Article> recent =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .range(r -> r
-         .path(ArticleField.publishedAt)
-         .gte(Instant.parse("2025-01-01T00:00:00Z"))
-         .lt(Instant.parse("2026-01-01T00:00:00Z"))
-     )
-     .findAll()
-     .execute();
-```
-
-### Example: numeric range
-
-```java
-Flux<Article> weighted =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .range(r -> r
-         .path(ArticleField.scoreWeight)
-         .gte(10)
-         .lt(100)
-     )
-     .findAll()
-     .execute();
-```
+Typed range values supported by the Driver, including numbers, dates, and `ObjectId`, can be used.
 
 ---
 
-## `SearchScoreSpec`
+### `compound`
 
-`SearchScoreSpec` exists to keep score customization strongly typed and DSL-friendly.
-
-Supported entry points:
-
-- `SearchScoreSpec.boost(double value)`
-- `SearchScoreSpec.boostByPath(path)`
-- `SearchScoreSpec.boostByPath(path, undefined)`
-- `SearchScoreSpec.constant(double value)`
-- `SearchScoreSpec.function(spec -> ...)`
-
-### Basic examples
+Build compound searches with `compound(...)`.
 
 ```java
-SearchScoreSpec boosted = SearchScoreSpec.boost(2.5);
-SearchScoreSpec constant = SearchScoreSpec.constant(100);
-SearchScoreSpec pathBoost = SearchScoreSpec.boostByPath(ArticleField.scoreWeight, 1.0);
-```
-
-### Function example
-
-```java
-SearchScoreSpec score = SearchScoreSpec.function(fn -> fn
-    .multiply(expr -> expr
-        .scoreRelevance()
-        .path(ArticleField.scoreWeight, 1.0)
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .compound(compound -> compound
+        .mustText("title", text -> text
+            .query("mongodb")
+        )
+        .shouldText("summary", text -> text
+            .query("mongodb")
+        )
+        .filterEquals("status", eq -> eq
+            .value("PUBLISHED")
+        )
+        .mustNotExists("deletedAt")
+        .minimumShouldMatch(0)
     )
-);
+    .findAll()
+    .execute();
 ```
 
-### More advanced function example
+Operators themselves can also be passed directly.
 
 ```java
-SearchScoreSpec score = SearchScoreSpec.function(fn -> fn
-    .add(expr -> expr
-        .scoreRelevance()
-        .expression(nested -> nested.gauss(
-            ArticleField.scoreWeight,
-            0.0,
-            7.0,
-            0.0,
-            0.5
-        ))
-    )
-);
+.compound(compound -> compound
+    .must(SearchOperators.text().path("title").query("mongo"))
+    .should(SearchOperators.phrase().path("title").query("reactive mongo"))
+    .filter(SearchOperators.equals().path("status").value("PUBLISHED"))
+)
 ```
 
-The builder currently supports:
-
-- `constant(...)`
-- `scoreRelevance()`
-- `path(...)`
-- `add(...)`
-- `multiply(...)`
-- `gauss(...)`
-- `log(...)`
-- `log1p(...)`
-
-Use `SearchScoreSpec` on any clause that supports `.score(...)`.
-
----
-
-## `compound(...)`
-
-`compound(...)` is the main way to combine multiple Atlas Search clauses.
-
-Supported clause groups:
+Supported groups:
 
 - `must(...)`
 - `mustNot(...)`
 - `should(...)`
 - `filter(...)`
-- `minimumShouldMatch(int)`
-- `score(SearchScoreSpec)`
+- `minimumShouldMatch(...)`
+- `score(...)`
 
-Convenience helpers currently include:
+Convenience helpers:
 
 - `mustText(...)`
 - `shouldText(...)`
@@ -474,660 +2175,695 @@ Convenience helpers currently include:
 - `filterRange(...)`
 - `mustNotExists(...)`
 
-### Example
+---
+
+### Search clauses vs post-search `fields(...)`
+
+This distinction is important.
+
+#### Search clauses
+
+`text`, `phrase`, `autocomplete`, `compound.filter`, and similar operators are placed inside the `$search` stage.
+
+They participate directly in Search indexing and scoring.
+
+#### `search().fields(...)`
 
 ```java
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .compound(c -> c
-         .mustText(ArticleField.title, t -> t
-             .query("reactive mongo")
-             .matchCriteria(SearchMatchCriteria.ALL)
-             .score(SearchScoreSpec.boost(5.0))
-         )
-         .shouldAutocomplete(ArticleField.titleAutocomplete, a -> a
-             .query("reactive mon")
-             .tokenOrder(SearchTokenOrder.SEQUENTIAL)
-             .score(SearchScoreSpec.boost(2.0))
-         )
-         .filterEquals(ArticleField.status, e -> e
-             .value("PUBLISHED")
-         )
-         .filterRange(ArticleField.publishedAt, r -> r
-             .gte(Instant.parse("2025-01-01T00:00:00Z"))
-         )
-         .mustNotExists(ArticleField.deletedAt)
-         .minimumShouldMatch(1)
-     )
-     .addFieldsScore()
-     .firstSortScore()
-     .findAll()
-     .execute();
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text
+        .path("title")
+        .query("mongodb")
+    )
+    .fields(
+        pair("deleted", false),
+        pair("status", "PUBLISHED")
+    )
+    .findAll()
+    .execute();
 ```
 
-### When to use `filter` vs post-search `fields(...)`
+The `fields(...)` above is not a filter inside `$search`.
 
-Use `compound.filter(...)` when the condition should stay **inside the Atlas Search clause model**.
-Use `search().fields(...)` when you intentionally want a **plain Mongo `$match` after `$search`**.
+Conceptually the stage order is:
+
+```text
+$search
+-> $match (fields)
+-> metadata addFields / score match
+-> paging
+-> projection
+```
+
+Use `compound.filter(...)` for conditions that should restrict candidates at the search-index stage. Use `search().fields(...)` only when an ordinary MongoDB condition should be applied after Search has produced candidates.
 
 ---
 
-## Highlighting
+### Search score
 
-Highlighting is modeled as a **stage-level option** on `SearchBuilder`, not as part of a specific clause.
-That matches how Atlas Search defines `highlight`: it lives directly under `$search`, and you later expose the result with `$meta: "searchHighlights"`.
+#### Score adjustment
 
-### Available API
-
-- `highlight(SearchHighlightSpec)`
-- `highlight(spec -> ...)`
-- `addFieldsHighlights()`
-- `addFieldsHighlights(String alias)`
-
-### `SearchHighlightSpec`
-
-`SearchHighlightSpec` currently supports:
-
-- `builder().path(path)`
-- `builder().paths(path1, path2, ...)`
-- `builder().paths(Collection<K>)`
-- `builder().maxCharsToExamine(int)`
-- `builder().maxNumPassages(int)`
-
-### Example
+`SearchScoreSpec` helpers:
 
 ```java
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .text(t -> t
-         .path(ArticleField.title)
-         .query("atlas search")
-     )
-     .highlight(h -> h
-         .paths(ArticleField.title, ArticleField.summary)
-         .maxCharsToExamine(200_000)
-         .maxNumPassages(3)
-     )
-     .addFieldsHighlights()
-     .addFieldsScore()
-     .findAll()
-     .execute();
+SearchScoreSpec.boost(3.0)
+SearchScoreSpec.boostByPath("popularity")
+SearchScoreSpec.constant(1.0)
+SearchScoreSpec.function(...)
 ```
 
-### Result shape note
-
-`addFieldsHighlights()` simply exposes Atlas Search metadata as a normal field on the output document.
-If your mapped entity doesn't have a matching property, either:
-
-- add a property to the mapped type,
-- map to a projection/custom class, or
-- omit `addFieldsHighlights()` and keep the entity mapping clean.
-
-### Design note
-
-`count().executeSearchMeta()` uses `$searchMeta` and does **not** include stage-level highlight output. Highlighting is only part of the `$search` stage path.
+Driver-native `SearchScore` can also be passed directly to a clause.
 
 ---
 
-## Sort and score output
-
-### Add score to the result document
+#### Add score to result documents
 
 ```java
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .text(t -> t.path(ArticleField.title).query("atlas"))
-     .addFieldsScore()                // alias: score
-     .addFieldsScoreDetails()         // alias: scoreDetails
-     .findAll()
-     .execute();
+.search("articles_default")
+.text(text -> text.path("title").query("mongodb"))
+.addFieldsScore()
+.findAll()
+.execute();
 ```
 
-### Sort by score first
+The default alias is `score`.
 
 ```java
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .text(t -> t.path(ArticleField.title).query("atlas"))
-     .firstSortScore()
-     .sorts(SearchSortSpec.desc(ArticleField.publishedAt))
-     .findAll()
-     .execute();
-```
-
-`SearchSortSpec` supports:
-
-- `SearchSortSpec.scoreDesc()`
-- `SearchSortSpec.scoreAsc()`
-- `SearchSortSpec.asc(path)`
-- `SearchSortSpec.desc(path)`
-
-### Stable ordering recommendation
-
-If multiple results have the same score, Atlas Search result order may be non-deterministic. In real applications, consider appending a unique field sort after score sort.
-
----
-
-## Count behavior
-
-There are **two different count concerns** in Atlas Search.
-
-### 1) Count final pipeline results
-
-```java
-Mono<Long> count =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .text(t -> t.path(ArticleField.title).query("atlas"))
-     .fields(pair("deleted", false))
-     .count()
-     .execute();
-```
-
-This counts the result **after** `$search` and after post-search `$match` / other pipeline logic.
-
-### 2) Count Atlas Search metadata
-
-```java
-Mono<Long> total =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .text(t -> t.path(ArticleField.title).query("atlas"))
-     .countType(SearchCountType.TOTAL)
-     .count()
-     .executeSearchMeta();
-```
-
-This uses `$searchMeta` and returns the **Atlas Search metadata count**.
-
-Supported count modes:
-
-- `SearchCountType.TOTAL`
-- `SearchCountType.LOWER_BOUND`
-
-Use metadata count when you need search-engine result counts specifically. Use pipeline count when you need the final application-visible count.
-
----
-
-## Pagination with sequence token
-
-Atlas Search supports cursor-like pagination using a sequence token.
-
-### Emit the token
-
-```java
-Flux<Article> page1 =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .text(t -> t.path(ArticleField.title).query("atlas"))
-     .firstSortScore()
-     .addFieldsSequenceToken("nextToken")
-     .findAll()
-     .execute();
-```
-
-### Read after a token
-
-```java
-Flux<Article> page2 =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .text(t -> t.path(ArticleField.title).query("atlas"))
-     .firstSortScore()
-     .searchAfter(previousToken)
-     .findAll()
-     .execute();
-```
-
-Or go backward with `searchBefore(token)`.
-
----
-
-## Exists query terminal for search
-
-For Atlas Search flows, use:
-
-```java
-Mono<Boolean> exists =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .search("articles_default")
-     .text(t -> t.path(ArticleField.title).query("atlas"))
-     .existsQuery()
-     .execute();
-```
-
-This is intentionally named `existsQuery()` to distinguish it from the ordinary query-builder `exists()` path.
-
----
-
-# Vector Search
-
-## VectorSearchBuilder overview
-
-Entry point:
-
-```java
-vectorSearch("indexName")
-```
-
-This flow is intentionally separated from both the classic Mongo flow and the Atlas Search flow because `$vectorSearch` is a distinct pipeline stage with its own constraints and options.
-
-### Available builder methods
-
-Core vector-search options:
-
-- `path(K path)`
-- `queryVector(VectorQueryVector)`
-- `queryVector(Mono<VectorQueryVector>)`
-- `queryVector(float[] values)`
-- `queryVector(double[] values)`
-- `queryVector(Collection<Double> values)`
-- `queryEmbedding(String queryText, VectorEmbeddingFunction embeddingFunction)`
-- `queryText(String queryText)`
-- `limit(long limit)`
-- `numCandidates(long numCandidates)`
-- `exact(boolean)`
-- `exact()`
-- `approximate(long numCandidates)`
-
-Filtering / shaping:
-
-- `filterFields(...)` for **pre-filtering inside `$vectorSearch.filter`**
-- `filter(block -> ...)` for nested pre-filter composition with the normal `FieldBuilder`
-- `fields(...)` for **post-stage ordinary Mongo `$match`**
-- `addFieldsVectorSearchScore()`
-- `addFieldsVectorSearchScore(String alias)`
-- `excludes(...)`
-
-Terminal builders:
-
-- `findAll().execute()`
-- `find().execute()` / `find().executeFirst()`
-- `count().execute()`
-- `existsQuery().execute()`
-
-### Important difference from `search()`
-
-`vectorSearch()` does **not** currently expose:
-
-- `executePage()`
-- metadata count like `$searchMeta`
-- sequence-token paging
-- built-in sort customization
-
-The current vector path is intentionally minimal and aligned with the actual code in `VectorSearchBuilder`.
-
----
-
-## `VectorQueryVector`
-
-`VectorQueryVector` is the DSL wrapper for the query embedding.
-
-Available factories:
-
-- `VectorQueryVector.ofFloatArray(float[])`
-- `VectorQueryVector.ofDoubleArray(double[])`
-- `VectorQueryVector.ofDoubleList(Collection<Double>)`
-
-The public API intentionally stays independent from driver-specific vector classes.
-The builder currently renders a BSON-ready `List<Double>` at stage-build time.
-
-### Example
-
-```java
-float[] embedding = embeddingService.embed("reactive mongo dsl");
-
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryVector(embedding)
-     .limit(10)
-     .approximate(200)
-     .addFieldsVectorSearchScore()
-     .findAll()
-     .execute();
+.addFieldsScore("searchScore")
 ```
 
 ---
 
-## Query by text for auto-embedding indexes
-
-When your vector index/query path is designed to accept text input, the current DSL also supports:
+#### Post-filter by score range
 
 ```java
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryText("reactive mongo dsl")
-     .limit(10)
-     .approximate(200)
-     .addFieldsVectorSearchScore()
-     .findAll()
-     .execute();
+.search("articles_default")
+.text(text -> text.path("title").query("mongodb"))
+.matchScoreGte(1.5)
+.findAll()
+.execute();
 ```
 
-`queryVector(...)` / `queryEmbedding(...)` and `queryText(...)` are mutually exclusive in the current implementation.
+Supported helpers:
+
+```java
+matchScoreGte(min)
+matchScoreLte(max)
+matchScoreBetween(min, max)
+```
+
+These are not conditions inside `$search`. The score is first exposed through `$addFields`, then filtered by a later `$match`.
+
+As a result, `executePage()` and `count().execute()` use the same score threshold.
 
 ---
 
-## Application-provided embedding function
+### Search sorting
 
-For external embedding providers such as Voyage, OpenAI-compatible APIs, internal gateways, or SDK-based clients, keep the provider implementation in the consuming application and pass only the final reactive vector into the DSL.
-
-The core library does **not** own:
-
-- provider DTOs
-- API keys
-- base URLs
-- model names
-- HTTP clients such as Spring `WebClient`
-- timeout / retry / rate-limit policy
-
-The DSL only needs a `Mono<VectorQueryVector>` or a provider-neutral `VectorEmbeddingFunction`.
-
-### Direct asynchronous vector
+Ordinary field sorting:
 
 ```java
-Mono<VectorQueryVector> queryVector = userOwnedEmbeddingClient
-    .embedQuery("reactive mongo dsl")
-    .map(VectorQueryVector::ofDoubleList);
-
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryVector(queryVector)
-     .limit(10)
-     .approximate(200)
-     .findAll()
-     .execute();
+.search("articles_default")
+.text(text -> text.path("title").query("mongodb"))
+.sorts(sort -> sort
+    .desc("publishedAt")
+    .desc("id")
+)
+.findAll()
+.execute();
 ```
 
-### Provider-neutral embedding function
-
-`VectorEmbeddingFunction` receives a logical input type so the application can map it to provider-specific options.
+Score sorting is provided through `scoreDesc()` / `scoreAsc()`. Sort priority follows the order in which sort entries are added.
 
 ```java
-import com.byeolnaerim.mongodsl.vector.VectorEmbeddingFunction;
-import com.byeolnaerim.mongodsl.vector.VectorQueryVector;
-
-VectorEmbeddingFunction embeddingFunction = (text, inputType) -> {
-    String providerInputType = switch (inputType) {
-        case QUERY -> "query";
-        case DOCUMENT -> "document";
-    };
-
-    return userOwnedEmbeddingClient
-        .embed(text, providerInputType)
-        .map(VectorQueryVector::ofDoubleList);
-};
+.search("articles_default")
+.text(text -> text.path("title").query("mongodb"))
+.scoreDesc()
+.sorts(sort -> sort.desc("publishedAt"))
+.findAll()
+.execute();
 ```
 
-Use `queryEmbedding(...)` when the search query should be embedded at execution time.
+Or:
 
 ```java
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryEmbedding("reactive mongo dsl", embeddingFunction)
-     .limit(10)
-     .approximate(200)
-     .addFieldsVectorSearchScore()
-     .findAll()
-     .execute();
+.sorts(sort -> sort.desc("publishedAt"))
+.scoreDesc()
 ```
 
-For indexing corpus documents or chunks, use the same function outside the search DSL and store the returned vector in your MongoDB document.
+Changing the order changes sort priority.
 
-```java
-Mono<ArticleChunk> save = embeddingFunction
-    .embedDocument(chunkText)
-    .flatMap(vector -> {
-        ArticleChunk chunk = ArticleChunk.builder()
-            .articleId(articleId)
-            .content(chunkText)
-            .embedding(vector.toBsonValue())
-            .build();
-
-        return mongoTemplate.save(chunk);
-    });
-```
-
-This keeps model selection, URL configuration, authentication, batching, retry, and HTTP client choice entirely in the application layer.
+For stable pagination when scores tie, add a unique/stable field sort in addition to score sorting.
 
 ---
 
-## ANN vs ENN
-
-The current DSL models vector-search mode like this:
-
-### ANN
+### Search Highlight
 
 ```java
-Flux<Article> ann =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryVector(embedding)
-     .limit(10)
-     .numCandidates(200)
-     .findAll()
-     .execute();
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text
+        .path("title")
+        .query("mongodb")
+    )
+    .highlight(highlight -> highlight
+        .path("title")
+        .maxCharsToExamine(100_000)
+        .maxNumPassages(3)
+    )
+    .addFieldsHighlights()
+    .findAll()
+    .execute();
 ```
 
-Or equivalently:
+`highlight(...)` configures an option on the `$search` stage, while `addFieldsHighlights(...)` exposes highlight metadata as a result-document field.
+
+Default alias:
+
+```text
+highlights
+```
+
+Driver-native `SearchHighlight` can also be passed directly.
+
+---
+
+### Search score details
 
 ```java
+.search("articles_default")
+.text(text -> text.path("title").query("mongodb"))
+.addFieldsScoreDetails()
+.findAll()
+.execute();
+```
+
+`addFieldsScoreDetails()` also enables `scoreDetails(true)` internally.
+
+The default alias is `scoreDetails`.
+
+---
+
+### Search sequence-token pagination
+
+Expose a sequence token in each result:
+
+```java
+.search("articles_default")
+.text(text -> text.path("title").query("mongodb"))
+.addFieldsSequenceToken()
+.findAll()
+.execute();
+```
+
+Default alias:
+
+```text
+searchSequenceToken
+```
+
+Next page:
+
+```java
+.search("articles_default")
+.text(text -> text.path("title").query("mongodb"))
+.searchAfter(token)
+.findAll()
+.execute();
+```
+
+Previous direction:
+
+```java
+.searchBefore(token)
+```
+
+Setting `searchAfter(...)` clears an existing `searchBefore(...)` value, and vice versa.
+
+---
+
+### Search paging / page result
+
+Offset paging:
+
+```java
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text.path("title").query("mongodb"))
+    .paging(0, 20)
+    .findAll()
+    .execute();
+```
+
+`PageResult`:
+
+```java
+Mono<PageResult<Article>> page = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text.path("title").query("mongodb"))
+    .paging(0, 20)
+    .findAll()
+    .executePage();
+```
+
+Reactive page:
+
+```java
+PageStream<Article> page = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text.path("title").query("mongodb"))
+    .paging(0, 20)
+    .findAll()
+    .executePageStream();
+```
+
+---
+
+### Search count
+
+Atlas Search provides two different count paths.
+
+#### 1) Final pipeline count: `count().execute()`
+
+```java
+Mono<Long> count = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text.path("title").query("mongodb"))
+    .fields(pair("status", "PUBLISHED"))
+    .matchScoreGte(1.5)
+    .count()
+    .execute();
+```
+
+This is the **final pipeline result count**, including post-search `fields(...)` and score matching after `$search`.
+
+---
+
+#### 2) Atlas Search metadata count: `count().executeSearchMeta()`
+
+```java
+Mono<Long> count = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text.path("title").query("mongodb"))
+    .countType(SearchCountType.TOTAL)
+    .count()
+    .executeSearchMeta();
+```
+
+`executeSearchMeta()` uses `$searchMeta`.
+
+`SearchCountType`:
+
+- `TOTAL`
+- `LOWER_BOUND`
+
+If `executeSearchMeta()` is called without an explicit `countType(...)`, the default is `TOTAL`.
+
+Because `$searchMeta` reports Search metadata count, it does not execute the ordinary post-search `$match` produced by `fields(...)`.
+
+Choose between these two count paths according to the semantics you need.
+
+---
+
+### Search exists terminal
+
+```java
+Mono<Boolean> exists = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text.path("title").query("mongodb"))
+    .existsQuery()
+    .execute();
+```
+
+This terminal checks whether the Search pipeline count is greater than zero.
+
+---
+
+### Driver-native Search extensions
+
+Stage options can be supplemented directly.
+
+```java
+.search("articles_default")
+.driverOptions(options -> options.option("someNewOption", value))
+```
+
+When a Search feature appears in the MongoDB Driver before a matching DSL convenience API, escape hatches such as `operator(...)`, `driverOptions(...)`, `SortSpec.driver(...)`, and `customizeAggregation(...)` can still be used.
+
+---
+
+## Vector Search
+
+Vector Search builds a MongoDB `$vectorSearch` stage.
+
+An index name is required.
+
+```java
+.vectorSearch("articles_vector_index")
+```
+
+Basic form:
+
+```java
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .vectorSearch("articles_vector_index")
+    .path("embedding")
+    .queryVector(embedding)
+    .limit(20)
+    .approximate(200)
+    .findAll()
+    .execute();
+```
+
+---
+
+### Vector path
+
+`path(...)` accepts:
+
+- String
+- Enum
+- Driver-native `FieldSearchPath`
+- custom wrappers
+
+For a manually managed vector index, specify the embedding vector field. For a MongoDB Automated Embedding index, specify the indexed text field.
+
+---
+
+### Query vector
+
+Overloads for passing vectors directly:
+
+```java
+.queryVector(float[] values)
+.queryVector(double[] values)
+.queryVector(Collection<Double> values)
+.queryVector(BinaryVector values)
+```
+
+Example:
+
+```java
+float[] embedding = ...;
+
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .vectorSearch("articles_vector_index")
+    .path("embedding")
+    .queryVector(embedding)
+    .limit(20)
+    .approximate(200)
+    .findAll()
+    .execute();
+```
+
+The DSL core does not call external embedding providers to generate vectors. Generate the embedding in the application and pass it to `queryVector(...)`.
+
+---
+
+### MongoDB Automated Embedding text query
+
+With an Automated Embedding vector index, the query text itself can be supplied.
+
+```java
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .vectorSearch("articles_auto_embedding")
+    .path("content")
+    .query("reactive mongodb search")
+    .limit(20)
+    .approximate(200)
+    .findAll()
+    .execute();
+```
+
+Optional model override:
+
+```java
+.query("reactive mongodb search")
+.model("model-name")
+```
+
+`model(...)` is an option used together with the text `query(String)` form.
+
+---
+
+### Driver-native vector query
+
+A MongoDB Driver `VectorSearchQuery` can be passed directly.
+
+```java
+.vectorSearch("articles_vector_index")
+.path("embedding")
+.query(driverVectorSearchQuery)
+.limit(20)
+.findAll()
+.execute();
+```
+
+This is the escape hatch for new Driver query types that may appear before DSL convenience overloads.
+
+---
+
+### ANN / ENN
+
+#### ANN
+
+```java
+.vectorSearch("articles_vector_index")
+.path("embedding")
+.queryVector(embedding)
+.limit(20)
 .approximate(200)
+.findAll()
+.execute();
 ```
 
-### ENN
+`approximate(n)` is a convenience alias for `numCandidates(n)`.
 
 ```java
-Flux<Article> enn =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryVector(embedding)
-     .limit(10)
-     .exact()
-     .findAll()
-     .execute();
+.numCandidates(200)
 ```
 
-Validation rules in the current code:
-
-- `index` is required
-- `path` is required
-- `limit` is required
-- either `queryVector(...)`, `queryEmbedding(...)`, or `queryText(...)` is required
-- `queryVector(...)` / `queryEmbedding(...)` and `queryText(...)` are mutually exclusive
-- for ANN mode, `numCandidates(...)` is required
+ANN mode requires `numCandidates`.
 
 ---
 
-## Pre-filter vs post-filter in vector search
-
-This distinction matters just as much as in Atlas Search.
-
-### Pre-filter: `$vectorSearch.filter`
-
-Use `filterFields(...)` or `filter(...)` when you want the condition rendered into the vector-search stage itself.
+#### ENN
 
 ```java
-Flux<Article> filtered =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryVector(embedding)
-     .limit(10)
-     .approximate(200)
-     .filterFields(
-         pair("status", "PUBLISHED"),
-         pair("deleted", false)
-     )
-     .findAll()
-     .execute();
+.vectorSearch("articles_vector_index")
+.path("embedding")
+.queryVector(embedding)
+.limit(20)
+.exact()
+.findAll()
+.execute();
 ```
 
-Nested pre-filter composition is also supported:
+Or:
 
 ```java
-Flux<Article> filtered =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryVector(embedding)
-     .limit(10)
-     .approximate(200)
-     .filter(f -> f
-         .and(x -> x.fields(
-             pair("status", "PUBLISHED"),
-             pair("deleted", false)
-         ))
-         .or(x -> x.fields(
-             pair("category", "JAVA"),
-             pair("category", "MONGODB")
-         ))
-     )
-     .findAll()
-     .execute();
+.exact(true)
 ```
 
-### Post-filter: ordinary aggregation `$match`
-
-Use `fields(...)` on `VectorSearchBuilder` when you intentionally want a normal Mongo `$match` **after** `$vectorSearch`.
-
-```java
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryVector(embedding)
-     .limit(10)
-     .approximate(200)
-     .fields(
-         pair("visible", true)
-     )
-     .findAll()
-     .execute();
-```
+Setting `exact(true)` clears any existing `numCandidates` value.
 
 ---
 
-## Vector score metadata
+### Vector pre-filter / post-filter
 
-Expose the vector-search similarity score with:
+These two forms have different semantics and should be kept distinct.
 
-- `addFieldsVectorSearchScore()`
-- `addFieldsVectorSearchScore(String alias)`
-
-### Example
+#### Pre-filter: `$vectorSearch.filter`
 
 ```java
-Flux<Article> results =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryVector(embedding)
-     .limit(10)
-     .approximate(200)
-     .addFieldsVectorSearchScore("score")
-     .findAll()
-     .execute();
+Flux<Article> results = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .vectorSearch("articles_vector_index")
+    .path("embedding")
+    .queryVector(embedding)
+    .limit(20)
+    .approximate(200)
+    .filterFields(
+        pair("status", "PUBLISHED"),
+        pair("deleted", false)
+    )
+    .findAll()
+    .execute();
 ```
 
-As with `addFieldsHighlights()`, make sure your mapped result type can actually accept the additional field if you expect it to be populated after mapping.
+Nested conditions:
+
+```java
+.filter(filter -> filter
+    .and(f -> f.fields(
+        pair("status", "PUBLISHED"),
+        pair("deleted", false)
+    ))
+)
+```
+
+These conditions are placed inside `$vectorSearch.filter` and therefore affect candidate selection itself.
 
 ---
 
-## Vector count semantics
-
-Vector count is intentionally narrower than Atlas Search metadata count.
+#### Post-filter: `vectorSearch().fields(...)`
 
 ```java
-Mono<Long> count =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryVector(embedding)
-     .limit(10)
-     .approximate(200)
-     .count()
-     .execute();
+.vectorSearch("articles_vector_index")
+.path("embedding")
+.queryVector(embedding)
+.limit(20)
+.approximate(200)
+.fields(pair("category", "TECH"))
+.findAll()
+.execute();
 ```
 
-This counts the documents returned by the **current pipeline output** after `$vectorSearch`, so it is effectively bounded by your configured `limit` and any post-stage `fields(...)` filtering.
+This condition becomes an ordinary aggregation `$match` after `$vectorSearch`.
 
-It is **not** a corpus-wide metadata count.
+Conceptually:
+
+```text
+$vectorSearch
+-> $match (fields)
+-> addFields vector score
+-> projection
+```
+
+Use a pre-filter when candidate selection itself must be restricted, and a post-filter when an ordinary Mongo condition should be applied after vector results are produced.
 
 ---
 
-## Vector exists terminal
+### Vector score
+
+Vector Search score can be exposed as a result field.
 
 ```java
-Mono<Boolean> exists =
-  dsl.executeEntity(Article.class, MongoTemplateName.FRONT)
-     .vectorSearch("articles_vector_index")
-     .path(ArticleField.embedding)
-     .queryVector(embedding)
-     .limit(1)
-     .exact()
-     .existsQuery()
-     .execute();
+.vectorSearch("articles_vector_index")
+.path("embedding")
+.queryVector(embedding)
+.limit(20)
+.approximate(200)
+.addFieldsVectorSearchScore()
+.findAll()
+.execute();
+```
+
+Default alias:
+
+```text
+vectorSearchScore
+```
+
+Custom alias:
+
+```java
+.addFieldsVectorSearchScore("similarity")
 ```
 
 ---
 
-## Notes and limitations
+### Vector projection
 
-### Atlas Search
+For example, exclude a large embedding field from the final result:
 
-- Atlas Search requires a matching Search index for the fields you query.
-- `$search` and `$searchMeta` must be the first stage in their pipelines.
-- `$search` cannot appear inside `$facet`.
-- `AutocompleteClause` intentionally exposes only a single path.
-- `TextClause` currently rejects `fuzzy + synonyms` together.
-- `count().execute()` and `count().executeSearchMeta()` serve different purposes; choose carefully.
-- If you need deterministic ordering, do not rely on score alone.
-- Highlighting is stage-level and only participates in the `$search` path, not the `$searchMeta` count path.
-
-### Vector Search
-
-- `vectorSearch("indexName")` currently requires an explicit index name.
-- `$vectorSearch` must be the first stage of the pipeline.
-- `$vectorSearch` can't be used inside `$facet` or inside a `$lookup` sub-pipeline.
-- ANN mode requires `numCandidates(...)`.
-- `queryEmbedding(...)` delegates embedding creation to the application-provided `VectorEmbeddingFunction`; this library does not include provider clients or HTTP-client dependencies.
-- `count()` only counts the limited pipeline output; there is no metadata count terminal today.
-- There is no built-in page token, `executePage()`, or sort DSL for vector search in the current implementation.
-- For advanced analyzed text filtering together with vectors, this DSL currently keeps that concern separate rather than trying to blend it into a single stage.
+```java
+.vectorSearch("articles_vector_index")
+.path("embedding")
+.queryVector(embedding)
+.limit(20)
+.approximate(200)
+.excludes("embedding")
+.findAll()
+.execute();
+```
 
 ---
 
-## Result wrappers
+### Vector count
 
-- `PageResult<T>`: classic page object (`List<T> data`, `Long totalCount`)
-- `PageStream<T>`: reactive-friendly wrapper (`Flux<T> data`, `Mono<Long> totalCount`)
-- `ResultTuple<L, R>`: container for lookup/grouped results
+```java
+Mono<Long> count = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .vectorSearch("articles_vector_index")
+    .path("embedding")
+    .queryVector(embedding)
+    .limit(20)
+    .approximate(200)
+    .count()
+    .execute();
+```
+
+Vector count appends `$count` after a `$vectorSearch` stage that already has a `limit`.
+
+It therefore represents the **limited number of results returned by the current Vector Search pipeline**, not a count of the entire corpus.
+
+Vector Search does not have an Atlas Search `$searchMeta`-style metadata count terminal.
 
 ---
 
-## Tip
+### Vector exists terminal
 
-When in doubt, keep this rule in mind:
+```java
+Mono<Boolean> exists = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .vectorSearch("articles_vector_index")
+    .path("embedding")
+    .queryVector(embedding)
+    .limit(1)
+    .exact()
+    .existsQuery()
+    .execute();
+```
 
-- use `FieldsPair` / `fields(...).end()` for ordinary Mongo querying
-- use `search(...)` for Atlas Search querying
-- use `search().fields(...)` only when you intentionally want a **post-search** ordinary `$match`
-- use `vectorSearch(...)` for MongoDB Vector Search querying
-- use `queryVector(Mono<VectorQueryVector>)` or `queryEmbedding(...)` when query vectors come from an application-owned embedding provider
-- use `vectorSearch().filter(...)` / `filterFields(...)` for stage-level vector pre-filters
-- use `vectorSearch().fields(...)` only when you intentionally want a **post-vector-search** ordinary `$match`
+---
+
+### Vector Search Driver options
+
+```java
+.vectorSearch("articles_vector_index")
+.driverOptions(options -> ...)
+```
+
+Driver-native `VectorSearchOptions` can be adjusted at the end.
+
+---
+
+## `preview()` and `explain()` for Search / Vector
+
+Atlas Search and Vector Search terminals expose the same diagnostic APIs.
+
+```java
+Mono<Document> preview = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .search("articles_default")
+    .text(text -> text.path("title").query("mongodb"))
+    .findAll()
+    .preview();
+```
+
+```java
+Mono<Document> explain = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .vectorSearch("articles_vector_index")
+    .path("embedding")
+    .queryVector(embedding)
+    .limit(20)
+    .approximate(200)
+    .findAll()
+    .explain(ExplainVerbosity.QUERY_PLANNER);
+```
+
+---

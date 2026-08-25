@@ -81,8 +81,10 @@ import com.mongodb.client.model.search.SearchOptions;
 import com.mongodb.client.model.search.SearchScore;
 import com.mongodb.client.model.search.ShouldCompoundSearchOperator;
 import com.mongodb.client.model.search.TextVectorSearchQuery;
+import com.mongodb.client.model.search.VectorSearchNestedOptions;
 import com.mongodb.client.model.search.VectorSearchOptions;
 import com.mongodb.client.model.search.VectorSearchQuery;
+import com.mongodb.client.model.search.VectorSearchScoreMode;
 import com.mongodb.client.result.DeleteResult;
 import com.mongodb.client.result.UpdateResult;
 import com.mongodb.reactivestreams.client.AggregatePublisher;
@@ -2800,6 +2802,170 @@ public class ReactiveMongoDsl<K> {
 		}
 
 		/**
+		 * Starts a driver-native root aggregation pipeline.
+		 * <p>This entry point accepts MongoDB Driver {@link Bson} stages directly instead of
+		 * re-implementing Driver aggregation operators in the DSL. It is intended for
+		 * aggregation stages that need full pipeline-position control, including newly
+		 * introduced Driver features.</p>
+		 *
+		 * @return a root aggregation builder
+		 */
+		public AggregationBuilder aggregation() {
+
+			return new AggregationBuilder();
+
+		}
+
+		/**
+		 * Root aggregation builder backed by MongoDB Driver {@link Bson} stages.
+		 * <p>Stages are executed exactly in insertion order. MongoDB stage ordering and
+		 * server-version constraints remain the caller's responsibility.</p>
+		 */
+		public class AggregationBuilder {
+
+			private final List<Bson> stages = new ArrayList<>();
+
+			private ReadPreference readPreference;
+
+			private Boolean isAllowDiskUse;
+
+			private Consumer<AggregatePublisher<Document>> aggregationCustomizer = ignored -> {};
+
+			AggregationBuilder() {}
+
+			public AggregationBuilder readPreference(
+				ReadPreference rp
+			) {
+
+				this.readPreference = rp;
+				return this;
+
+			}
+
+			public AggregationBuilder isAllowDiskUse(
+				Boolean allow
+			) {
+
+				this.isAllowDiskUse = allow;
+				return this;
+
+			}
+
+			/** Applies a MongoDB Driver AggregatePublisher customization directly. */
+			public AggregationBuilder customizeAggregation(
+				Consumer<AggregatePublisher<Document>> customizer
+			) {
+
+				if (customizer != null)
+					this.aggregationCustomizer = this.aggregationCustomizer.andThen( customizer );
+				return this;
+
+			}
+
+			/** Adds a MongoDB Driver aggregation stage at the end of this pipeline. */
+			public AggregationBuilder stage(
+				Bson stage
+			) {
+
+				this.stages.add( Objects.requireNonNull( stage, "stage" ) );
+				return this;
+
+			}
+
+			/** Adds MongoDB Driver aggregation stages in the given order. */
+			public AggregationBuilder stages(
+				Bson... stages
+			) {
+
+				return stages( Arrays.asList( Objects.requireNonNull( stages, "stages" ) ) );
+
+			}
+
+			/** Adds MongoDB Driver aggregation stages in collection iteration order. */
+			public AggregationBuilder stages(
+				Collection<? extends Bson> stages
+			) {
+
+				Objects.requireNonNull( stages, "stages" ).forEach( this::stage );
+				return this;
+
+			}
+
+			private AggregationSpec buildAggregation() {
+
+				return new AggregationSpec( this.stages )
+					.readPreference( this.readPreference )
+					.allowDiskUse( this.isAllowDiskUse )
+					.customize( this.aggregationCustomizer );
+
+			}
+
+			/** Executes the pipeline and maps results to the source entity type. */
+			public Flux<E> execute() {
+
+				return executeClassMono
+					.flatMapMany(
+						entityClass -> ReactiveMongoDsl.this
+							.aggregate( mongoExecutionContext, entityClass, collectionName, buildAggregation(), entityClass )
+					);
+
+			}
+
+			/** Executes the pipeline and maps results to the requested result type. */
+			public <R> Flux<R> execute(
+				Class<R> resultClass
+			) {
+
+				Objects.requireNonNull( resultClass, "resultClass" );
+				return executeClassMono
+					.flatMapMany(
+						entityClass -> ReactiveMongoDsl.this
+							.aggregate( mongoExecutionContext, entityClass, collectionName, buildAggregation(), resultClass )
+					);
+
+			}
+
+			/** Executes the pipeline and returns raw MongoDB {@link Document} results. */
+			public Flux<Document> executeDocument() {
+
+				return executeClassMono
+					.flatMapMany(
+						entityClass -> ReactiveMongoDsl.this
+							.aggregateDocuments( mongoExecutionContext, entityClass, collectionName, buildAggregation() )
+					);
+
+			}
+
+			/** Renders the current pipeline without executing it. */
+			public Mono<Document> preview() {
+
+				return executeClassMono
+					.map( entityClass -> previewAggregation( mongoExecutionContext, entityClass, collectionName, buildAggregation() ) );
+
+			}
+
+			/** Executes MongoDB explain for the current pipeline. */
+			public Mono<Document> explain() {
+
+				return executeClassMono
+					.flatMap( entityClass -> explainAggregation( mongoExecutionContext, entityClass, collectionName, buildAggregation() ) );
+
+			}
+
+			/** Executes MongoDB explain with the requested verbosity. */
+			public Mono<Document> explain(
+				ExplainVerbosity verbosity
+			) {
+
+				Objects.requireNonNull( verbosity, "verbosity" );
+				return executeClassMono
+					.flatMap( entityClass -> explainAggregation( mongoExecutionContext, entityClass, collectionName, buildAggregation(), verbosity ) );
+
+			}
+
+		}
+
+		/**
 		 * Atlas Search-specific builder that renders strongly typed Atlas Search operators
 		 * into a {@code $search} or {@code $searchMeta} aggregation stage.
 		 * <p>This builder extends {@link QueryBuilderAccesser} on purpose so it can reuse
@@ -2850,6 +3016,8 @@ public class ReactiveMongoDsl<K> {
 			private SearchHighlight highlight;
 
 			private final List<Function<SearchOptions, SearchOptions>> driverOptionCustomizers = new ArrayList<>();
+
+			private final List<Bson> stages = new ArrayList<>();
 
 			SearchBuilder(
 							String index
@@ -3306,6 +3474,46 @@ public class ReactiveMongoDsl<K> {
 			) {
 
 				this.driverOptionCustomizers.add( Objects.requireNonNull( customizer, "customizer" ) );
+				return this;
+
+			}
+
+			/**
+			 * Adds a driver-native aggregation stage immediately after {@code $search}.
+			 * <p>The stage runs before post-search {@code fields(...)} criteria, metadata
+			 * additions, score filtering, paging, and projection. This does not apply to
+			 * {@code executeSearchMeta()}, which uses a dedicated {@code $searchMeta}
+			 * metadata-count pipeline.</p>
+			 *
+			 * @param stage
+			 *            the driver-native aggregation stage
+			 *
+			 * @return this builder
+			 */
+			public SearchBuilder<S> stage(
+				Bson stage
+			) {
+
+				this.stages.add( Objects.requireNonNull( stage, "stage" ) );
+				return this;
+
+			}
+
+			/** Adds driver-native aggregation stages immediately after {@code $search}. */
+			public SearchBuilder<S> stages(
+				Bson... stages
+			) {
+
+				return stages( Arrays.asList( Objects.requireNonNull( stages, "stages" ) ) );
+
+			}
+
+			/** Adds driver-native aggregation stages immediately after {@code $search}. */
+			public SearchBuilder<S> stages(
+				Collection<? extends Bson> stages
+			) {
+
+				Objects.requireNonNull( stages, "stages" ).forEach( this::stage );
 				return this;
 
 			}
@@ -3776,6 +3984,8 @@ public class ReactiveMongoDsl<K> {
 				List<Bson> ops = new ArrayList<>();
 
 				ops.add( buildSearchStage( includeCount ) );
+
+				ops.addAll( this.stages );
 
 				postCriteria.ifPresent( c -> ops.add( Aggregates.match( c ) ) );
 
@@ -4623,6 +4833,8 @@ public class ReactiveMongoDsl<K> {
 
 			private final FieldBuilder<E> preFilterBuilder = new FieldBuilder<>( LogicalOperator.AND );
 
+			private final FieldBuilder<E> parentFilterBuilder = new FieldBuilder<>( LogicalOperator.AND );
+
 			private final FieldBuilder<E> postFilterBuilder = new FieldBuilder<>( LogicalOperator.AND );
 
 			private FieldSearchPath path;
@@ -4646,7 +4858,11 @@ public class ReactiveMongoDsl<K> {
 
 			private VectorSearchQuery driverQuery;
 
+			private VectorSearchScoreMode nestedScoreMode;
+
 			private final List<Function<VectorSearchOptions, VectorSearchOptions>> driverOptionCustomizers = new ArrayList<>();
+
+			private final List<Bson> stages = new ArrayList<>();
 
 			private final List<Document> addFieldsDocs = new ArrayList<>();
 
@@ -4937,6 +5153,44 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
+			 * Adds a driver-native aggregation stage immediately after {@code $vectorSearch}.
+			 * <p>The stage runs before post-vector {@code fields(...)} criteria, metadata
+			 * additions, and projection.</p>
+			 *
+			 * @param stage
+			 *            the driver-native aggregation stage
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> stage(
+				Bson stage
+			) {
+
+				this.stages.add( Objects.requireNonNull( stage, "stage" ) );
+				return this;
+
+			}
+
+			/** Adds driver-native aggregation stages immediately after {@code $vectorSearch}. */
+			public VectorSearchBuilder<S> stages(
+				Bson... stages
+			) {
+
+				return stages( Arrays.asList( Objects.requireNonNull( stages, "stages" ) ) );
+
+			}
+
+			/** Adds driver-native aggregation stages immediately after {@code $vectorSearch}. */
+			public VectorSearchBuilder<S> stages(
+				Collection<? extends Bson> stages
+			) {
+
+				Objects.requireNonNull( stages, "stages" ).forEach( this::stage );
+				return this;
+
+			}
+
+			/**
 			 * Sets the maximum number of documents to return.
 			 *
 			 * @param limit
@@ -5088,6 +5342,76 @@ public class ReactiveMongoDsl<K> {
 
 				}
 
+				return this;
+
+			}
+
+			/**
+			 * Adds root-document filters for a nested {@code $vectorSearch}.
+			 * <p>Unlike {@link #filter(Consumer)}, which maps to the Driver's leaf
+			 * {@code filter} option, this maps to the Driver 5.10+
+			 * {@code parentFilter} option. MongoDB server support for nested vector
+			 * search is required.</p>
+			 *
+			 * @param fieldsPairs
+			 *            the parent-document field conditions
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> parentFilterFields(
+				FieldsPair<?, ?>... fieldsPairs
+			) {
+
+				this.parentFilterBuilder.fields( fieldsPairs );
+				return this;
+
+			}
+
+			/** Adds root-document filters for a nested {@code $vectorSearch}. */
+			public VectorSearchBuilder<S> parentFilterFields(
+				Collection<FieldsPair<?, ?>> fieldsPairs
+			) {
+
+				if (fieldsPairs == null || fieldsPairs.isEmpty())
+					return this;
+
+				this.parentFilterBuilder.fields( fieldsPairs.stream().toArray( FieldsPair[]::new ) );
+				return this;
+
+			}
+
+			/**
+			 * Composes root-document filters for a nested {@code $vectorSearch} with
+			 * the regular {@link FieldBuilder}.
+			 */
+			public VectorSearchBuilder<S> parentFilter(
+				Consumer<FieldBuilder<E>> block
+			) {
+
+				if (block != null) {
+					block.accept( this.parentFilterBuilder );
+
+				}
+
+				return this;
+
+			}
+
+			/**
+			 * Sets how scores from matching embeddings inside a nested document are
+			 * combined. This maps directly to MongoDB Driver 5.10+
+			 * {@link VectorSearchNestedOptions#scoreMode(VectorSearchScoreMode)}.
+			 *
+			 * @param scoreMode
+			 *            the nested vector score mode
+			 *
+			 * @return this builder
+			 */
+			public VectorSearchBuilder<S> nestedScoreMode(
+				VectorSearchScoreMode scoreMode
+			) {
+
+				this.nestedScoreMode = Objects.requireNonNull( scoreMode, "scoreMode" );
 				return this;
 
 			}
@@ -5273,7 +5597,7 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			private VectorSearchOptions buildVectorSearchOptions(
-				Optional<Bson> preFilterCriteria
+				Optional<Bson> preFilterCriteria, Optional<Bson> parentFilterCriteria
 			) {
 
 				VectorSearchOptions options = Boolean.TRUE.equals( this.exact )
@@ -5282,6 +5606,21 @@ public class ReactiveMongoDsl<K> {
 
 				if (preFilterCriteria.isPresent()) {
 					options = options.filter( preFilterCriteria.get() );
+
+				}
+
+				if (parentFilterCriteria.isPresent()) {
+					options = options.parentFilter( parentFilterCriteria.get() );
+
+				}
+
+				if (this.nestedScoreMode != null) {
+					options = options
+						.nestedOptions(
+							VectorSearchNestedOptions
+								.vectorSearchNestedOptions()
+								.scoreMode( this.nestedScoreMode )
+						);
 
 				}
 
@@ -5295,11 +5634,11 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			private Bson buildVectorSearchStage(
-				Optional<Bson> preFilterCriteria
+				Optional<Bson> preFilterCriteria, Optional<Bson> parentFilterCriteria
 			) {
 
 				validateVectorSearchBody();
-				VectorSearchOptions options = buildVectorSearchOptions( preFilterCriteria );
+				VectorSearchOptions options = buildVectorSearchOptions( preFilterCriteria, parentFilterCriteria );
 
 				if (this.queryVector != null) {
 					return Aggregates
@@ -5335,12 +5674,14 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			private List<Bson> buildAggregationOps(
-				Optional<Bson> preFilterCriteria, Optional<Bson> postFilterCriteria, boolean includeProjection, boolean includeMetaAdds
+				Optional<Bson> preFilterCriteria, Optional<Bson> parentFilterCriteria, Optional<Bson> postFilterCriteria, boolean includeProjection, boolean includeMetaAdds
 			) {
 
 				List<Bson> ops = new ArrayList<>();
 
-				ops.add( buildVectorSearchStage( preFilterCriteria ) );
+				ops.add( buildVectorSearchStage( preFilterCriteria, parentFilterCriteria ) );
+
+				ops.addAll( this.stages );
 
 				postFilterCriteria.ifPresent( criteria -> ops.add( Aggregates.match( criteria ) ) );
 
@@ -5410,12 +5751,13 @@ public class ReactiveMongoDsl<K> {
 				public Flux<E> execute() {
 
 					return Mono
-						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), parentFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
 						.flatMapMany( tuple -> {
 							Class<E> entityClass = tuple.getT1();
 							Optional<Bson> preCriteria = tuple.getT2();
-							Optional<Bson> postCriteria = tuple.getT3();
-							List<Bson> ops = buildAggregationOps( preCriteria, postCriteria, true, true );
+							Optional<Bson> parentCriteria = tuple.getT3();
+							Optional<Bson> postCriteria = tuple.getT4();
+							List<Bson> ops = buildAggregationOps( preCriteria, parentCriteria, postCriteria, true, true );
 							return aggregateDocuments( entityClass, ops )
 								.map( doc -> mongoExecutionContext.read( entityClass, doc ) );
 
@@ -5426,13 +5768,13 @@ public class ReactiveMongoDsl<K> {
 				public Mono<Document> preview() {
 
 					return Mono
-						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), parentFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
 						.map(
 							tuple -> previewAggregation(
 								mongoExecutionContext,
 								tuple.getT1(),
 								collectionName,
-								applyAggOptions( buildAggregationOps( tuple.getT2(), tuple.getT3(), true, true ) )
+								applyAggOptions( buildAggregationOps( tuple.getT2(), tuple.getT3(), tuple.getT4(), true, true ) )
 							)
 						);
 
@@ -5441,13 +5783,13 @@ public class ReactiveMongoDsl<K> {
 				public Mono<Document> explain() {
 
 					return Mono
-						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), parentFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
 						.flatMap(
 							tuple -> explainAggregation(
 								mongoExecutionContext,
 								tuple.getT1(),
 								collectionName,
-								applyAggOptions( buildAggregationOps( tuple.getT2(), tuple.getT3(), true, true ) )
+								applyAggOptions( buildAggregationOps( tuple.getT2(), tuple.getT3(), tuple.getT4(), true, true ) )
 							)
 						);
 
@@ -5458,13 +5800,13 @@ public class ReactiveMongoDsl<K> {
 				) {
 
 					return Mono
-						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), parentFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
 						.flatMap(
 							tuple -> explainAggregation(
 								mongoExecutionContext,
 								tuple.getT1(),
 								collectionName,
-								applyAggOptions( buildAggregationOps( tuple.getT2(), tuple.getT3(), true, true ) ),
+								applyAggOptions( buildAggregationOps( tuple.getT2(), tuple.getT3(), tuple.getT4(), true, true ) ),
 								verbosity
 							)
 						);
@@ -5538,13 +5880,14 @@ public class ReactiveMongoDsl<K> {
 				public Mono<Long> execute() {
 
 					return Mono
-						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), parentFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
 						.flatMap( tuple -> {
 							Class<E> entityClass = tuple.getT1();
 							Optional<Bson> preCriteria = tuple.getT2();
-							Optional<Bson> postCriteria = tuple.getT3();
+							Optional<Bson> parentCriteria = tuple.getT3();
+							Optional<Bson> postCriteria = tuple.getT4();
 
-							List<Bson> ops = buildAggregationOps( preCriteria, postCriteria, false, false );
+							List<Bson> ops = buildAggregationOps( preCriteria, parentCriteria, postCriteria, false, false );
 							ops.add( Aggregates.count( "count" ) );
 
 							return aggregateDocuments( entityClass, ops )
@@ -5557,10 +5900,10 @@ public class ReactiveMongoDsl<K> {
 				}
 
 				private AggregationSpec buildCountAggregation(
-					Optional<Bson> preCriteria, Optional<Bson> postCriteria
+					Optional<Bson> preCriteria, Optional<Bson> parentCriteria, Optional<Bson> postCriteria
 				) {
 
-					List<Bson> ops = buildAggregationOps( preCriteria, postCriteria, false, false );
+					List<Bson> ops = buildAggregationOps( preCriteria, parentCriteria, postCriteria, false, false );
 					ops.add( Aggregates.count( "count" ) );
 					return applyAggOptions( ops );
 
@@ -5569,16 +5912,16 @@ public class ReactiveMongoDsl<K> {
 				public Mono<Document> preview() {
 
 					return Mono
-						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
-						.map( tuple -> previewAggregation( mongoExecutionContext, tuple.getT1(), collectionName, buildCountAggregation( tuple.getT2(), tuple.getT3() ) ) );
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), parentFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.map( tuple -> previewAggregation( mongoExecutionContext, tuple.getT1(), collectionName, buildCountAggregation( tuple.getT2(), tuple.getT3(), tuple.getT4() ) ) );
 
 				}
 
 				public Mono<Document> explain() {
 
 					return Mono
-						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
-						.flatMap( tuple -> explainAggregation( mongoExecutionContext, tuple.getT1(), collectionName, buildCountAggregation( tuple.getT2(), tuple.getT3() ) ) );
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), parentFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.flatMap( tuple -> explainAggregation( mongoExecutionContext, tuple.getT1(), collectionName, buildCountAggregation( tuple.getT2(), tuple.getT3(), tuple.getT4() ) ) );
 
 				}
 
@@ -5587,13 +5930,13 @@ public class ReactiveMongoDsl<K> {
 				) {
 
 					return Mono
-						.zip( executeClassMono, preFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
+						.zip( executeClassMono, preFilterBuilder.buildCriteria(), parentFilterBuilder.buildCriteria(), postFilterBuilder.buildCriteria() )
 						.flatMap(
 							tuple -> explainAggregation(
 								mongoExecutionContext,
 								tuple.getT1(),
 								collectionName,
-								buildCountAggregation( tuple.getT2(), tuple.getT3() ),
+								buildCountAggregation( tuple.getT2(), tuple.getT3(), tuple.getT4() ),
 								verbosity
 							)
 						);
