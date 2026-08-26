@@ -211,7 +211,7 @@ Spring Boot를 사용하는 경우 애플리케이션 쪽에 기존처럼 Reacti
 
 ```gradle
 dependencies {
-    implementation 'com.byeolnaerim:reactive-mongo-dsl:1.0.0-alpha.4'
+    implementation 'com.byeolnaerim:reactive-mongo-dsl:1.0.0'
     implementation 'org.springframework.boot:spring-boot-starter-data-mongodb-reactive'
 }
 ```
@@ -952,6 +952,57 @@ Mono<PageResult<User>> page = dsl
 `executeAggregation()`은 내부적으로 reactive page를 최종 `List`로 collect해서 `PageResult`를 만듭니다.
 
 단건은 `find().executeAggregation()`을 사용할 수 있습니다.
+
+### Driver-native root aggregation
+
+MongoDB Driver가 제공하는 aggregation stage를 pipeline 첫 단계부터 직접 조합해야 할 때는 `aggregation()`을 사용할 수 있습니다. DSL이 Driver aggregation API를 다시 구현하지 않고, Driver가 반환하는 `Bson` stage를 그대로 실행하는 escape hatch입니다. `Document` 역시 `Bson`이므로 그대로 전달할 수 있습니다.
+
+```java
+Flux<User> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .aggregation()
+    .stage(Aggregates.match(Filters.eq("status", "ACTIVE")))
+    .stage(Aggregates.sort(Sorts.descending("createdAt")))
+    .stage(Aggregates.limit(20))
+    .execute();
+```
+
+여러 stage는 호출 순서 그대로 보존됩니다. 결과 shape가 원본 entity와 다르면 `execute(ResultType.class)`를 사용하고, raw 결과가 필요하면 `executeDocument()`를 사용합니다.
+
+MongoDB Driver 5.10.0의 `$score` / `$scoreFusion`도 전용 DSL wrapper 없이 Driver API를 그대로 전달합니다. 특히 `$scoreFusion`처럼 첫 stage 위치가 중요한 기능은 `aggregation()`에서 pipeline 순서를 직접 제어합니다.
+
+```java
+Bson searchStage = Aggregates.search(
+    SearchOperator.text(SearchPath.fieldPath("title"), "mongodb"),
+    SearchOptions.searchOptions().index("search-index")
+);
+
+Bson vectorStage = Aggregates.vectorSearch(
+    SearchPath.fieldPath("embedding"),
+    List.of(0.1D, 0.2D, 0.3D),
+    "vector-index",
+    10L,
+    VectorSearchOptions.exactVectorSearchOptions()
+);
+
+Flux<Document> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .aggregation()
+    .stage(
+        Aggregates.scoreFusion(
+            List.of(
+                FusionPipeline.of("text", searchStage),
+                FusionPipeline.of("vector", vectorStage)
+            ),
+            ScoreNormalization.SIGMOID
+        )
+    )
+    .executeDocument();
+```
+
+Driver에 API가 존재하는 것과 서버에서 해당 stage를 지원하는 것은 별개입니다. `$score` / `$scoreFusion`은 MongoDB 8.2+, 5.10의 nested/array Vector Search 옵션은 MongoDB 8.3+ 기능이므로 실제 실행 환경의 서버 버전도 맞아야 합니다.
+
+`aggregation()`에서도 `readPreference(...)`, `isAllowDiskUse(...)`, `customizeAggregation(...)`, `preview()`, `explain()`을 사용할 수 있습니다.
 
 ---
 
@@ -2525,6 +2576,20 @@ stage option을 직접 보완할 수 있습니다.
 
 MongoDB Driver가 새 Search 기능을 먼저 제공하고 DSL convenience API가 아직 없는 경우에도 `operator(...)`, `driverOptions(...)`, `SortSpec.driver(...)`, `customizeAggregation(...)` 같은 escape hatch를 사용할 수 있습니다.
 
+`$search` 뒤에 Driver-native aggregation stage가 필요하면 `stage(Bson)` / `stages(...)`를 사용할 수 있습니다. 추가 stage는 `$search` 직후, post-search `fields(...)`, metadata 추가, score filter, paging, projection보다 먼저 실행됩니다.
+
+추가 stage는 `$search` 기반의 일반 결과/count pipeline에 적용됩니다. `executeSearchMeta()`는 `$searchMeta` 전용 metadata count 경로이므로 `stage(...)`를 적용하지 않습니다.
+
+```java
+Flux<User> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .search("search-index")
+    .text(text -> text.path("title").query("mongodb"))
+    .stage(Aggregates.score("$rating"))
+    .findAll()
+    .execute();
+```
+
 ---
 
 ## Vector Search
@@ -2838,6 +2903,52 @@ Mono<Boolean> exists = dsl
 
 ---
 
+### Vector Search post stage
+
+`$vectorSearch` 뒤에 Driver-native aggregation stage가 필요하면 `stage(Bson)` / `stages(...)`를 사용할 수 있습니다. 추가 stage는 `$vectorSearch` 직후, post-filter, metadata 추가, projection보다 먼저 실행됩니다.
+
+```java
+Flux<User> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .vectorSearch("vector-index")
+    .path("embedding")
+    .queryVector(vector)
+    .limit(20)
+    .exact()
+    .stage(Aggregates.score("$rating"))
+    .findAll()
+    .execute();
+```
+
+### Nested / array embedding 옵션 (Driver 5.10+)
+
+MongoDB Driver 5.10.0에서 추가된 nested Vector Search의 핵심 옵션은 기존 Vector DSL과 바로 연결할 수 있습니다.
+
+- `filter(...)` / `filterFields(...)`: nested embedding의 leaf document에 적용되는 `filter`
+- `parentFilter(...)` / `parentFilterFields(...)`: root document에 적용되는 `parentFilter`
+- `nestedScoreMode(...)`: 한 document 안에서 여러 embedding이 매칭될 때 score 결합 방식 (`AVG` / `MAX`)
+
+```java
+Flux<Article> result = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .vectorSearch("articles_vector_index")
+    .path("chunks.embedding")
+    .queryVector(embedding)
+    .limit(20)
+    .exact()
+    .filter(f -> f.fields(
+        pair("chunks.kind", "BODY")
+    ))
+    .parentFilter(f -> f.fields(
+        pair("tenantId", tenantId)
+    ))
+    .nestedScoreMode(VectorSearchScoreMode.AVG)
+    .findAll()
+    .execute();
+```
+
+이 convenience API는 MongoDB Driver 기능을 다시 구현하는 것이 아니라 기존 `FieldsPair` / `FieldBuilder` 조건 DSL과 Driver 5.10의 `VectorSearchOptions`를 연결하는 역할만 합니다. nested Vector Search는 MongoDB 8.3+ 서버 기능입니다.
+
 ### Vector Search Driver options
 
 ```java
@@ -2845,7 +2956,19 @@ Mono<Boolean> exists = dsl
 .driverOptions(options -> ...)
 ```
 
-Driver-native `VectorSearchOptions`를 마지막에 추가 조정할 수 있습니다.
+`driverOptions(...)`는 convenience API에 아직 반영되지 않은 현재/미래 Driver 옵션을 직접 사용할 수 있는 escape hatch로 유지됩니다. 예를 들어 동일한 nested 옵션도 Driver API를 직접 사용할 수 있습니다.
+
+```java
+.vectorSearch("articles_vector_index")
+.driverOptions(options -> options
+    .parentFilter(Filters.eq("tenantId", tenantId))
+    .nestedOptions(
+        VectorSearchNestedOptions
+            .vectorSearchNestedOptions()
+            .scoreMode(VectorSearchScoreMode.AVG)
+    )
+)
+```
 
 ---
 

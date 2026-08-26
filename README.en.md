@@ -211,7 +211,7 @@ With Spring Boot, keep the normal Reactive MongoDB starter in the application:
 
 ```gradle
 dependencies {
-    implementation 'com.byeolnaerim:reactive-mongo-dsl:1.0.0-alpha.4'
+    implementation 'com.byeolnaerim:reactive-mongo-dsl:1.0.0'
     implementation 'org.springframework.boot:spring-boot-starter-data-mongodb-reactive'
 }
 ```
@@ -951,6 +951,57 @@ Mono<PageResult<User>> page = dsl
 `executeAggregation()` collects the reactive page data into a final `List` and creates a `PageResult`.
 
 For a single result, use `find().executeAggregation()`.
+
+### Driver-native root aggregation
+
+Use `aggregation()` when MongoDB Driver aggregation stages must be composed directly from the first pipeline stage. The DSL does not re-implement the Driver aggregation API; it executes Driver-provided `Bson` stages as-is. `Document` also implements `Bson` and can be passed directly.
+
+```java
+Flux<User> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .aggregation()
+    .stage(Aggregates.match(Filters.eq("status", "ACTIVE")))
+    .stage(Aggregates.sort(Sorts.descending("createdAt")))
+    .stage(Aggregates.limit(20))
+    .execute();
+```
+
+Stages preserve insertion order. Use `execute(ResultType.class)` when the result shape differs from the source entity, or `executeDocument()` for raw `Document` results.
+
+MongoDB Driver 5.10.0 `$score` / `$scoreFusion` stages are passed through directly without DSL-specific wrappers. For features such as `$scoreFusion`, where first-stage placement matters, use `aggregation()` to control pipeline order explicitly.
+
+```java
+Bson searchStage = Aggregates.search(
+    SearchOperator.text(SearchPath.fieldPath("title"), "mongodb"),
+    SearchOptions.searchOptions().index("search-index")
+);
+
+Bson vectorStage = Aggregates.vectorSearch(
+    SearchPath.fieldPath("embedding"),
+    List.of(0.1D, 0.2D, 0.3D),
+    "vector-index",
+    10L,
+    VectorSearchOptions.exactVectorSearchOptions()
+);
+
+Flux<Document> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .aggregation()
+    .stage(
+        Aggregates.scoreFusion(
+            List.of(
+                FusionPipeline.of("text", searchStage),
+                FusionPipeline.of("vector", vectorStage)
+            ),
+            ScoreNormalization.SIGMOID
+        )
+    )
+    .executeDocument();
+```
+
+Driver API availability and server-stage support are separate concerns. `$score` / `$scoreFusion` require MongoDB 8.2+, while the nested/array Vector Search options added in Driver 5.10 require MongoDB 8.3+.
+
+`readPreference(...)`, `isAllowDiskUse(...)`, `customizeAggregation(...)`, `preview()`, and `explain()` are available on `aggregation()` as well.
 
 ---
 
@@ -2519,6 +2570,20 @@ Stage options can be supplemented directly.
 
 When a Search feature appears in the MongoDB Driver before a matching DSL convenience API, escape hatches such as `operator(...)`, `driverOptions(...)`, `SortSpec.driver(...)`, and `customizeAggregation(...)` can still be used.
 
+Use `stage(Bson)` / `stages(...)` when a Driver-native aggregation stage is needed after `$search`. Added stages run immediately after `$search` and before post-search `fields(...)`, metadata additions, score filters, paging, and projection.
+
+Added stages apply to normal `$search` result/count pipelines. `executeSearchMeta()` uses the dedicated `$searchMeta` metadata-count path and does not apply `stage(...)`.
+
+```java
+Flux<User> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .search("search-index")
+    .text(text -> text.path("title").query("mongodb"))
+    .stage(Aggregates.score("$rating"))
+    .findAll()
+    .execute();
+```
+
 ---
 
 ## Vector Search
@@ -2830,6 +2895,52 @@ Mono<Boolean> exists = dsl
 
 ---
 
+### Vector Search post stage
+
+Use `stage(Bson)` / `stages(...)` when a Driver-native aggregation stage is needed after `$vectorSearch`. Added stages run immediately after `$vectorSearch` and before post-filters, metadata additions, and projection.
+
+```java
+Flux<User> result = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .vectorSearch("vector-index")
+    .path("embedding")
+    .queryVector(vector)
+    .limit(20)
+    .exact()
+    .stage(Aggregates.score("$rating"))
+    .findAll()
+    .execute();
+```
+
+### Nested / array embedding options (Driver 5.10+)
+
+The core nested Vector Search options added in MongoDB Driver 5.10.0 are connected directly to the existing Vector DSL.
+
+- `filter(...)` / `filterFields(...)`: the `filter` applied to nested embedding leaf documents
+- `parentFilter(...)` / `parentFilterFields(...)`: the `parentFilter` applied to root documents
+- `nestedScoreMode(...)`: how scores from multiple matching embeddings inside one document are combined (`AVG` / `MAX`)
+
+```java
+Flux<Article> result = dsl
+    .executeEntity(Article.class, MongoTemplateName.FRONT)
+    .vectorSearch("articles_vector_index")
+    .path("chunks.embedding")
+    .queryVector(embedding)
+    .limit(20)
+    .exact()
+    .filter(f -> f.fields(
+        pair("chunks.kind", "BODY")
+    ))
+    .parentFilter(f -> f.fields(
+        pair("tenantId", tenantId)
+    ))
+    .nestedScoreMode(VectorSearchScoreMode.AVG)
+    .findAll()
+    .execute();
+```
+
+These convenience methods do not re-implement the MongoDB Driver. They only connect the existing `FieldsPair` / `FieldBuilder` criteria DSL to the Driver 5.10 `VectorSearchOptions`. Nested Vector Search requires MongoDB 8.3+.
+
 ### Vector Search Driver options
 
 ```java
@@ -2837,7 +2948,19 @@ Mono<Boolean> exists = dsl
 .driverOptions(options -> ...)
 ```
 
-Driver-native `VectorSearchOptions` can be adjusted at the end.
+`driverOptions(...)` remains the escape hatch for current or future Driver options that the convenience DSL does not expose yet. The same nested options can still be used directly through the Driver API.
+
+```java
+.vectorSearch("articles_vector_index")
+.driverOptions(options -> options
+    .parentFilter(Filters.eq("tenantId", tenantId))
+    .nestedOptions(
+        VectorSearchNestedOptions
+            .vectorSearchNestedOptions()
+            .scoreMode(VectorSearchScoreMode.AVG)
+    )
+)
+```
 
 ---
 
