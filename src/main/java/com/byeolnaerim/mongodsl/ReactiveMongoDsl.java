@@ -1,16 +1,19 @@
 package com.byeolnaerim.mongodsl;
 
 
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -28,11 +31,21 @@ import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuild
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllAggregation;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllExecute;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindExecute;
+import com.byeolnaerim.mongodsl.change.ChangeStreamCheckpointStore;
+import com.byeolnaerim.mongodsl.change.ChangeStreamHub;
 import com.byeolnaerim.mongodsl.criteria.FieldsPair;
 import com.byeolnaerim.mongodsl.criteria.FieldsPairBsonSupport;
+import com.byeolnaerim.mongodsl.internal.CursorNamespaceCoordinator;
 import com.byeolnaerim.mongodsl.internal.MongoBsonSupport;
 import com.byeolnaerim.mongodsl.internal.MongoFieldNameSupport;
 import com.byeolnaerim.mongodsl.lookup.LookupSpec;
+import com.byeolnaerim.mongodsl.paging.CursorAnchor;
+import com.byeolnaerim.mongodsl.paging.CursorAnchorStore;
+import com.byeolnaerim.mongodsl.paging.CursorPaginationSupport;
+import com.byeolnaerim.mongodsl.paging.CursorSkipExceededAction;
+import com.byeolnaerim.mongodsl.paging.CursorSkipLimitExceededException;
+import com.byeolnaerim.mongodsl.paging.CursorTokenState;
+import com.byeolnaerim.mongodsl.result.CursorPage;
 import com.byeolnaerim.mongodsl.result.PageResult;
 import com.byeolnaerim.mongodsl.result.PageStream;
 import com.byeolnaerim.mongodsl.result.ResultTuple;
@@ -52,6 +65,11 @@ import com.byeolnaerim.mongodsl.search.TextClause;
 import com.byeolnaerim.mongodsl.sort.SortSpec;
 import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
 import com.byeolnaerim.mongodsl.spi.MongoTemplateResolver;
+import com.byeolnaerim.mongodsl.state.InMemoryReactiveMongoDslStateStore;
+import com.byeolnaerim.mongodsl.state.ReactiveMongoDslStateStore;
+import com.byeolnaerim.mongodsl.sync.EmbeddedSyncEngine;
+import com.byeolnaerim.mongodsl.sync.EmbeddedSyncLeaseStore;
+import com.byeolnaerim.mongodsl.sync.InMemoryEmbeddedSyncLeaseStore;
 import com.mongodb.ExplainVerbosity;
 import com.mongodb.ReadPreference;
 import com.mongodb.bulk.BulkWriteResult;
@@ -73,6 +91,7 @@ import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.Variable;
 import com.mongodb.client.model.WriteModel;
+import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import com.mongodb.client.model.search.CompoundSearchOperator;
 import com.mongodb.client.model.search.FieldSearchPath;
 import com.mongodb.client.model.search.SearchHighlight;
@@ -111,47 +130,211 @@ import tools.jackson.databind.json.JsonMapper;
  * @param <K>
  *            the logical key type used to resolve the target Mongo execution context
  */
-public class ReactiveMongoDsl<K> {
+public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 	private final MongoTemplateResolver<K> resolver;
 
 	private final ObjectMapper objectMapper;
 
+	private final ReactiveMongoDslStateStore stateStore;
+
+	private final CursorAnchorStore cursorAnchorStore;
+
+	private final ChangeStreamHub changeStreamHub;
+
+	private final EmbeddedSyncEngine embeddedSyncEngine;
+
+	private final EmbeddedSyncLeaseStore embeddedSyncLeaseStore;
+
+	private final Mono<Void> embeddedSyncInitialization;
+
+	private final CursorNamespaceCoordinator cursorNamespaceCoordinator;
+
 	private static final Object CLIENT_SESSION_CONTEXT_KEY = new Object();
+
+	private static final String LOOKUP_LEFT_RESULT_FIELD = "__reactiveMongoDslLookupLeft";
+
+	private static final String LOOKUP_RIGHT_RESULT_FIELD = "__reactiveMongoDslLookupRight";
 
 	private record SessionBinding(Object sessionScope, ClientSession session) {}
 
+	private record CursorSkipResolution(long relativeSkip, boolean returnEmpty) {}
+
 	/**
-	 * Creates a new DSL instance using the given resolver and a default {@link ObjectMapper}.
-	 * The mapper is retained for source/API compatibility; history snapshots use the active Mongo
-	 * execution context mapping.
-	 *
-	 * @param resolver
-	 *            the Mongo execution-context resolver
+	 * Creates a new DSL instance using the given resolver and the default process-local unified
+	 * state store.
 	 */
 	public ReactiveMongoDsl(
 							MongoTemplateResolver<K> resolver
 	) {
 
-		this( resolver, JsonMapper.builder().build() );
+		this( resolver, JsonMapper.builder().build(), (EmbeddedSyncConfig<K>) null, new InMemoryReactiveMongoDslStateStore() );
 
 	}
 
-	/**
-	 * Creates a new DSL instance using the given resolver and object mapper.
-	 *
-	 * @param resolver
-	 *            the Mongo execution-context resolver
-	 * @param objectMapper
-	 *            the object mapper retained for source/API compatibility with existing callers
-	 */
+	/** Creates a new DSL instance with embedded synchronization and the default unified state store. */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							EmbeddedSyncConfig<K> embeddedSyncConfig
+	) {
+
+		this( resolver, JsonMapper.builder().build(), embeddedSyncConfig, new InMemoryReactiveMongoDslStateStore() );
+
+	}
+
+	/** Uses one state store for cursor paging, Change Stream checkpoints, and embedded-sync leases. */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							ReactiveMongoDslStateStore stateStore
+	) {
+
+		this( resolver, JsonMapper.builder().build(), (EmbeddedSyncConfig<K>) null, stateStore );
+
+	}
+
+	/** Uses one state store for all three features together with embedded synchronization. */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							EmbeddedSyncConfig<K> embeddedSyncConfig,
+							ReactiveMongoDslStateStore stateStore
+	) {
+
+		this( resolver, JsonMapper.builder().build(), embeddedSyncConfig, stateStore );
+
+	}
+
+	/** Creates a new DSL instance using the given resolver and object mapper. */
 	public ReactiveMongoDsl(
 							MongoTemplateResolver<K> resolver,
 							ObjectMapper objectMapper
 	) {
 
-		this.resolver = resolver;
-		this.objectMapper = objectMapper;
+		this( resolver, objectMapper, (EmbeddedSyncConfig<K>) null, new InMemoryReactiveMongoDslStateStore() );
+
+	}
+
+	/** Creates a DSL instance with an explicit mapper and one unified state store. */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							ObjectMapper objectMapper,
+							ReactiveMongoDslStateStore stateStore
+	) {
+
+		this( resolver, objectMapper, (EmbeddedSyncConfig<K>) null, stateStore );
+
+	}
+
+	/**
+	 * Primary constructor. The supplied state store is used by cursor anchors, namespace versions,
+	 * Change Stream checkpoints, and embedded-sync leases unless EmbeddedSyncConfig explicitly
+	 * overrides only the lease store.
+	 */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							ObjectMapper objectMapper,
+							EmbeddedSyncConfig<K> embeddedSyncConfig,
+							ReactiveMongoDslStateStore stateStore
+	) {
+
+		this.resolver = Objects.requireNonNull( resolver, "resolver must not be null" );
+		this.objectMapper = Objects.requireNonNull( objectMapper, "objectMapper must not be null" );
+		this.stateStore = Objects.requireNonNull( stateStore, "stateStore must not be null" );
+		this.cursorAnchorStore = this.stateStore;
+		this.embeddedSyncLeaseStore = embeddedSyncConfig == null ? this.stateStore : embeddedSyncConfig.leaseStoreOr( this.stateStore );
+		this.changeStreamHub = new ChangeStreamHub( this.stateStore, this.stateStore, this.embeddedSyncLeaseStore );
+		this.cursorNamespaceCoordinator = new CursorNamespaceCoordinator( this.changeStreamHub, this.cursorAnchorStore );
+
+		if (embeddedSyncConfig == null) {
+			this.embeddedSyncEngine = null;
+			this.embeddedSyncInitialization = Mono.empty();
+
+		} else {
+			this.embeddedSyncEngine = new EmbeddedSyncEngine( this.changeStreamHub, this.embeddedSyncLeaseStore );
+			this.embeddedSyncInitialization = Flux
+				.fromIterable( embeddedSyncConfig.registrations() )
+				.concatMap(
+					registration -> Flux
+						.fromIterable( registration.keys() )
+						.concatMap( key -> this.embeddedSyncEngine.register( getMongoTemplate( key ), registration.definition() ) )
+						.then()
+				)
+				.then()
+				.cache();
+			this.embeddedSyncInitialization.subscribe( ignored -> {}, ignored -> {} );
+
+		}
+
+	}
+
+	/**
+	 * Advanced compatibility constructor for independently configured cursor/checkpoint stores.
+	 * Prefer
+	 * {@link ReactiveMongoDslStateStore#of(CursorAnchorStore, ChangeStreamCheckpointStore, EmbeddedSyncLeaseStore)}
+	 * when all three features intentionally use different backends.
+	 */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							CursorAnchorStore cursorAnchorStore,
+							ChangeStreamCheckpointStore checkpointStore
+	) {
+
+		this( resolver, JsonMapper.builder().build(), (EmbeddedSyncConfig<K>) null, legacyStateStore( cursorAnchorStore, checkpointStore ) );
+
+	}
+
+	/** Advanced compatibility constructor with embedded synchronization and separate stores. */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							EmbeddedSyncConfig<K> embeddedSyncConfig,
+							CursorAnchorStore cursorAnchorStore,
+							ChangeStreamCheckpointStore checkpointStore
+	) {
+
+		this( resolver, JsonMapper.builder().build(), embeddedSyncConfig, legacyStateStore( cursorAnchorStore, checkpointStore ) );
+
+	}
+
+	/** Advanced compatibility constructor with an explicit mapper and separate stores. */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							ObjectMapper objectMapper,
+							CursorAnchorStore cursorAnchorStore,
+							ChangeStreamCheckpointStore checkpointStore
+	) {
+
+		this( resolver, objectMapper, (EmbeddedSyncConfig<K>) null, legacyStateStore( cursorAnchorStore, checkpointStore ) );
+
+	}
+
+	/** Advanced compatibility constructor with embedded synchronization and separate stores. */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							ObjectMapper objectMapper,
+							EmbeddedSyncConfig<K> embeddedSyncConfig,
+							CursorAnchorStore cursorAnchorStore,
+							ChangeStreamCheckpointStore checkpointStore
+	) {
+
+		this( resolver, objectMapper, embeddedSyncConfig, legacyStateStore( cursorAnchorStore, checkpointStore ) );
+
+	}
+
+	private static ReactiveMongoDslStateStore legacyStateStore(
+		CursorAnchorStore cursorAnchorStore, ChangeStreamCheckpointStore checkpointStore
+	) {
+
+		return ReactiveMongoDslStateStore
+			.of(
+				Objects.requireNonNull( cursorAnchorStore, "cursorAnchorStore must not be null" ),
+				Objects.requireNonNull( checkpointStore, "checkpointStore must not be null" ),
+				new InMemoryEmbeddedSyncLeaseStore()
+			);
+
+	}
+
+	Mono<Void> embeddedSyncInitialization() {
+
+		return embeddedSyncInitialization;
 
 	}
 
@@ -169,6 +352,43 @@ public class ReactiveMongoDsl<K> {
 	) {
 
 		return resolver.getTemplate( key );
+
+	}
+
+	/** Returns the shared change-stream facade used by all DSL change-stream features. */
+	public ChangeStreams changeStreams() {
+
+		return new ChangeStreams();
+
+	}
+
+	/** Shared ChangeStreamHub access without opening duplicate physical MongoDB streams. */
+	public final class ChangeStreams {
+
+		public Flux<ChangeStreamDocument<Document>> watch(
+			K key
+		) {
+
+			return changeStreamHub.watch( getMongoTemplate( key ) );
+
+		}
+
+		public Flux<ChangeStreamDocument<Document>> watch(
+			K key, Class<?> entityClass
+		) {
+
+			MongoExecutionContext context = getMongoTemplate( key );
+			return changeStreamHub.watchCollection( context, context.getCollectionName( entityClass ) );
+
+		}
+
+		public Flux<ChangeStreamDocument<Document>> watch(
+			K key, String collectionName
+		) {
+
+			return changeStreamHub.watchCollection( getMongoTemplate( key ), collectionName );
+
+		}
 
 	}
 
@@ -629,8 +849,8 @@ public class ReactiveMongoDsl<K> {
 
 	}
 
-	private <T> Flux<T> find(
-		MongoExecutionContext executionContext, Class<T> entityClass, String explicitCollectionName, FindSpec query
+	private Flux<Document> findDocuments(
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, FindSpec query
 	) {
 
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
@@ -640,7 +860,15 @@ public class ReactiveMongoDsl<K> {
 					session -> applyQuery( collection, query, session ),
 					() -> applyQuery( collection, query, null )
 				)
-			)
+			);
+
+	}
+
+	private <T> Flux<T> find(
+		MongoExecutionContext executionContext, Class<T> entityClass, String explicitCollectionName, FindSpec query
+	) {
+
+		return findDocuments( executionContext, entityClass, explicitCollectionName, query )
 			.map( document -> executionContext.read( entityClass, document ) );
 
 	}
@@ -1073,6 +1301,218 @@ public class ReactiveMongoDsl<K> {
 			);
 
 	}
+
+
+	private Mono<String> cursorNamespaceVersion(
+		MongoExecutionContext context, String collectionName
+	) {
+
+		return cursorNamespaceCoordinator.version( context, collectionName );
+
+	}
+
+	private void validateCursorPageSize(
+		int pageSize
+	) {
+
+		if (pageSize <= 0)
+			throw new IllegalArgumentException( "cursor pageSize must be > 0" );
+		int maxPageSize = cursorAnchorStore.cursorCacheOptions().maxPageSize();
+		if (pageSize > maxPageSize)
+			throw new IllegalArgumentException( "cursor pageSize " + pageSize + " exceeds configured maxPageSize " + maxPageSize );
+
+	}
+
+	private CursorSkipResolution resolveCursorRelativeSkip(
+		int targetPageNumber,
+		int anchorPageNumber,
+		int pageSize,
+		long maxRelativeSkip,
+		CursorSkipExceededAction onExceeded
+	) {
+
+		long pageDistance = Math.max( 0L, (long) targetPageNumber - anchorPageNumber );
+		long relativeSkip = Math.multiplyExact( pageDistance, (long) pageSize );
+		if (relativeSkip <= maxRelativeSkip) {
+			validateCursorDriverSkip( relativeSkip );
+			return new CursorSkipResolution( relativeSkip, false );
+
+		}
+
+		return switch (Objects.requireNonNull( onExceeded, "onExceeded must not be null" )) {
+			case FAIL -> throw new CursorSkipLimitExceededException(
+				targetPageNumber, anchorPageNumber, pageSize, relativeSkip, maxRelativeSkip
+			);
+			case RETURN_EMPTY -> new CursorSkipResolution( 0L, true );
+			case EXECUTE_ANYWAY -> {
+				validateCursorDriverSkip( relativeSkip );
+				yield new CursorSkipResolution( relativeSkip, false );
+
+			}
+		};
+
+	}
+
+	private void validateCursorDriverSkip(
+		long relativeSkip
+	) {
+
+		if (relativeSkip > Integer.MAX_VALUE)
+			throw new IllegalArgumentException(
+				"cursor relative skip " + relativeSkip + " exceeds the MongoDB Java Driver skip limit " + Integer.MAX_VALUE
+			);
+
+	}
+
+	private Mono<Optional<CursorTokenState>> resolveCursorToken(
+		String queryKey, int pageSize, String token
+	) {
+
+		if (token == null || token.isBlank())
+			return Mono.just( Optional.empty() );
+		if (! CursorPaginationSupport.isTokenId( token ))
+			return Mono.error( new IllegalArgumentException( "cursor token format is invalid" ) );
+		return cursorAnchorStore.resolveToken( token ).map( optional -> {
+			CursorTokenState state = optional.orElseThrow( () -> new IllegalArgumentException( "cursor token is invalid or expired" ) );
+			if (! queryKey.equals( state.queryKey() ))
+				throw new IllegalArgumentException( "cursor token does not belong to the current namespace/query" );
+			if (pageSize != state.pageSize())
+				throw new IllegalArgumentException( "cursor pageSize must match the pageSize used when the token was issued" );
+			return Optional.of( state );
+
+		} );
+
+	}
+
+	private Mono<String> issueCursorToken(
+		String queryKey, int pageSize, Document sortValues
+	) {
+
+		String token = CursorPaginationSupport.tokenId( queryKey, pageSize, sortValues );
+		CursorTokenState state = new CursorTokenState( queryKey, pageSize, sortValues );
+		return cursorAnchorStore
+			.putToken( token, state, cursorAnchorStore.cursorCacheOptions().tokenTtl() )
+			.thenReturn( token );
+
+	}
+
+	private Mono<String> cursorQueryKey(
+		MongoExecutionContext context, String collectionName, String operation, Bson criteria, Document normalizedSort, int pageSize, String projectionFingerprint, String extraFingerprint, Collection<String> additionalDependencies
+	) {
+
+		List<String> dependencies = new ArrayList<>();
+		dependencies.add( collectionName );
+		if (additionalDependencies != null)
+			additionalDependencies.stream().filter( Objects::nonNull ).filter( value -> ! value.isBlank() ).forEach( dependencies::add );
+
+		return Flux
+			.fromIterable( dependencies.stream().distinct().sorted().toList() )
+			.concatMap( dependency -> cursorNamespaceVersion( context, dependency ) )
+			.collectList()
+			.map(
+				versions -> CursorPaginationSupport
+					.fingerprint(
+						operation,
+						versions,
+						MongoBsonSupport.toDocument( criteria ),
+						normalizedSort,
+						pageSize,
+						projectionFingerprint,
+						extraFingerprint
+					)
+			);
+
+	}
+
+	private Mono<String> cursorTokenQueryKey(
+		MongoExecutionContext context, String collectionName, String operation, Bson criteria, Document normalizedSort, int pageSize, String projectionFingerprint, String extraFingerprint, Collection<String> additionalDependencies
+	) {
+
+		List<String> dependencies = new ArrayList<>();
+		dependencies.add( collectionName );
+		if (additionalDependencies != null)
+			additionalDependencies.stream().filter( Objects::nonNull ).filter( value -> ! value.isBlank() ).forEach( dependencies::add );
+
+		return Flux
+			.fromIterable( dependencies.stream().distinct().sorted().toList() )
+			.concatMap( dependency -> cursorNamespaceCoordinator.identity( context, dependency ) )
+			.collectList()
+			.map(
+				namespaces -> CursorPaginationSupport
+					.fingerprint(
+						"opaque-token-v1",
+						operation,
+						namespaces,
+						MongoBsonSupport.toDocument( criteria ),
+						normalizedSort,
+						pageSize,
+						projectionFingerprint,
+						extraFingerprint
+					)
+			);
+
+	}
+
+	private String lookupFingerprint(
+		LookupSpec spec, Bson rightCriteria, String rightCollection
+	) {
+
+		return CursorPaginationSupport
+			.fingerprint(
+				rightCollection,
+				MongoBsonSupport.toDocument( rightCriteria ),
+				spec.getAs(),
+				spec.getLocalField(),
+				spec.getForeignField(),
+				spec.getLetDoc(),
+				MongoBsonSupport.toDocuments( spec.getPipelineDocs() ),
+				MongoBsonSupport.toDocuments( spec.getOuterStages() ),
+				spec.isUnwind(),
+				spec.isPreserveNullAndEmptyArrays()
+			);
+
+	}
+
+	private Set<String> lookupDependencyCollections(
+		String rightCollection, LookupSpec spec
+	) {
+
+		Set<String> collections = new HashSet<>();
+		collections.add( rightCollection );
+		for (Document document : MongoBsonSupport.toDocuments( spec.getPipelineDocs() ))
+			collectLookupDependencyCollections( document, collections );
+		for (Document document : MongoBsonSupport.toDocuments( spec.getOuterStages() ))
+			collectLookupDependencyCollections( document, collections );
+		return collections;
+
+	}
+
+	private void collectLookupDependencyCollections(
+		Object value, Set<String> collections
+	) {
+
+		if (value instanceof Document document) {
+			Object lookup = document.get( "$lookup" );
+			if (lookup instanceof Document lookupDocument && lookupDocument.get( "from" ) instanceof String from)
+				collections.add( from );
+			Object graphLookup = document.get( "$graphLookup" );
+			if (graphLookup instanceof Document graphDocument && graphDocument.get( "from" ) instanceof String from)
+				collections.add( from );
+			Object unionWith = document.get( "$unionWith" );
+			if (unionWith instanceof String collection)
+				collections.add( collection );
+			if (unionWith instanceof Document unionDocument && unionDocument.get( "coll" ) instanceof String collection)
+				collections.add( collection );
+			document.values().forEach( nested -> collectLookupDependencyCollections( nested, collections ) );
+			return;
+
+		}
+
+		if (value instanceof Collection<?> collection)
+			collection.forEach( nested -> collectLookupDependencyCollections( nested, collections ) );
+
+	}
+
 
 
 	/**
@@ -2092,6 +2532,10 @@ public class ReactiveMongoDsl<K> {
 
 			protected Consumer<AggregatePublisher<Document>> aggregationCustomizer = ignored -> {};
 
+			protected boolean queryCustomized;
+
+			protected boolean aggregationCustomized;
+
 			public interface Runner {}
 
 			/** Applies a MongoDB driver FindPublisher customization directly. */
@@ -2100,8 +2544,12 @@ public class ReactiveMongoDsl<K> {
 				Consumer<FindPublisher<Document>> customizer
 			) {
 
-				if (customizer != null)
+				if (customizer != null) {
 					this.queryCustomizer = this.queryCustomizer.andThen( customizer );
+					this.queryCustomized = true;
+
+				}
+
 				return (Q) this;
 
 			}
@@ -2112,8 +2560,12 @@ public class ReactiveMongoDsl<K> {
 				Consumer<AggregatePublisher<Document>> customizer
 			) {
 
-				if (customizer != null)
+				if (customizer != null) {
 					this.aggregationCustomizer = this.aggregationCustomizer.andThen( customizer );
+					this.aggregationCustomized = true;
+
+				}
+
 				return (A) this;
 
 			}
@@ -6025,8 +6477,11 @@ public class ReactiveMongoDsl<K> {
 
 			/**
 			 * Starts paging configuration for this query.
+			 * <p>The existing {@code pageNumber(...).pageSize(...).and()} flow remains the
+			 * ordinary page-number paging API. Cursor strategies are selected explicitly
+			 * through {@code pageNumberCursor(...)} or {@code cursor(...)} on the returned builder.</p>
 			 *
-			 * @return a paging helper builder
+			 * @return a paging helper and strategy selector
 			 */
 			public PageBuilder paging() {
 
@@ -6051,6 +6506,7 @@ public class ReactiveMongoDsl<K> {
 				return new PageBuilder().and( pageNumber, pageSize );
 
 			}
+
 
 			/**
 			 * Starts ordered sorting for this query.
@@ -6119,7 +6575,191 @@ public class ReactiveMongoDsl<K> {
 			}
 
 			/**
-			 * Helper builder for configuring page number and page size.
+			 * Reserves shared change-stream invalidation for this query. The returned builder emits an
+			 * initial snapshot and re-runs the finite query whenever a dependency namespace changes.
+			 */
+			public FindAllChangeStreamReservation reservationChangeStream() {
+
+				return new FindAllChangeStreamReservation();
+
+			}
+
+			public final class FindAllChangeStreamReservation {
+
+				private final List<ReservationDependency> dependencies = new ArrayList<>();
+
+				private Duration coalesce = Duration.ofMillis( 50 );
+
+				public FindAllChangeStreamReservation watch(
+					Class<?> entityClass
+				) {
+
+					dependencies.add( new ReservationDependency( mongoExecutionContext, mongoExecutionContext.getCollectionName( entityClass ) ) );
+					return this;
+
+				}
+
+				public FindAllChangeStreamReservation watch(
+					K key, Class<?> entityClass
+				) {
+
+					MongoExecutionContext context = getMongoTemplate( key );
+					dependencies.add( new ReservationDependency( context, context.getCollectionName( entityClass ) ) );
+					return this;
+
+				}
+
+				public FindAllChangeStreamReservation watch(
+					K key, String collectionName
+				) {
+
+					dependencies.add( new ReservationDependency( getMongoTemplate( key ), Objects.requireNonNull( collectionName, "collectionName must not be null" ) ) );
+					return this;
+
+				}
+
+				public FindAllChangeStreamReservation coalesce(
+					Duration duration
+				) {
+
+					if (duration == null || duration.isNegative())
+						throw new IllegalArgumentException( "coalesce duration must be >= 0" );
+					this.coalesce = duration;
+					return this;
+
+				}
+
+				public Flux<ChangeStreamDocument<Document>> changes() {
+
+					return prepareChanges( List.of() ).thenMany( coalesce( rawChanges( List.of() ) ) );
+
+				}
+
+				public Flux<ChangeStreamDocument<Document>> invalidations() {
+
+					return changes();
+
+				}
+
+				public Flux<List<E>> execute() {
+
+					return refreshSnapshots(
+						prepareChanges( List.of() ),
+						coalesce( rawChanges( List.of() ) ),
+						FindAllQueryBuilder.this.execute().collectList()
+					);
+
+				}
+
+				public <R2> Flux<List<ResultTuple<E, List<R2>>>> executeLookup(
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+				) {
+
+					return refreshSnapshots(
+						prepareLookupChanges( rightBuilder ),
+						coalesce( Flux.merge( rawChanges( List.of() ), lookupReservationChanges( rightBuilder, spec ) ) ),
+						FindAllQueryBuilder.this.executeLookup( rightBuilder, spec ).collectList()
+					);
+
+				}
+
+				private <V> Flux<List<V>> refreshSnapshots(
+					Mono<Void> preparation, Flux<ChangeStreamDocument<Document>> changes, Mono<List<V>> query
+				) {
+
+					return preparation.thenMany(
+						Flux
+							.concat( Mono.just( 0L ), changes.map( ignored -> 1L ) )
+							.switchMap( ignored -> Mono.defer( () -> query ) )
+					);
+
+				}
+
+				private Mono<Void> prepareChanges(
+					Collection<ReservationDependency> additional
+				) {
+
+					List<MongoExecutionContext> contexts = new ArrayList<>();
+					contexts.add( mongoExecutionContext );
+					for (ReservationDependency dependency : dependencies)
+						contexts.add( dependency.context() );
+					for (ReservationDependency dependency : additional)
+						contexts.add( dependency.context() );
+					return Flux
+						.fromIterable( contexts )
+						.distinct( MongoExecutionContext::getSessionScope )
+						.concatMap( changeStreamHub::prepare )
+						.then();
+
+				}
+
+				private <R2> Mono<Void> prepareLookupChanges(
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder
+				) {
+
+					return prepareChanges( List.of( new ReservationDependency( rightBuilder.getMongoExecutionContext(), "" ) ) );
+
+				}
+
+				private Flux<ChangeStreamDocument<Document>> rawChanges(
+					Collection<ReservationDependency> additional
+				) {
+
+					Flux<ChangeStreamDocument<Document>> own = executeClassMono.flatMapMany( entityClass -> {
+						String ownCollection = ReactiveMongoDsl.this.resolveCollectionName( mongoExecutionContext, entityClass, collectionName );
+						return changeStreamHub.watchCollection( mongoExecutionContext, ownCollection );
+
+					} );
+					List<Flux<ChangeStreamDocument<Document>>> streams = new ArrayList<>();
+					streams.add( own );
+					for (ReservationDependency dependency : dependencies)
+						streams.add( changeStreamHub.watchCollection( dependency.context(), dependency.collectionName() ) );
+					for (ReservationDependency dependency : additional)
+						streams.add( changeStreamHub.watchCollection( dependency.context(), dependency.collectionName() ) );
+					return Flux.merge( streams );
+
+				}
+
+				private <R2> Flux<ChangeStreamDocument<Document>> lookupReservationChanges(
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+				) {
+
+					return rightBuilder.getExecuteClassMono().flatMapMany( rightClass -> {
+						String rightCollection = rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank()
+							? rightBuilder.getCollectionName()
+							: rightBuilder.resolveCollectionName( rightClass );
+						return Flux
+							.merge(
+								lookupDependencyCollections( rightCollection, spec )
+									.stream()
+									.map( collection -> changeStreamHub.watchCollection( mongoExecutionContext, collection ) )
+									.toList()
+							);
+
+					} );
+
+				}
+
+				private Flux<ChangeStreamDocument<Document>> coalesce(
+					Flux<ChangeStreamDocument<Document>> source
+				) {
+
+					if (coalesce.isZero())
+						return source;
+					return source
+						.bufferTimeout( 1024, coalesce )
+						.filter( values -> ! values.isEmpty() )
+						.map( values -> values.get( values.size() - 1 ) );
+
+				}
+
+				private record ReservationDependency(MongoExecutionContext context, String collectionName) {}
+
+			}
+
+			/**
+			 * Paging helper that preserves the existing page-number/page-size API and also
+			 * exposes explicit cursor strategy entry points.
 			 */
 			public class PageBuilder {
 
@@ -6162,6 +6802,46 @@ public class ReactiveMongoDsl<K> {
 				}
 
 				/**
+				 * Selects page-number cursor paging while keeping page-number navigation semantics.
+				 *
+				 * @return a page-number cursor paging builder
+				 */
+				public PageNumberCursorPagingBuilder pageNumberCursor() {
+
+					return new PageNumberCursorPagingBuilder();
+
+				}
+
+				/** Selects page-number cursor paging with the given page number and size. */
+				public PageNumberCursorPagingBuilder pageNumberCursor(
+					int pageNumber, int pageSize
+				) {
+
+					return pageNumberCursor().pageNumber( pageNumber ).pageSize( pageSize );
+
+				}
+
+				/**
+				 * Selects page-number-free opaque cursor paging.
+				 *
+				 * @return an opaque cursor paging builder
+				 */
+				public CursorPagingBuilder cursor() {
+
+					return new CursorPagingBuilder();
+
+				}
+
+				/** Selects page-number-free opaque cursor paging with the given page size. */
+				public CursorPagingBuilder cursor(
+					int pageSize
+				) {
+
+					return cursor().pageSize( pageSize );
+
+				}
+
+				/**
 				 * Finalizes paging configuration using the given values and returns the parent query builder.
 				 *
 				 * @param pageNumber
@@ -6197,6 +6877,275 @@ public class ReactiveMongoDsl<K> {
 
 					paging = new Paging( pageNumber, pageSize );
 					return FindAllQueryBuilder.this;
+
+				}
+
+			}
+
+
+			/**
+			 * Typed paging strategy that preserves page-number navigation while using
+			 * store-backed cursor anchors to bound repeated deep-page skips.
+			 */
+			public final class PageNumberCursorPagingBuilder {
+
+				private Integer pageNumber;
+
+				private Integer pageSize;
+
+				private long maxRelativeSkip = cursorAnchorStore.cursorCacheOptions().maxRelativeSkip();
+
+				private CursorSkipExceededAction skipExceededAction = cursorAnchorStore.cursorCacheOptions().skipExceededAction();
+
+				public PageNumberCursorPagingBuilder pageNumber(
+					int pageNumber
+				) {
+
+					if (pageNumber < 0)
+						throw new IllegalArgumentException( "pageNumber must be >= 0" );
+					this.pageNumber = pageNumber;
+					return this;
+
+				}
+
+				public PageNumberCursorPagingBuilder pageSize(
+					int pageSize
+				) {
+
+					validateCursorPageSize( pageSize );
+					this.pageSize = pageSize;
+					return this;
+
+				}
+
+				/** Starts the relative-skip safety policy for this page-number cursor query. */
+				public SkipPolicyBuilder skipPolicy() {
+
+					return new SkipPolicyBuilder();
+
+				}
+
+				/** Configures the relative-skip safety policy in one callback. */
+				public PageNumberCursorPagingBuilder skipPolicy(
+					Consumer<SkipPolicyBuilder> policy
+				) {
+
+					SkipPolicyBuilder builder = skipPolicy();
+					Objects.requireNonNull( policy, "policy must not be null" ).accept( builder );
+					return builder.end();
+
+				}
+
+				public Flux<E> execute() {
+
+					return executePageNumberCursor( requirePaging(), maxRelativeSkip, skipExceededAction );
+
+				}
+
+				public PageStream<E> executePageStream() {
+
+					return executePageNumberCursorStream( requirePaging(), maxRelativeSkip, skipExceededAction );
+
+				}
+
+				public <R2> Flux<ResultTuple<E, List<R2>>> executeLookup(
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+				) {
+
+					return executeLookupPageNumberCursor( rightBuilder, spec, requirePaging(), maxRelativeSkip, skipExceededAction );
+
+				}
+
+				public <R2> Mono<PageResult<ResultTuple<E, List<R2>>>> executeLookupAndCount(
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+				) {
+
+					return executeLookupPageNumberCursorAndCount( rightBuilder, spec, requirePaging(), maxRelativeSkip, skipExceededAction );
+
+				}
+
+
+				/** Reserves shared Change Stream invalidation for this page-number cursor query. */
+				public PageNumberCursorChangeStreamReservation reservationChangeStream() {
+
+					return new PageNumberCursorChangeStreamReservation();
+
+				}
+
+				public final class PageNumberCursorChangeStreamReservation {
+
+					private final FindAllChangeStreamReservation delegate = new FindAllChangeStreamReservation();
+
+					public PageNumberCursorChangeStreamReservation watch(
+						Class<?> entityClass
+					) {
+
+						delegate.watch( entityClass );
+						return this;
+
+					}
+
+					public PageNumberCursorChangeStreamReservation watch(
+						K key, Class<?> entityClass
+					) {
+
+						delegate.watch( key, entityClass );
+						return this;
+
+					}
+
+					public PageNumberCursorChangeStreamReservation watch(
+						K key, String collectionName
+					) {
+
+						delegate.watch( key, collectionName );
+						return this;
+
+					}
+
+					public PageNumberCursorChangeStreamReservation coalesce(
+						Duration duration
+					) {
+
+						delegate.coalesce( duration );
+						return this;
+
+					}
+
+					public Flux<ChangeStreamDocument<Document>> changes() {
+
+						return delegate.changes();
+
+					}
+
+					public Flux<ChangeStreamDocument<Document>> invalidations() {
+
+						return changes();
+
+					}
+
+					public Flux<List<E>> execute() {
+
+						return delegate.refreshSnapshots(
+							delegate.prepareChanges( List.of() ),
+							delegate.coalesce( delegate.rawChanges( List.of() ) ),
+							PageNumberCursorPagingBuilder.this.execute().collectList()
+						);
+
+					}
+
+					public <R2> Flux<List<ResultTuple<E, List<R2>>>> executeLookup(
+						ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+					) {
+
+						return delegate.refreshSnapshots(
+							delegate.prepareLookupChanges( rightBuilder ),
+							delegate.coalesce( Flux.merge( delegate.rawChanges( List.of() ), delegate.lookupReservationChanges( rightBuilder, spec ) ) ),
+							PageNumberCursorPagingBuilder.this.executeLookup( rightBuilder, spec ).collectList()
+						);
+
+					}
+
+				}
+
+				private Paging requirePaging() {
+
+					if (pageNumber == null || pageSize == null)
+						throw new IllegalStateException( "pageNumberCursor requires both pageNumber and pageSize" );
+					return new Paging( pageNumber, pageSize );
+
+				}
+
+				public final class SkipPolicyBuilder {
+
+					private long configuredMaxRelativeSkip = maxRelativeSkip;
+
+					private CursorSkipExceededAction configuredAction = skipExceededAction;
+
+					/** Sets the maximum number of rows MongoDB may skip from the nearest stored anchor. */
+					public SkipPolicyBuilder maxRelativeSkip(
+						long maxRelativeSkip
+					) {
+
+						if (maxRelativeSkip < 0L)
+							throw new IllegalArgumentException( "maxRelativeSkip must be >= 0" );
+						this.configuredMaxRelativeSkip = maxRelativeSkip;
+						return this;
+
+					}
+
+					/** Selects what happens when the configured relative-skip limit is exceeded. */
+					public SkipPolicyBuilder onExceeded(
+						CursorSkipExceededAction action
+					) {
+
+						this.configuredAction = Objects.requireNonNull( action, "action must not be null" );
+						return this;
+
+					}
+
+					/** Applies the policy and returns the page-number cursor builder. */
+					public PageNumberCursorPagingBuilder end() {
+
+						maxRelativeSkip = configuredMaxRelativeSkip;
+						skipExceededAction = configuredAction;
+						return PageNumberCursorPagingBuilder.this;
+
+					}
+
+				}
+
+			}
+
+			/**
+			 * Typed page-number-free cursor strategy. The client only receives an opaque
+			 * store-backed token; no offset skip or page-number skip policy is exposed here.
+			 */
+			public final class CursorPagingBuilder {
+
+				private Integer pageSize;
+
+				private String cursor;
+
+				public CursorPagingBuilder pageSize(
+					int pageSize
+				) {
+
+					validateCursorPageSize( pageSize );
+					this.pageSize = pageSize;
+					return this;
+
+				}
+
+				/** Continues from an opaque cursor returned by the previous page. */
+				public CursorPagingBuilder after(
+					String cursor
+				) {
+
+					this.cursor = cursor;
+					return this;
+
+				}
+
+				public Mono<CursorPage<E>> execute() {
+
+					return executeTokenCursorPage( requirePageSize(), cursor );
+
+				}
+
+				public <R2> Mono<CursorPage<ResultTuple<E, List<R2>>>> executeLookup(
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
+				) {
+
+					return executeLookupTokenCursorPage( rightBuilder, spec, requirePageSize(), cursor );
+
+				}
+
+				private int requirePageSize() {
+
+					if (pageSize == null)
+						throw new IllegalStateException( "cursor paging requires pageSize" );
+					return pageSize;
 
 				}
 
@@ -6253,6 +7202,189 @@ public class ReactiveMongoDsl<K> {
 
 			}
 
+
+			private Flux<E> executePageNumberCursor(
+				Paging cursorPaging, long maxRelativeSkip, CursorSkipExceededAction skipExceededAction
+			) {
+				validateCursorPageSize( cursorPaging.pageSize );
+				if (queryCustomized)
+					return Flux.error( new IllegalStateException( "pageNumberCursor paging does not support customizeQuery because cursor sort/filter semantics would be opaque." ) );
+
+				Optional<Document> normalizedSort = CursorPaginationSupport.normalizeSort( sort );
+				if (normalizedSort.isEmpty())
+					return Flux.error( new IllegalStateException( "pageNumberCursor paging requires numeric ascending/descending sort fields." ) );
+
+				Document cursorSort = normalizedSort.get();
+				return Mono.zip( executeClassMono, fieldBuilder.buildCriteria() ).flatMapMany( tuple -> {
+					Class<E> entityClass = tuple.getT1();
+					Bson baseCriteria = tuple.getT2().orElseGet( Document::new );
+					String resolvedCollection = ReactiveMongoDsl.this.resolveCollectionName( mongoExecutionContext, entityClass, collectionName );
+					String projectionFingerprint = excludes == null ? "" : Arrays.toString( excludes );
+
+					return cursorQueryKey(
+						mongoExecutionContext,
+						resolvedCollection,
+						"find",
+						baseCriteria,
+						cursorSort,
+						cursorPaging.pageSize,
+						projectionFingerprint,
+						"",
+						List.of()
+					)
+						.flatMapMany( queryKey -> {
+							long estimatedSkip = Math.multiplyExact( (long) cursorPaging.pageNumber, (long) cursorPaging.pageSize );
+							return cursorAnchorStore
+								.floor( queryKey, cursorPaging.pageNumber, estimatedSkip )
+								.flatMapMany( anchorOptional -> {
+									int anchorPageNumber = 0;
+									Bson cursorCriteria = baseCriteria;
+
+									if (anchorOptional.isPresent()) {
+										CursorAnchor anchor = anchorOptional.get();
+										anchorPageNumber = anchor.pageNumber();
+										cursorCriteria = CursorPaginationSupport
+											.combine(
+												baseCriteria,
+												CursorPaginationSupport.atOrAfterAnchor( cursorSort, anchor.sortValues() )
+											);
+
+									}
+									CursorSkipResolution skipResolution = resolveCursorRelativeSkip(
+										cursorPaging.pageNumber,
+										anchorPageNumber,
+										cursorPaging.pageSize,
+										maxRelativeSkip,
+										skipExceededAction
+									);
+									if (skipResolution.returnEmpty())
+										return Flux.<E>empty();
+
+									FindSpec query = new FindSpec()
+										.filter( cursorCriteria )
+										.sort( cursorSort )
+										.skip( skipResolution.relativeSkip() )
+										.limit( Math.addExact( cursorPaging.pageSize, 1 ) );
+									if (excludes != null && excludes.length > 0)
+										query.projection( Projections.exclude( excludes ) );
+									applyQueryOptions( query );
+
+									return findDocuments( mongoExecutionContext, entityClass, collectionName, query )
+										.collectList()
+										.flatMapMany(
+											rows -> storeCursorAnchors( queryKey, cursorPaging.pageNumber, cursorPaging.pageSize, rows, cursorSort )
+												.thenMany(
+													Flux
+														.fromIterable( rows.stream().limit( cursorPaging.pageSize ).toList() )
+														.map( document -> mongoExecutionContext.read( entityClass, document ) )
+												)
+										);
+
+								} );
+
+						} );
+
+				} );
+
+			}
+
+
+
+			private Mono<CursorPage<E>> executeTokenCursorPage(
+				int pageSize, String cursor
+			) {
+
+				try {
+					validateCursorPageSize( pageSize );
+
+				} catch (RuntimeException error) {
+					return Mono.error( error );
+
+				}
+				if (queryCustomized)
+					return Mono.error( new IllegalStateException( "cursor paging does not support customizeQuery because cursor sort/filter semantics would be opaque." ) );
+
+				Optional<Document> normalizedSort = CursorPaginationSupport.normalizeSort( sort );
+				if (normalizedSort.isEmpty())
+					return Mono.error( new IllegalStateException( "cursor paging requires numeric ascending/descending sort fields." ) );
+
+				Document cursorSort = normalizedSort.get();
+				return Mono.zip( executeClassMono, fieldBuilder.buildCriteria() ).flatMap( tuple -> {
+					Class<E> entityClass = tuple.getT1();
+					Bson baseCriteria = tuple.getT2().orElseGet( Document::new );
+					String resolvedCollection = ReactiveMongoDsl.this.resolveCollectionName( mongoExecutionContext, entityClass, collectionName );
+					String projectionFingerprint = excludes == null ? "" : Arrays.toString( excludes );
+
+					return cursorTokenQueryKey(
+						mongoExecutionContext,
+						resolvedCollection,
+						"find-token",
+						baseCriteria,
+						cursorSort,
+						pageSize,
+						projectionFingerprint,
+						"",
+						List.of()
+					).flatMap( queryKey -> resolveCursorToken( queryKey, pageSize, cursor ).flatMap( tokenState -> {
+						Bson cursorCriteria = baseCriteria;
+						if (tokenState.isPresent())
+							cursorCriteria = CursorPaginationSupport.combine(
+								baseCriteria,
+								CursorPaginationSupport.atOrAfterAnchor( cursorSort, tokenState.orElseThrow().sortValues() )
+							);
+
+						FindSpec query = new FindSpec()
+							.filter( cursorCriteria )
+							.sort( cursorSort )
+							.limit( Math.addExact( pageSize, 1 ) );
+						if (excludes != null && excludes.length > 0)
+							query.projection( Projections.exclude( excludes ) );
+						applyQueryOptions( query );
+
+						return findDocuments( mongoExecutionContext, entityClass, collectionName, query )
+							.collectList()
+							.flatMap( rows -> {
+								List<E> data = rows
+									.stream()
+									.limit( pageSize )
+									.map( document -> mongoExecutionContext.read( entityClass, document ) )
+									.toList();
+								if (rows.size() <= pageSize)
+									return Mono.just( new CursorPage<>( data, null ) );
+
+								Document nextRow = rows.get( pageSize );
+								Document nextSortValues = CursorPaginationSupport
+									.anchorValues( nextRow, cursorSort )
+									.orElseThrow( () -> new IllegalStateException( "cursor sort fields must be present in the projected result" ) );
+								return issueCursorToken( queryKey, pageSize, nextSortValues )
+									.map( nextCursor -> new CursorPage<>( data, nextCursor ) );
+
+							} );
+
+					} ) );
+
+				} );
+
+			}
+
+			private Mono<Void> storeCursorAnchors(
+				String queryKey, int pageNumber, int pageSize, List<Document> rows, Document cursorSort
+			) {
+
+				if (rows.isEmpty())
+					return Mono.empty();
+				List<Mono<Void>> stores = new ArrayList<>();
+				CursorPaginationSupport
+					.anchorValues( rows.get( 0 ), cursorSort )
+					.ifPresent( values -> stores.add( cursorAnchorStore.put( queryKey, new CursorAnchor( pageNumber, values ) ) ) );
+				if (rows.size() > pageSize)
+					CursorPaginationSupport
+						.anchorValues( rows.get( pageSize ), cursorSort )
+						.ifPresent( values -> stores.add( cursorAnchorStore.put( queryKey, new CursorAnchor( pageNumber + 1, values ) ) ) );
+				return stores.isEmpty() ? Mono.empty() : Mono.when( stores );
+
+			}
+
 			@Override
 			public Mono<Document> preview() {
 
@@ -6294,6 +7426,18 @@ public class ReactiveMongoDsl<K> {
 			public PageStream<E> executePageStream() {
 
 				return new PageStream<>( execute(), new CountQueryBuilder().execute() );
+
+			}
+
+
+			private PageStream<E> executePageNumberCursorStream(
+				Paging cursorPaging, long maxRelativeSkip, CursorSkipExceededAction skipExceededAction
+			) {
+
+				return new PageStream<>(
+					executePageNumberCursor( cursorPaging, maxRelativeSkip, skipExceededAction ),
+					new CountQueryBuilder().execute()
+				);
 
 			}
 
@@ -6427,7 +7571,7 @@ public class ReactiveMongoDsl<K> {
 							.add(
 								Aggregates
 									.project(
-										new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs )
+										new Document( LOOKUP_LEFT_RESULT_FIELD, "$$ROOT" ).append( LOOKUP_RIGHT_RESULT_FIELD, "$" + rightAs )
 									)
 							);
 
@@ -6443,11 +7587,11 @@ public class ReactiveMongoDsl<K> {
 
 					return aggregateDocuments( mongoExecutionContext, leftClass, collectionName, tuple.getT3() )
 						.map( document -> {
-							E leftValue = mongoExecutionContext.read( leftClass, document.get( leftKey, Document.class ) );
+							E leftValue = mongoExecutionContext.read( leftClass, document.get( LOOKUP_LEFT_RESULT_FIELD, Document.class ) );
 							List<R2> rightValues = readLookupValues(
 								rightBuilder.getMongoExecutionContext(),
 								rightClass,
-								document.get( rightKey )
+								document.get( LOOKUP_RIGHT_RESULT_FIELD )
 							);
 							return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues );
 
@@ -6470,6 +7614,259 @@ public class ReactiveMongoDsl<K> {
 			 * 
 			 * @return a {@link Mono} emitting a paged lookup result
 			 */
+			private <R2> Flux<ResultTuple<E, List<R2>>> executeLookupPageNumberCursor(
+				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec,
+				Paging cursorPaging, long maxRelativeSkip, CursorSkipExceededAction skipExceededAction
+			) {
+
+				Objects.requireNonNull( rightBuilder, "rightBuilder must not be null" );
+				Objects.requireNonNull( spec, "spec must not be null" );
+				validateCursorPageSize( cursorPaging.pageSize );
+				if (aggregationCustomized)
+					return Flux.error( new IllegalStateException( "pageNumberCursor lookup does not support customizeAggregation because cursor pipeline semantics would be opaque." ) );
+
+				Optional<Document> normalizedSort = CursorPaginationSupport.normalizeSort( sort );
+				if (normalizedSort.isEmpty())
+					return Flux.error( new IllegalStateException( "pageNumberCursor lookup requires numeric ascending/descending sort fields." ) );
+				Document cursorSort = normalizedSort.get();
+
+				return Mono
+					.zip( fieldBuilder.buildCriteria(), rightBuilder.getFieldBuilderCriteria(), executeClassMono, rightBuilder.getExecuteClassMono() )
+					.flatMapMany( tuple -> {
+						Bson leftCriteria = tuple.getT1().orElseGet( Document::new );
+						Bson rightCriteria = tuple.getT2().orElseGet( Document::new );
+						Class<E> leftClass = tuple.getT3();
+						Class<R2> rightClass = tuple.getT4();
+						String leftCollection = ReactiveMongoDsl.this.resolveCollectionName( mongoExecutionContext, leftClass, collectionName );
+						String rightCollection = rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank()
+							? rightBuilder.getCollectionName()
+							: rightBuilder.resolveCollectionName( rightClass );
+						String rightAs = spec.getAs() != null && ! spec.getAs().isBlank() ? spec.getAs() : simpleName( rightClass );
+						String leftKey = simpleName( leftClass );
+						String rightKey = simpleName( rightClass );
+						Set<String> dependencies = lookupDependencyCollections( rightCollection, spec );
+						String extraFingerprint = lookupFingerprint( spec, rightCriteria, rightCollection );
+
+						return cursorQueryKey(
+							mongoExecutionContext,
+							leftCollection,
+							"lookup",
+							leftCriteria,
+							cursorSort,
+							cursorPaging.pageSize,
+							"",
+							extraFingerprint,
+							dependencies
+						)
+							.flatMapMany( queryKey -> {
+								long estimatedSkip = Math.multiplyExact( (long) cursorPaging.pageNumber, (long) cursorPaging.pageSize );
+								return cursorAnchorStore
+									.floor( queryKey, cursorPaging.pageNumber, estimatedSkip )
+									.flatMapMany( anchorOptional -> {
+										List<Bson> operations = new ArrayList<>();
+										if (! MongoBsonSupport.toDocument( leftCriteria ).isEmpty())
+											operations.add( Aggregates.match( leftCriteria ) );
+										appendLookupStages( operations, rightCollection, rightAs, tuple.getT2(), spec );
+
+										int anchorPageNumber = 0;
+
+										if (anchorOptional.isPresent()) {
+											CursorAnchor anchor = anchorOptional.get();
+											anchorPageNumber = anchor.pageNumber();
+											operations.add( Aggregates.match( CursorPaginationSupport.atOrAfterAnchor( cursorSort, anchor.sortValues() ) ) );
+
+										}
+										CursorSkipResolution skipResolution = resolveCursorRelativeSkip(
+											cursorPaging.pageNumber,
+											anchorPageNumber,
+											cursorPaging.pageSize,
+											maxRelativeSkip,
+											skipExceededAction
+										);
+										if (skipResolution.returnEmpty())
+											return Flux.<ResultTuple<E, List<R2>>>empty();
+
+										operations.add( Aggregates.sort( cursorSort ) );
+										if (skipResolution.relativeSkip() > 0L)
+											operations.add( Aggregates.skip( Math.toIntExact( skipResolution.relativeSkip() ) ) );
+										operations.add( Aggregates.limit( Math.addExact( cursorPaging.pageSize, 1 ) ) );
+										operations.add( Aggregates.project( new Document( LOOKUP_LEFT_RESULT_FIELD, "$$ROOT" ).append( LOOKUP_RIGHT_RESULT_FIELD, "$" + rightAs ) ) );
+
+										return aggregateDocuments( mongoExecutionContext, leftClass, collectionName, applyAggOptions( operations ) )
+											.collectList()
+											.flatMapMany(
+												rows -> storeLookupCursorAnchors( queryKey, cursorPaging.pageNumber, cursorPaging.pageSize, rows, cursorSort )
+													.thenMany(
+														Flux
+															.fromIterable( rows.stream().limit( cursorPaging.pageSize ).toList() )
+															.map( document -> {
+																E leftValue = mongoExecutionContext.read( leftClass, document.get( LOOKUP_LEFT_RESULT_FIELD, Document.class ) );
+																List<R2> rightValues = readLookupValues( rightBuilder.getMongoExecutionContext(), rightClass, document.get( LOOKUP_RIGHT_RESULT_FIELD ) );
+																return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues );
+
+															} )
+													)
+											);
+
+									} );
+
+							} );
+
+					} );
+
+			}
+
+
+
+			private <R2> Mono<CursorPage<ResultTuple<E, List<R2>>>> executeLookupTokenCursorPage(
+				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec, int pageSize, String cursor
+			) {
+
+				Objects.requireNonNull( rightBuilder, "rightBuilder must not be null" );
+				Objects.requireNonNull( spec, "spec must not be null" );
+				try {
+					validateCursorPageSize( pageSize );
+
+				} catch (RuntimeException error) {
+					return Mono.error( error );
+
+				}
+				if (aggregationCustomized)
+					return Mono.error( new IllegalStateException( "cursor lookup paging does not support customizeAggregation because cursor pipeline semantics would be opaque." ) );
+
+				Optional<Document> normalizedSort = CursorPaginationSupport.normalizeSort( sort );
+				if (normalizedSort.isEmpty())
+					return Mono.error( new IllegalStateException( "cursor lookup paging requires numeric ascending/descending sort fields." ) );
+				Document cursorSort = normalizedSort.get();
+
+				return Mono
+					.zip( fieldBuilder.buildCriteria(), rightBuilder.getFieldBuilderCriteria(), executeClassMono, rightBuilder.getExecuteClassMono() )
+					.flatMap( tuple -> {
+						Bson leftCriteria = tuple.getT1().orElseGet( Document::new );
+						Bson rightCriteria = tuple.getT2().orElseGet( Document::new );
+						Class<E> leftClass = tuple.getT3();
+						Class<R2> rightClass = tuple.getT4();
+						String leftCollection = ReactiveMongoDsl.this.resolveCollectionName( mongoExecutionContext, leftClass, collectionName );
+						String rightCollection = rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank()
+							? rightBuilder.getCollectionName()
+							: rightBuilder.resolveCollectionName( rightClass );
+						String rightAs = spec.getAs() != null && ! spec.getAs().isBlank() ? spec.getAs() : simpleName( rightClass );
+						String leftKey = simpleName( leftClass );
+						String rightKey = simpleName( rightClass );
+						Set<String> dependencies = lookupDependencyCollections( rightCollection, spec );
+						String extraFingerprint = lookupFingerprint( spec, rightCriteria, rightCollection );
+
+						return cursorTokenQueryKey(
+							mongoExecutionContext,
+							leftCollection,
+							"lookup-token",
+							leftCriteria,
+							cursorSort,
+							pageSize,
+							"",
+							extraFingerprint,
+							dependencies
+						).flatMap( queryKey -> resolveCursorToken( queryKey, pageSize, cursor ).flatMap( tokenState -> {
+							List<Bson> operations = new ArrayList<>();
+							if (! MongoBsonSupport.toDocument( leftCriteria ).isEmpty())
+								operations.add( Aggregates.match( leftCriteria ) );
+							appendLookupStages( operations, rightCollection, rightAs, tuple.getT2(), spec );
+							if (tokenState.isPresent())
+								operations.add( Aggregates.match( CursorPaginationSupport.atOrAfterAnchor( cursorSort, tokenState.orElseThrow().sortValues() ) ) );
+							operations.add( Aggregates.sort( cursorSort ) );
+							operations.add( Aggregates.limit( Math.addExact( pageSize, 1 ) ) );
+							operations.add( Aggregates.project( new Document( LOOKUP_LEFT_RESULT_FIELD, "$$ROOT" ).append( LOOKUP_RIGHT_RESULT_FIELD, "$" + rightAs ) ) );
+
+							return aggregateDocuments( mongoExecutionContext, leftClass, collectionName, applyAggOptions( operations ) )
+								.collectList()
+								.flatMap( rows -> {
+									List<ResultTuple<E, List<R2>>> data = rows
+										.stream()
+										.limit( pageSize )
+										.map( document -> {
+											E leftValue = mongoExecutionContext.read( leftClass, document.get( LOOKUP_LEFT_RESULT_FIELD, Document.class ) );
+											List<R2> rightValues = readLookupValues( rightBuilder.getMongoExecutionContext(), rightClass, document.get( LOOKUP_RIGHT_RESULT_FIELD ) );
+											return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues );
+
+										} )
+										.toList();
+									if (rows.size() <= pageSize)
+										return Mono.just( new CursorPage<>( data, null ) );
+
+									Document nextLeft = rows.get( pageSize ).get( LOOKUP_LEFT_RESULT_FIELD, Document.class );
+									if (nextLeft == null)
+										return Mono.error( new IllegalStateException( "lookup cursor result does not contain the left document" ) );
+									Document nextSortValues = CursorPaginationSupport
+										.anchorValues( nextLeft, cursorSort )
+										.orElseThrow( () -> new IllegalStateException( "lookup cursor sort fields must be present in the left result" ) );
+									return issueCursorToken( queryKey, pageSize, nextSortValues )
+										.map( nextCursor -> new CursorPage<>( data, nextCursor ) );
+
+								} );
+
+						} ) );
+
+					} );
+
+			}
+
+			private Mono<Void> storeLookupCursorAnchors(
+				String queryKey, int pageNumber, int pageSize, List<Document> rows, Document cursorSort
+			) {
+
+				if (rows.isEmpty())
+					return Mono.empty();
+				List<Mono<Void>> stores = new ArrayList<>();
+				Document first = rows.get( 0 ).get( LOOKUP_LEFT_RESULT_FIELD, Document.class );
+				if (first != null)
+					CursorPaginationSupport
+						.anchorValues( first, cursorSort )
+						.ifPresent( values -> stores.add( cursorAnchorStore.put( queryKey, new CursorAnchor( pageNumber, values ) ) ) );
+
+				if (rows.size() > pageSize) {
+					Document next = rows.get( pageSize ).get( LOOKUP_LEFT_RESULT_FIELD, Document.class );
+					if (next != null)
+						CursorPaginationSupport
+							.anchorValues( next, cursorSort )
+							.ifPresent( values -> stores.add( cursorAnchorStore.put( queryKey, new CursorAnchor( pageNumber + 1, values ) ) ) );
+
+				}
+
+				return stores.isEmpty() ? Mono.empty() : Mono.when( stores );
+
+			}
+
+			private <R2> Mono<PageResult<ResultTuple<E, List<R2>>>> executeLookupPageNumberCursorAndCount(
+				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec,
+				Paging cursorPaging, long maxRelativeSkip, CursorSkipExceededAction skipExceededAction
+			) {
+
+				Mono<Long> countMono = Mono
+					.zip( fieldBuilder.buildCriteria(), rightBuilder.getFieldBuilderCriteria(), executeClassMono, rightBuilder.getExecuteClassMono() )
+					.flatMap( tuple -> {
+						Class<E> leftClass = tuple.getT3();
+						Class<R2> rightClass = tuple.getT4();
+						String rightCollection = rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank()
+							? rightBuilder.getCollectionName()
+							: rightBuilder.resolveCollectionName( rightClass );
+						String rightAs = spec.getAs() != null && ! spec.getAs().isBlank() ? spec.getAs() : simpleName( rightClass );
+						List<Bson> operations = new ArrayList<>();
+						tuple.getT1().ifPresent( criteria -> operations.add( Aggregates.match( criteria ) ) );
+						appendLookupStages( operations, rightCollection, rightAs, tuple.getT2(), spec );
+						operations.add( Aggregates.count( "totalCount" ) );
+						return aggregateDocuments( mongoExecutionContext, leftClass, collectionName, applyAggOptions( operations ) )
+							.next()
+							.map( document -> Optional.ofNullable( document.get( "totalCount", Number.class ) ).map( Number::longValue ).orElse( 0L ) )
+							.defaultIfEmpty( 0L );
+
+					} );
+
+				return Mono
+					.zip( executeLookupPageNumberCursor( rightBuilder, spec, cursorPaging, maxRelativeSkip, skipExceededAction ).collectList(), countMono )
+					.map( tuple -> new PageResult<>( tuple.getT1(), tuple.getT2() ) );
+
+			}
+
 			@Override
 			public <R2> Mono<PageResult<ResultTuple<E, List<R2>>>> executeLookupAndCount(
 				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
@@ -6505,7 +7902,7 @@ public class ReactiveMongoDsl<K> {
 
 						}
 
-						data.add( Aggregates.project( new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs ) ) );
+						data.add( Aggregates.project( new Document( LOOKUP_LEFT_RESULT_FIELD, "$$ROOT" ).append( LOOKUP_RIGHT_RESULT_FIELD, "$" + rightAs ) ) );
 
 						List<Bson> countPipeline = new ArrayList<>( common );
 						countPipeline.add( Aggregates.count( "totalCount" ) );
@@ -6522,11 +7919,11 @@ public class ReactiveMongoDsl<K> {
 								@SuppressWarnings("unchecked")
 								List<Document> rows = (List<Document>) facetDocument.getOrDefault( "data", List.of() );
 								List<ResultTuple<E, List<R2>>> result = rows.stream().map( row -> {
-									E leftValue = mongoExecutionContext.read( leftClass, row.get( leftKey, Document.class ) );
+									E leftValue = mongoExecutionContext.read( leftClass, row.get( LOOKUP_LEFT_RESULT_FIELD, Document.class ) );
 									List<R2> rightValues = readLookupValues(
 										rightBuilder.getMongoExecutionContext(),
 										rightClass,
-										row.get( rightKey )
+										row.get( LOOKUP_RIGHT_RESULT_FIELD )
 									);
 									return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues );
 
@@ -6751,7 +8148,7 @@ public class ReactiveMongoDsl<K> {
 						appendLookupStages( operations, rightCollection, rightAs, rightCriteria, spec );
 						operations.add( Aggregates.sort( sort != null ? sort : Sorts.descending( "_id" ) ) );
 						operations.add( Aggregates.limit( 1 ) );
-						operations.add( Aggregates.project( new Document( leftKey, "$$ROOT" ).append( rightKey, "$" + rightAs ) ) );
+						operations.add( Aggregates.project( new Document( LOOKUP_LEFT_RESULT_FIELD, "$$ROOT" ).append( LOOKUP_RIGHT_RESULT_FIELD, "$" + rightAs ) ) );
 						return applyAggOptions( operations );
 
 					} );
@@ -6765,11 +8162,11 @@ public class ReactiveMongoDsl<K> {
 					return aggregateDocuments( mongoExecutionContext, leftClass, collectionName, tuple.getT3() )
 						.next()
 						.map( document -> {
-							E leftValue = mongoExecutionContext.read( leftClass, document.get( leftKey, Document.class ) );
+							E leftValue = mongoExecutionContext.read( leftClass, document.get( LOOKUP_LEFT_RESULT_FIELD, Document.class ) );
 							List<R2> rightValues = readLookupValues(
 								rightBuilder.getMongoExecutionContext(),
 								rightClass,
-								document.get( rightKey )
+								document.get( LOOKUP_RIGHT_RESULT_FIELD )
 							);
 							return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues.isEmpty() ? null : rightValues.get( 0 ) );
 
@@ -7743,6 +9140,19 @@ public class ReactiveMongoDsl<K> {
 	) {
 
 		return new ExecuteCustomClassBuilder<>( executeCustomClass, key, collectionName ) {};
+
+	}
+
+	@Override
+	public void close() {
+
+		cursorNamespaceCoordinator.close();
+		if (embeddedSyncEngine != null)
+			embeddedSyncEngine.close();
+		changeStreamHub.close();
+		if (embeddedSyncLeaseStore != stateStore)
+			embeddedSyncLeaseStore.close();
+		stateStore.close();
 
 	}
 

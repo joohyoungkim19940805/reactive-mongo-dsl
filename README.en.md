@@ -42,6 +42,7 @@ Maven:
 - Project Reactor
 - A MongoDB Atlas Search index when using Atlas Search
 - A MongoDB Vector Search index when using Vector Search
+- Change Stream availability in the target MongoDB environment when using cursor invalidation, query reservations, or embedded synchronization
 - Application-side Reactive MongoDB configuration (`ReactiveMongoTemplate`, `MongoClient`) when integrating with Spring Data MongoDB
 
 Spring Data MongoDB is not a required dependency of the core library. The DSL can be used in a Spring application, but its execution contract is based on `MongoExecutionContext` and the MongoDB Reactive Streams Driver.
@@ -888,6 +889,219 @@ The nested builder style is also supported.
 
 ---
 
+### Page-number cursor-anchor paging
+
+Cursor features are selected under `paging()` instead of being exposed as unrelated terminals on `findAll()`. Choose `pageNumberCursor(...)` when the UI must keep page-number navigation while store-backed anchors reduce repeated deep skips.
+
+```java
+Flux<User> users = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort
+        .desc("createdAt")
+        .desc("id")
+    )
+    .paging()
+    .pageNumberCursor(20, 50)
+    .execute();
+```
+
+`pageNumber` remains zero-based. Existing ordinary page-number paging is unchanged:
+
+```java
+.findAll()
+.paging()
+    .pageNumber(20)
+    .pageSize(50)
+    .and()
+.execute();
+```
+
+The cursor strategy also supports the explicit builder form:
+
+```java
+.findAll()
+.sorts(sort -> sort.desc("createdAt"))
+.paging()
+.pageNumberCursor()
+    .pageNumber(20)
+    .pageSize(50)
+    .execute();
+```
+
+After a strategy is selected, autocomplete exposes only operations meaningful for that strategy. `skipPolicy()` exists only on `pageNumberCursor()`; it is not available on the page-number-free `cursor()` builder.
+
+Internally the DSL finds the nearest earlier anchor for the query signature and skips only the remaining relative distance.
+
+```text
+pageNumber/pageSize + filter + sort + namespace version
+    -> build cursor query key
+    -> load nearest anchor at or before the target page
+    -> anchor condition + relative skip
+    -> fetch pageSize + 1 rows
+    -> store current-page and next-page anchors
+```
+
+When no nearby anchor exists, `skipPolicy()` controls deep-page behavior. Defaults are `maxRelativeSkip=5,000` and `CursorSkipExceededAction.FAIL`.
+
+```java
+Flux<User> users = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort.desc("createdAt"))
+    .paging()
+    .pageNumberCursor(99999, 20)
+    .skipPolicy()
+        .maxRelativeSkip(10_000)
+        .onExceeded(CursorSkipExceededAction.RETURN_EMPTY)
+        .end()
+    .execute();
+```
+
+`onExceeded(...)` supports:
+
+- `FAIL` - reject before the business collection query with `CursorSkipLimitExceededException`; this is the default.
+- `RETURN_EMPTY` - return an empty result without executing the business collection query.
+- `EXECUTE_ANYWAY` - explicitly accept the calculated relative skip even above the configured limit.
+
+The limit applies to the **actual row skip from the nearest anchor**, not to the numeric page number itself.
+
+Sorting rules:
+
+- if sort is omitted, `_id: -1` is used,
+- if `_id` is missing from a user sort, `_id: -1` is appended as a stable tie-breaker,
+- cursor sort values must use ordinary numeric ascending/descending (`1` / `-1`) semantics,
+- meta/opaque sorts are not supported by cursor paging,
+- `customizeQuery(...)` is not compatible because it makes filter/sort semantics opaque to the cursor engine.
+
+Use `executePageStream()` on the selected page-number cursor builder when a `PageStream<T>` is needed.
+
+```java
+PageStream<User> page = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort.desc("createdAt"))
+    .paging()
+    .pageNumberCursor(20, 50)
+    .executePageStream();
+```
+
+#### Anchor admission / TTL defaults
+
+The default in-memory state store does not retain anchors for every one-off query. It uses adaptive admission based on access behavior. `CursorCacheOptions.defaults()` uses:
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `admissionWindow` | 10 seconds | Window for hot-query detection |
+| `admissionThreshold` | 4 hits | Admit after this many hits in the window |
+| `idleTtl` | 1 minute | Idle expiration for query/anchor state |
+| `maxQueries` | 10,000 | In-memory query-state cap |
+| `maxAnchorsPerQuery` | 256 | In-memory per-query anchor cap |
+| `deepPageSkipThreshold` | 5,000 | Immediately admit when estimated skip reaches this value |
+| `expirationTick` | 1 second | In-memory expiration-wheel tick |
+| `expirationWheelSize` | 512 | Number of expiration-wheel slots |
+| `maxRelativeSkip` | 5,000 | Maximum relative row skip allowed from the nearest anchor in page-number cursor paging |
+| `skipExceededAction` | `FAIL` | Action on limit exceed: `FAIL`, `RETURN_EMPTY`, or `EXECUTE_ANYWAY` |
+| `maxPageSize` | 500 | Maximum page size accepted by cursor APIs |
+| `tokenTtl` | 10 minutes | TTL for store-backed opaque cursor tokens |
+
+The MongoDB-backed state store uses the same admission options and idle TTL, but the current implementation does not immediately prune persisted anchors per query to `maxAnchorsPerQuery` on the server. Persisted MongoDB anchors are aged out by TTL.
+
+To prevent stale anchors from being reused after external writes, the cursor query key includes collection namespace versions. When a Change Stream observes a collection change, the namespace version advances and subsequent requests use a new query key. State-store and Change Stream configuration are covered in the **Unified state store** and **Shared Change Stream** sections below.
+
+To change only the safety limits while retaining the default admission/TTL behavior:
+
+```java
+CursorCacheOptions cursorOptions = CursorCacheOptions
+    .defaults()
+    .withSafety(
+        50_000L,                         // maxRelativeSkip
+        CursorSkipExceededAction.FAIL,  // action on limit exceed
+        200,                             // maxPageSize
+        Duration.ofMinutes(5)            // tokenTtl
+    );
+```
+
+To change only the global page-number cursor skip policy while keeping admission/TTL settings intact:
+
+```java
+CursorCacheOptions cursorOptions = CursorCacheOptions
+    .defaults()
+    .withCursorSkipPolicy(
+        20_000L,
+        CursorSkipExceededAction.RETURN_EMPTY
+    );
+```
+
+A per-query `paging().pageNumberCursor(...).skipPolicy()` overrides these store/global defaults. If it is omitted, the `CursorCacheOptions` values are used.
+
+### Page-number-free store-backed opaque cursor
+
+For infinite-scroll or load-more flows, select the `cursor()` strategy under the same `paging()` entry point. This typed builder does not expose page-number or skip-policy methods.
+
+First page:
+
+```java
+CursorPage<User> first = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort.desc("createdAt"))
+    .paging()
+    .cursor(50)
+    .execute()
+    .block();
+```
+
+Continue by passing the previous opaque token to `after(...)`:
+
+```java
+CursorPage<User> second = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort.desc("createdAt"))
+    .paging()
+    .cursor(50)
+    .after(first.nextCursor())
+    .execute()
+    .block();
+```
+
+The explicit builder form is also available:
+
+```java
+.paging()
+.cursor()
+    .pageSize(50)
+    .after(token)
+    .execute();
+```
+
+`CursorPage<T>` exposes `data()`, `nextCursor()`, and `hasNext()`. This path never computes a page number and never uses MongoDB `skip`. The next-page sort tuple is stored in the state store and only an opaque id is exposed to the client. Client values that are not the exact 64-character lowercase hexadecimal token format issued by the library are rejected before any state-store lookup, preventing oversized arbitrary cursor strings from becoming store traffic.
+
+Stored token state is bound to the physical database/collection namespace, query/filter/sort semantics, page size, and sort tuple. The DSL therefore rejects:
+
+- arbitrary or expired tokens
+- tokens issued for another database/collection or a different filter/sort query
+- reuse with a different page size
+
+Unlike page-number anchors, pure keyset tokens are not invalidated on every collection write. The token already represents a concrete sort position, so after data changes it continues from that position against the **current data**. This is standard keyset-pagination behavior, not snapshot isolation: rows inserted or removed in an already-passed region between requests are not replayed automatically.
+
+The token id is deterministic for the same query and next position and is upserted in the store, so repeatedly reading the same page does not create a new token document on every request. Token documents expire after `tokenTtl`.
+
+Even a token issued far into a result set executes as `keyset predicate + limit(pageSize + 1)` and does not incur a skip proportional to its logical depth. Replaying the same token thousands of times is still a **request-rate attack**, however, and a library without account/IP/API-key identity cannot fully solve that layer; applications should still apply HTTP/API rate limiting. Cursor sort fields should also be backed by an appropriate MongoDB index so the keyset predicate and sort remain efficient.
+
+---
+
 ### `PageStream<T>`
 
 Use `executePageStream()` when you want to keep page data as a `Flux` instead of collecting it into a `List` first.
@@ -1266,6 +1480,160 @@ History writes do not invoke save lifecycle hooks.
 
 ---
 
+## Embedded snapshot synchronization
+
+When a MongoDB document stores a denormalized snapshot of another entity, changes to the canonical source may need to be propagated to that embedded copy. `EmbeddedSyncConfig<K>` defines those relations when the DSL singleton is created and uses the shared Change Stream to apply source changes to target documents.
+
+This is intentionally a separate configuration object rather than a stateful `syncEmbedded(...)` query-builder method. Build the relation configuration and inject it into the `ReactiveMongoDsl` constructor.
+
+### Basic relation definition
+
+```java
+EmbeddedSyncConfig<MongoTemplateName> embeddedSync =
+    new EmbeddedSyncConfig<MongoTemplateName>()
+        .forKeys(MongoTemplateName.FRONT)
+        .from(Order.class)
+        .into(User.class, "orders")
+        .linkBy()
+            .fromField("userId")
+            .intoField("id")
+            .end()
+        .build();
+
+ReactiveMongoDsl<MongoTemplateName> dsl =
+    new ReactiveMongoDsl<>(resolver, embeddedSync);
+```
+
+The direction means:
+
+```text
+from(Order.class)       = canonical source
+into(User.class, ...)   = target that stores the source snapshot
+```
+
+In this example `Order.userId` is linked to `User._id`, and the current Order BSON snapshot is synchronized into the User `orders` field. `intoField("id")` follows the normal DSL path rule and is normalized to `_id`. When a source link value targeting an id alias is a valid 24-character hexadecimal String, it can be converted for an ObjectId comparison.
+
+A relation can use multiple link pairs:
+
+```java
+.linkBy()
+    .fromField("tenantId")
+    .intoField("tenantId")
+    .fromField("userId")
+    .intoField("id")
+    .end()
+```
+
+`linkBy()` can be omitted, but the semantics are narrower. Without an explicit link, the engine can update/delete target fields that already contain the source `_id`, but a new source insert does not provide enough information to discover a brand-new target association. Use `linkBy()` when inserts must create new associations automatically.
+
+### Target field and cardinality
+
+The target field can be explicit:
+
+```java
+.from(Profile.class)
+.into(Account.class, "profile")
+.build();
+```
+
+Or it can be omitted when exactly one compatible target field can be inferred:
+
+```java
+.from(Profile.class)
+.into(Account.class)
+.build();
+```
+
+If no compatible field exists, or more than one field is compatible, the configuration fails instead of selecting an ambiguous field automatically.
+
+Cardinality is inferred from target-field Java metadata:
+
+| Target field shape | Cardinality | Synchronization style |
+| --- | --- | --- |
+| `SourceType field` | SINGLE | `$set` / `$unset` |
+| `Collection<SourceType> field` | COLLECTION | array upsert/update / `$pull` |
+| `Map<String, SourceType> field`, etc. | MAP | map-entry upsert/remove pipeline |
+
+MAP relations must specify which source field supplies the map key:
+
+```java
+.from(Address.class)
+.into(User.class, "addresses")
+.mapKey("type")
+.linkBy()
+    .fromField("userId")
+    .intoField("id")
+    .end()
+.build();
+```
+
+The runtime map key must be usable as a MongoDB field key; blank values, values containing `.`, and values beginning with `$` are rejected.
+
+### INSERT / UPDATE / REPLACE / DELETE handling
+
+Embedded sync handles these source Change Stream operations:
+
+- `INSERT`
+- `UPDATE`
+- `REPLACE`
+- `DELETE`
+
+For UPDATE/REPLACE, the current source document is re-read by `_id` so the target receives the latest snapshot. Short bursts for the same relation/source id are coalesced internally.
+
+Target changes use MongoDB atomic updates/pipelines rather than loading the full target entity and calling `save()`. Unrelated target fields are therefore not overwritten through a read-modify-write cycle.
+
+When link values move a source from target A to target B, the current target is updated and stale references left in the old target are cleaned up.
+
+The default source-delete policy is `EmbeddedDeletePolicy.REMOVE`:
+
+```java
+.onDelete(EmbeddedDeletePolicy.REMOVE)
+```
+
+To keep the embedded snapshot after a source delete:
+
+```java
+.onDelete(EmbeddedDeletePolicy.IGNORE)
+```
+
+### Multi-hop propagation and graph validation
+
+For relations such as:
+
+```text
+C -> B.children
+B -> A.child
+```
+
+a C change can update B, and that B update appears on the Change Stream and can propagate to the downstream A relation.
+
+The configuration validates a directed graph per resolver key:
+
+- DAGs such as `A -> B -> C` are allowed.
+- Real directed cycles (`A -> B -> A`, `A -> B -> C -> A`) are rejected.
+- Unrelated edges are not rejected merely because they point in opposite directions.
+- One target class + target field path cannot have multiple different source owners.
+- A relation registered for a resolver key operates inside the Mongo execution context resolved by that key; it is not a cross-database replication feature.
+
+### Existing data and startup behavior
+
+Registering a relation does not automatically run a full collection scan/reconciliation at startup. Synchronization is driven by changes observed after registration.
+
+If existing embedded snapshots are already stale, or data created before a new relation must be aligned, run an explicit application backfill/reconciliation job. The library does not hide a large startup scan behind relation registration.
+
+### Multiple instances and leases
+
+Embedded sync uses `EmbeddedSyncLeaseStore` so multiple application instances do not intentionally process the same relation batch concurrently. Unless `EmbeddedSyncConfig` overrides it, the DSL's unified state store is also used for leases.
+
+```java
+EmbeddedSyncConfig<MongoTemplateName> embeddedSync =
+    new EmbeddedSyncConfig<>(customLeaseStore);
+```
+
+The default in-memory state store is process-local and is sufficient for a single process. In load-balanced/multi-instance deployments, use a shared MongoDB-backed state store or another distributed implementation when leases must coordinate across nodes. In that case every node must return the same stable `MongoExecutionContext#getDistributedStateScopeKey()` for the same logical Mongo scope.
+
+---
+
 ## Transactions: `getTxJob(...)`
 
 Transactions use MongoDB `ClientSession` directly.
@@ -1310,6 +1678,223 @@ Using the Spring adapter does not change how DSL transactions work.
 Do not assume that DSL operations automatically join a Spring-bound Mongo session just because they are called inside a Spring `@Transactional` block. Likewise, do not assume that `ReactiveMongoTemplate` or Spring Data Repository operations called inside `getTxJob(...)` automatically use the DSL session.
 
 Use `getTxJob(...)` for transactions composed of DSL operations, and Spring's transaction infrastructure for transactions composed of Spring Data Template/Repository operations. If both execution models must participate in one transaction, the application must explicitly design the session integration.
+
+---
+
+## Unified state store: cursor / Change Stream / embedded lease
+
+Cursor anchors/namespace versions, Change Stream resume checkpoints, and embedded-sync leases serve different features but are all long-lived DSL state. The default constructors use one `InMemoryReactiveMongoDslStateStore` for all three areas.
+
+```java
+ReactiveMongoDsl<MongoTemplateName> dsl =
+    new ReactiveMongoDsl<>(resolver);
+```
+
+This default is **process-local**. It requires no additional infrastructure for a single process, but it does not share cursor state, checkpoints, or leases across application instances behind a load balancer.
+
+### Inject one unified state store
+
+Provide one `ReactiveMongoDslStateStore` when the features should share an external backend:
+
+```java
+ReactiveMongoDslStateStore stateStore = ...;
+
+ReactiveMongoDsl<MongoTemplateName> dsl =
+    new ReactiveMongoDsl<>(resolver, stateStore);
+```
+
+With embedded synchronization:
+
+```java
+ReactiveMongoDsl<MongoTemplateName> dsl =
+    new ReactiveMongoDsl<>(resolver, embeddedSync, stateStore);
+```
+
+By default the same store handles:
+
+- cursor anchor reads/writes
+- opaque cursor token storage/resolution/TTL
+- collection namespace versions and invalidation
+- Change Stream resume checkpoints
+- embedded-sync distributed leases
+
+Advanced applications that intentionally use different backends can compose the individual SPIs with `ReactiveMongoDslStateStore.of(...)`:
+
+```java
+ReactiveMongoDslStateStore stateStore = ReactiveMongoDslStateStore.of(
+    cursorAnchorStore,
+    changeStreamCheckpointStore,
+    embeddedSyncLeaseStore
+);
+```
+
+The API is therefore not restricted to in-memory or MongoDB. Implement `ReactiveMongoDslStateStore`, or the individual SPIs and compose them, to connect Redis or another backend. The built-in unified implementations currently provided by the core are in-memory and MongoDB. A custom `CursorAnchorStore` only needs the existing `floor/put` contract for page-number anchors, but it must also implement `putToken(...)` / `resolveToken(...)` to support the `paging().cursor(...)` opaque-token strategy.
+
+### MongoDB-backed unified state store
+
+Use `MongoReactiveMongoDslStateStore` when state should live in MongoDB:
+
+```java
+MongoExecutionContext context = resolver.getTemplate(MongoTemplateName.FRONT);
+
+ReactiveMongoDslStateStore stateStore =
+    new MongoReactiveMongoDslStateStore(context);
+
+ReactiveMongoDsl<MongoTemplateName> dsl =
+    new ReactiveMongoDsl<>(resolver, stateStore);
+```
+
+The default state collection is:
+
+```text
+__reactive_mongo_dsl_state
+```
+
+One collection stores cursor anchors, opaque cursor tokens, namespace versions, Change Stream checkpoints, and embedded-sync leases as separate document kinds.
+
+By default it ensures:
+
+- an `expiresAt` TTL index (`expireAfter=0`)
+- a `(kind, queryKey, pageNumber desc)` compound index for cursor floor lookups
+
+Options can be supplied explicitly:
+
+```java
+MongoReactiveMongoDslStateStoreOptions options =
+    new MongoReactiveMongoDslStateStoreOptions(
+        "__reactive_mongo_dsl_state",
+        CursorCacheOptions.defaults(),
+        true,
+        "front-consumer-a"
+    );
+
+ReactiveMongoDslStateStore stateStore =
+    new MongoReactiveMongoDslStateStore(context, options);
+```
+
+`changeStreamConsumerId` isolates resume tokens by logical consumer. When it is `null`, each store instance uses a process-unique UUID so concurrently running nodes do not overwrite the same checkpoint id. If one logical consumer must resume from the same token after a process restart, supply an id that is **stable across that consumer's restarts but distinct from other concurrently active consumers**.
+
+Checkpoint documents currently use a 7-day TTL. Cursor anchors use `CursorCacheOptions.idleTtl()`. Namespace invalidation stores the Change Stream `clusterTime` so duplicate or older replayed events do not advance the namespace version again.
+
+When the state store is **actually in the same watched Mongo scope**, the internal state collection is excluded from the database Change Stream pipeline to prevent a feedback loop such as:
+
+```text
+state write
+ -> Change Stream event
+ -> state invalidation/checkpoint write
+ -> another Change Stream event
+ -> ...
+```
+
+When state is stored in the same database, the `MongoReactiveMongoDslStateStore(MongoExecutionContext, ...)` constructor provides the clearest same-scope detection because the store can compare the session scope as well as the database.
+
+### `distributedStateScopeKey`
+
+A distributed state store needs a stable namespace shared across processes rather than a process identity. `MongoExecutionContext#getDistributedStateScopeKey()` supplies that namespace.
+
+All nodes serving the same logical Mongo scope should return the same value, while different clusters/tenants/logical databases should use different values so their state cannot collide accidentally.
+
+For a custom `MongoExecutionContext`:
+
+```java
+@Override
+public String getDistributedStateScopeKey() {
+    return "auction-front-prod";
+}
+```
+
+`DriverMongoExecutionContext` also provides a constructor that accepts an explicit `distributedStateScopeKey`.
+
+When a distributed cursor/checkpoint/lease store requires this key and it is absent, the DSL fails initialization/use of that feature rather than guessing a process-local namespace silently.
+
+---
+
+## Shared Change Stream
+
+`ReactiveMongoDsl` shares a `ChangeStreamHub` so cursor invalidation, embedded sync, query reservations, and direct watchers do not each open independent MongoDB Change Streams for the same database scope.
+
+Public facade:
+
+```java
+Flux<ChangeStreamDocument<Document>> databaseChanges =
+    dsl.changeStreams().watch(MongoTemplateName.FRONT);
+
+Flux<ChangeStreamDocument<Document>> userChanges =
+    dsl.changeStreams().watch(MongoTemplateName.FRONT, User.class);
+
+Flux<ChangeStreamDocument<Document>> rawCollectionChanges =
+    dsl.changeStreams().watch(MongoTemplateName.FRONT, "user");
+```
+
+Collection watchers that share the same session scope + database receive filtered views of one database-wide physical stream.
+
+### Checkpoints and the first-subscription boundary
+
+When a shared stream is prepared for the first time, the DSL captures a MongoDB operation time as its safe starting boundary.
+
+- If a saved checkpoint exists, it uses `resumeAfter(resumeToken)`.
+- Otherwise it uses `startAtOperationTime(initialOperationTime)`.
+
+This avoids losing a write that occurs after logical subscription setup but before the server-side Change Stream cursor has physically opened.
+
+Internal processing is micro-batched. The current implementation uses up to 256 events or a 10ms window. Internal work that can be coalesced by collection, such as cursor namespace invalidation, runs as a batch observer, and the checkpoint is saved once using the last resumable token in the batch rather than once per event.
+
+This batching does **not** collapse the public Change Stream event sequence. After internal side effects complete, `changeStreams().watch(...)` subscribers still receive the original events individually and in order.
+
+Internal observers execute before the batch checkpoint advances. If an observer fails, the checkpoint is not moved past that work first, allowing the event to be replayed after reconnection instead of being hidden behind a newer resume token.
+
+### `reservationChangeStream()`: re-run a finite query on invalidation
+
+Use a query reservation when you want a fresh snapshot whenever a dependency collection changes:
+
+```java
+Flux<List<User>> snapshots = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort.desc("createdAt"))
+    .reservationChangeStream()
+    .coalesce(Duration.ofMillis(100))
+    .execute();
+```
+
+The stream:
+
+1. emits one initial finite-query snapshot,
+2. waits for Change Stream events from dependency collections,
+3. re-executes the same finite query and emits a new snapshot after an invalidation.
+
+The default coalescing window is 50ms and can be disabled with `Duration.ZERO`.
+
+Additional dependencies can be declared explicitly:
+
+```java
+.reservationChangeStream()
+.watch(Profile.class)
+.watch(MongoTemplateName.BACK, Audit.class)
+.watch(MongoTemplateName.FRONT, "external_status")
+.execute();
+```
+
+Available terminals:
+
+- `.changes()` / `.invalidations()` - dependency Change Stream events themselves
+- `.execute()` - re-run the ordinary finite query
+- `.executeLookup(right, spec)` - re-run a lookup finite query
+
+For page-number cursor snapshot refreshes, select the strategy first and then use `.reservationChangeStream().execute()` or `.executeLookup(right, spec)`.
+
+```java
+.paging()
+.pageNumberCursor(20, 50)
+.reservationChangeStream()
+.execute();
+```
+
+Lookup reservations automatically include the right collection and nested `$lookup` dependencies found in the `LookupSpec`.
+
+A reservation does not translate the query filter into a document-level MongoDB Change Stream `$match`. It intentionally uses an **invalidation -> pull** model: any observed change in a dependency collection can cause the finite query to be run again. For high-change collections or expensive queries, choose `coalesce(...)`, dependency scope, and query cost accordingly.
 
 ---
 
@@ -1400,6 +1985,55 @@ Mono<PageResult<ResultTuple<User, List<Order>>>> page =
 ```
 
 This returns data and `totalCount` together using a `$facet(data, count)` pipeline.
+
+---
+
+### Lookup cursor paging
+
+Lookup cursor strategy is also selected from the left builder's `paging()` entry point.
+
+Page-number cursor lookup:
+
+```java
+Flux<ResultTuple<User, List<Order>>> joined = left
+    .paging()
+    .pageNumberCursor(20, 50)
+    .executeLookup(right, spec);
+```
+
+When total count is needed:
+
+```java
+Mono<PageResult<ResultTuple<User, List<Order>>>> page = left
+    .paging()
+    .pageNumberCursor(20, 50)
+    .executeLookupAndCount(right, spec);
+```
+
+Anchors use the left builder's `sorts(...)` and the selected page number/page size. The same tie-breaker, admission, namespace invalidation, and `skipPolicy()` rules apply. Lookup query identity also includes the right collection/criteria, `LookupSpec` pipeline semantics, and nested `$lookup` dependency namespaces.
+
+For page-number-free lookup pagination, select `cursor()` and keep the same terminal name `executeLookup(...)`:
+
+```java
+CursorPage<ResultTuple<User, List<Order>>> first = left
+    .paging()
+    .cursor(50)
+    .executeLookup(right, spec)
+    .block();
+
+CursorPage<ResultTuple<User, List<Order>>> second = left
+    .paging()
+    .cursor(50)
+    .after(first.nextCursor())
+    .executeLookup(right, spec)
+    .block();
+```
+
+This path stores the left sort tuple behind an opaque state-store token and uses no offset skip. The token fingerprint includes right-side criteria, lookup semantics, and left/right physical namespace identity, but it is not bound to Change Stream namespace versions like page-number anchors are.
+
+`customizeAggregation(...)` is not compatible with lookup cursor paging because it makes the final pipeline semantics opaque.
+
+Internal lookup projections use dedicated private aliases rather than left/right class simple names, so same-class and `Document`/`Document` lookups do not collide.
 
 ---
 
@@ -1805,6 +2439,23 @@ Representative escape hatches:
 - `bindConditionFieldsLeftToObjectId(...)` converts the left-side value to `ObjectId`.
 - Lookup `$expr` helpers do not support `near`, `nearSphere`, or `elemMatch`; use `rawStage(Bson)` when these are needed.
 
+### Cursor paging / state store / Change Stream
+
+- When page-number cursor paging exceeds `maxRelativeSkip`, it follows `skipExceededAction`. The default `FAIL` blocks before the business-collection query; the page-number cursor builder's `skipPolicy()` or global `CursorCacheOptions` can choose `RETURN_EMPTY` or `EXECUTE_ANYWAY`. Page-number-free opaque cursors do not use `skip` at all.
+- Cursor sorts must use deterministic numeric ascending/descending fields. `_id: -1` is appended as a tie-breaker when `_id` is absent.
+- The default state store is process-local. Use a distributed store plus a stable `distributedStateScopeKey` when cursor/checkpoint/embedded lease state must be shared across application instances.
+- Do not share one `changeStreamConsumerId` across concurrently active Mongo-backed consumers. Use a stable/unique id only for a logical consumer that needs checkpoint continuity across restarts.
+- `reservationChangeStream()` does not translate the query filter into a Change Stream `$match`; it treats dependency writes as invalidations and re-runs the finite query.
+- Shared Change Stream internal state side effects can be batched, while public watch events are still delivered as the original individual events.
+
+### Embedded snapshot sync
+
+- `from` is the canonical source and `into` is the snapshot target; reversing them reverses the meaning of the relation.
+- Use `linkBy()` when a new insert must discover which target should receive a new association.
+- Directed relation cycles and multiple source owners for the same target field are rejected during registration.
+- Registration is not a startup full reconciliation. Existing data backfill must be performed by an explicit application job when required.
+- Multi-instance coordination depends on the lease store; the default in-memory lease is process-local.
+
 ### Atlas Search
 
 - An Atlas Search index must already be configured.
@@ -1846,6 +2497,15 @@ A simple decision guide:
 - business-key bulk upsert: `saveAllBulkUpsertByKey()`
 - atomic update: `atomicUpdate()`
 - join: `executeLookup(...)`
+- ordinary page-number paging: existing `findAll().paging(pageNumber, pageSize)` or `paging().pageNumber(...).pageSize(...).and()`
+- page-number cursor paging: `findAll().paging().pageNumberCursor(pageNumber, pageSize).execute()`
+- page-number-free opaque cursor: `findAll().paging().cursor(pageSize).after(token).execute()`
+- page-number lookup cursor: `left.paging().pageNumberCursor(...).executeLookup(...)` / `executeLookupAndCount(...)`
+- opaque lookup cursor: `left.paging().cursor(...).after(token).executeLookup(...)`
+- refresh a finite-query snapshot on dependency changes: `findAll().reservationChangeStream()`
+- direct Change Stream subscription: `changeStreams().watch(...)`
+- embedded snapshot synchronization: `EmbeddedSyncConfig`
+- shared cursor/checkpoint/lease backend: `ReactiveMongoDslStateStore`
 - grouped aggregation: `group(...)`
 - inspect a query/pipeline before execution: `preview()`
 - inspect the real execution plan: `explain()`

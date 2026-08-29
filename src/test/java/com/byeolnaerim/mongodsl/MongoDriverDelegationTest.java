@@ -550,6 +550,7 @@ class MongoDriverDelegationTest {
 	void vectorStageUsesDriverVectorSearchStage() throws Exception {
 
 		ReactiveMongoDsl<String> dsl = new ReactiveMongoDsl<>( ignored -> context() );
+
 		var builder = dsl
 			.executeEntity( TestEntity.class, "test" )
 			.vectorSearch( "vector-index" )
@@ -560,9 +561,23 @@ class MongoDriverDelegationTest {
 			.limit( 10 )
 			.approximate( 100 );
 
-		Method buildVectorSearchStage = builder.getClass().getDeclaredMethod( "buildVectorSearchStage", Optional.class );
+		Method buildVectorSearchStage = builder
+			.getClass()
+			.getDeclaredMethod(
+				"buildVectorSearchStage",
+				Optional.class,
+				Optional.class
+			);
+
 		buildVectorSearchStage.setAccessible( true );
-		Bson actual = (Bson) buildVectorSearchStage.invoke( builder, Optional.empty() );
+
+		Bson actual = (Bson) buildVectorSearchStage
+			.invoke(
+				builder,
+				Optional.empty(),
+				Optional.empty()
+			);
+
 		Bson expected = Aggregates
 			.vectorSearch(
 				SearchPath.fieldPath( "embedding" ),
@@ -572,7 +587,10 @@ class MongoDriverDelegationTest {
 				VectorSearchOptions.approximateVectorSearchOptions( 100 )
 			);
 
-		assertEquals( MongoBsonSupport.toDocument( expected ), MongoBsonSupport.toDocument( actual ) );
+		assertEquals(
+			MongoBsonSupport.toDocument( expected ),
+			MongoBsonSupport.toDocument( actual )
+		);
 
 	}
 
@@ -581,6 +599,7 @@ class MongoDriverDelegationTest {
 	void automatedEmbeddingVectorQueryUsesDriverQueryShape() throws Exception {
 
 		ReactiveMongoDsl<String> dsl = new ReactiveMongoDsl<>( ignored -> context() );
+
 		var builder = dsl
 			.executeEntity( TestEntity.class, "test" )
 			.vectorSearch( "vector-index" )
@@ -590,19 +609,38 @@ class MongoDriverDelegationTest {
 			.limit( 5 )
 			.exact();
 
-		Method buildVectorSearchStage = builder.getClass().getDeclaredMethod( "buildVectorSearchStage", Optional.class );
+		Method buildVectorSearchStage = builder
+			.getClass()
+			.getDeclaredMethod(
+				"buildVectorSearchStage",
+				Optional.class,
+				Optional.class
+			);
+
 		buildVectorSearchStage.setAccessible( true );
-		Bson actual = (Bson) buildVectorSearchStage.invoke( builder, Optional.empty() );
+
+		Bson actual = (Bson) buildVectorSearchStage
+			.invoke(
+				builder,
+				Optional.empty(),
+				Optional.empty()
+			);
+
 		Bson expected = Aggregates
 			.vectorSearch(
 				SearchPath.fieldPath( "content" ),
-				VectorSearchQuery.textQuery( "mongodb reactive driver" ).model( "voyage-4-large" ),
+				VectorSearchQuery
+					.textQuery( "mongodb reactive driver" )
+					.model( "voyage-4-large" ),
 				"vector-index",
 				5L,
 				VectorSearchOptions.exactVectorSearchOptions()
 			);
 
-		assertEquals( MongoBsonSupport.toDocument( expected ), MongoBsonSupport.toDocument( actual ) );
+		assertEquals(
+			MongoBsonSupport.toDocument( expected ),
+			MongoBsonSupport.toDocument( actual )
+		);
 
 	}
 

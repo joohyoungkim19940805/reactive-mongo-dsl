@@ -105,6 +105,13 @@ public interface MongoExecutionContext {
 	default Object getSessionScope() { return this; }
 
 	/**
+	 * Returns a stable application-defined scope key for state shared across load-balanced
+	 * application instances. The same physical MongoDB cluster/tenant should return the same value
+	 * on every instance. Process-local stores do not require this value.
+	 */
+	default String getDistributedStateScopeKey() { return null; }
+
+	/**
 	 * Returns an environment-specific native object represented by this context.
 	 * Framework adapters can expose their own native Mongo object without leaking that framework
 	 * dependency into the DSL core.

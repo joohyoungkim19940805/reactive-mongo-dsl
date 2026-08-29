@@ -42,6 +42,7 @@ Maven:
 - Project Reactor
 - Atlas Search 기능 사용 시 MongoDB Atlas Search index
 - Vector Search 기능 사용 시 MongoDB Vector Search index
+- Change Stream 기반 cursor invalidation / reservation / embedded sync 사용 시 해당 MongoDB 환경에서 Change Stream 사용 가능
 - Spring Data MongoDB 연동 시 애플리케이션 측 Reactive MongoDB 구성 (`ReactiveMongoTemplate`, `MongoClient`)
 
 Spring Data MongoDB는 코어 필수 의존성이 아닙니다. Spring 애플리케이션에서도 사용할 수 있지만, DSL 자체의 실행 계약은 `MongoExecutionContext`와 MongoDB Reactive Streams Driver를 기준으로 합니다.
@@ -889,6 +890,220 @@ builder 스타일도 지원합니다.
 
 ---
 
+### 페이지 번호를 유지하는 cursor anchor 페이징
+
+`findAll()`의 cursor 기능은 일반 페이징 terminal과 한 레벨에 섞지 않고 `paging()`에서 전략을 먼저 선택합니다. 페이지 번호 UI를 유지하면서 store-backed anchor로 deep skip 비용을 줄이려면 `pageNumberCursor(...)`를 선택합니다.
+
+```java
+Flux<User> users = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort
+        .desc("createdAt")
+        .desc("id")
+    )
+    .paging()
+    .pageNumberCursor(20, 50)
+    .execute();
+```
+
+`pageNumber`는 기존 일반 페이징과 동일하게 0-based입니다. 기존 일반 페이징 API는 바뀌지 않습니다.
+
+```java
+// 기존 일반 page-number paging 그대로 유지
+.findAll()
+.paging()
+    .pageNumber(20)
+    .pageSize(50)
+    .and()
+.execute();
+```
+
+page-number cursor도 builder 형태로 각각 지정할 수 있습니다.
+
+```java
+.findAll()
+.sorts(sort -> sort.desc("createdAt"))
+.paging()
+.pageNumberCursor()
+    .pageNumber(20)
+    .pageSize(50)
+    .execute();
+```
+
+전략을 선택한 뒤에는 해당 전략에 필요한 API만 노출됩니다. `skipPolicy()`는 `pageNumberCursor()`에서만 사용할 수 있고, 아래의 page-number 없는 `cursor()` builder에는 노출되지 않습니다.
+
+내부적으로는 현재 query signature에 대해 가장 가까운 이전 anchor를 찾고, 그 anchor부터 필요한 상대 구간만 이동합니다.
+
+```text
+pageNumber/pageSize + filter + sort + namespace version
+    -> cursor query key 생성
+    -> 현재 page 이하에서 가장 가까운 anchor 조회
+    -> anchor가 있으면 anchor 조건 + 상대 skip
+    -> pageSize + 1건 조회
+    -> 현재 page 시작점 / 다음 page 시작점 anchor 저장
+```
+
+처음 요청하는 deep page에 가까운 anchor가 없을 때의 동작은 `skipPolicy()`로 제어합니다. 기본값은 `maxRelativeSkip=5,000` + `CursorSkipExceededAction.FAIL`이며, 상대 이동량이 한도를 넘으면 business collection query를 실행하기 전에 `CursorSkipLimitExceededException`을 반환합니다.
+
+```java
+Flux<User> users = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort.desc("createdAt"))
+    .paging()
+    .pageNumberCursor(99999, 20)
+    .skipPolicy()
+        .maxRelativeSkip(10_000)
+        .onExceeded(CursorSkipExceededAction.RETURN_EMPTY)
+        .end()
+    .execute();
+```
+
+`onExceeded(...)` 선택지는 다음과 같습니다.
+
+- `FAIL`: business collection query를 실행하지 않고 `CursorSkipLimitExceededException`을 반환합니다. 기본값입니다.
+- `RETURN_EMPTY`: business collection query를 실행하지 않고 빈 결과를 반환합니다. 실제 데이터가 존재해도 빈 결과가 될 수 있으므로 이 의미를 의도한 API에서만 사용하는 것이 좋습니다.
+- `EXECUTE_ANYWAY`: 한도를 넘어도 nearest anchor부터 계산된 relative skip을 그대로 실행합니다. 큰 skip 비용은 이 정책을 명시적으로 선택한 호출 측 책임이 됩니다.
+
+따라서 `pageNumber=99999` 자체를 금지하는 것이 아니라 **nearest anchor부터 실제로 필요한 row skip**을 기준으로 정책을 적용합니다. 이미 가까운 anchor가 있으면 높은 page number도 낮은 비용으로 실행할 수 있습니다.
+
+정렬 규칙:
+
+- sort를 생략하면 `_id: -1`을 사용합니다.
+- 사용자가 지정한 sort에 `_id`가 없으면 안정적인 tie-breaker로 `_id: -1`을 뒤에 자동 추가합니다.
+- cursor anchor를 만들 수 있도록 각 sort 값은 일반적인 numeric ascending/descending (`1` / `-1`) 형태여야 합니다.
+- meta sort처럼 cursor 값 비교 의미가 불명확한 sort는 page-number cursor에서 지원하지 않습니다.
+- `customizeQuery(...)`는 filter/sort 의미를 DSL이 확정할 수 없으므로 cursor paging과 함께 사용할 수 없습니다.
+
+`PageStream<T>` 형태가 필요하면 선택된 page-number cursor builder에서 `executePageStream()`을 사용합니다.
+
+```java
+PageStream<User> page = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort.desc("createdAt"))
+    .paging()
+    .pageNumberCursor(20, 50)
+    .executePageStream();
+```
+
+#### anchor admission / TTL 기본값
+
+기본 in-memory state store는 모든 일회성 query를 무조건 캐시에 보관하지 않고 접근 패턴을 보고 anchor 저장을 admission합니다. 기본 `CursorCacheOptions.defaults()`는 다음과 같습니다.
+
+| 옵션 | 기본값 | 의미 |
+| --- | ---: | --- |
+| `admissionWindow` | 10초 | hot query 판정 window |
+| `admissionThreshold` | 4회 | window 안에서 이 횟수 이상 접근하면 admission |
+| `idleTtl` | 1분 | 사용되지 않은 anchor/query state 만료 기준 |
+| `maxQueries` | 10,000 | in-memory query state 상한 |
+| `maxAnchorsPerQuery` | 256 | in-memory query별 anchor 상한 |
+| `deepPageSkipThreshold` | 5,000 | 예상 skip이 이 값 이상이면 즉시 admission |
+| `expirationTick` | 1초 | in-memory expiration wheel tick |
+| `expirationWheelSize` | 512 | expiration wheel slot 수 |
+| `maxRelativeSkip` | 5,000 | page-number cursor에서 nearest anchor부터 허용하는 최대 상대 row skip |
+| `skipExceededAction` | `FAIL` | 상대 skip 한도 초과 시 `FAIL` / `RETURN_EMPTY` / `EXECUTE_ANYWAY` 중 수행할 동작 |
+| `maxPageSize` | 500 | cursor API가 한 요청에서 허용하는 최대 page size |
+| `tokenTtl` | 10분 | store-backed opaque cursor token TTL |
+
+MongoDB-backed state store도 같은 admission 옵션과 idle TTL을 사용하지만, 현재 구현은 MongoDB에 저장된 query별 anchor를 `maxAnchorsPerQuery` 기준으로 서버에서 즉시 prune하지는 않습니다. MongoDB 쪽 오래된 anchor 정리는 TTL을 기준으로 이루어집니다.
+
+외부 변경으로 stale anchor가 재사용되지 않도록 cursor query key에는 collection namespace version이 포함됩니다. Change Stream이 collection 변경을 관측하면 해당 namespace version이 증가하고, 이후 요청은 새로운 query key를 사용합니다. state store와 Change Stream 구성은 뒤의 **공통 상태 저장소**와 **공유 Change Stream** 섹션에서 설명합니다.
+
+안전 제한만 조정하려면 기존 admission/TTL 설정을 유지한 채 다음처럼 복사할 수 있습니다.
+
+```java
+CursorCacheOptions cursorOptions = CursorCacheOptions
+    .defaults()
+    .withSafety(
+        50_000L,                         // maxRelativeSkip
+        CursorSkipExceededAction.FAIL,  // 한도 초과 동작
+        200,                             // maxPageSize
+        Duration.ofMinutes(5)            // tokenTtl
+    );
+```
+
+page-number cursor의 skip 정책만 전역 기본값으로 바꾸려면 admission/TTL 설정을 유지한 채 다음처럼 설정할 수 있습니다.
+
+```java
+CursorCacheOptions cursorOptions = CursorCacheOptions
+    .defaults()
+    .withCursorSkipPolicy(
+        20_000L,
+        CursorSkipExceededAction.RETURN_EMPTY
+    );
+```
+
+`paging().pageNumberCursor(...).skipPolicy()`를 지정하면 이 store/global 기본값보다 query 설정이 우선합니다. 지정하지 않으면 `CursorCacheOptions`의 값이 그대로 적용됩니다.
+
+### 페이지 번호 없는 store-backed opaque cursor
+
+무한스크롤/더보기처럼 임의 page number 이동이 필요하지 않다면 같은 `paging()` 진입점에서 `cursor()` 전략을 선택합니다. 이 builder에는 `pageNumber(...)`나 `skipPolicy()`가 노출되지 않습니다.
+
+첫 요청:
+
+```java
+CursorPage<User> first = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort.desc("createdAt"))
+    .paging()
+    .cursor(50)
+    .execute()
+    .block();
+```
+
+다음 요청은 이전 응답의 opaque token을 `after(...)`에 그대로 전달합니다.
+
+```java
+CursorPage<User> second = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort.desc("createdAt"))
+    .paging()
+    .cursor(50)
+    .after(first.nextCursor())
+    .execute()
+    .block();
+```
+
+`cursor()`도 page size를 builder에서 나중에 지정할 수 있습니다.
+
+```java
+.paging()
+.cursor()
+    .pageSize(50)
+    .after(token)
+    .execute();
+```
+
+`CursorPage<T>`는 `data()`, `nextCursor()`, `hasNext()`를 제공합니다. 이 방식은 page number를 계산하거나 MongoDB `skip`을 사용하지 않습니다. token은 다음 페이지 시작점의 sort tuple 자체를 클라이언트에 노출하지 않고 state store에 저장한 뒤 opaque id만 반환합니다. 클라이언트가 임의로 매우 긴 값을 보내 state store lookup 비용으로 증폭시키지 못하도록 라이브러리가 발급하는 64자리 lowercase hex token 형식이 아니면 store 조회 전에 거부합니다.
+
+token state에는 physical DB/collection namespace, query/filter/sort 의미, page size, sort tuple이 함께 묶입니다. 따라서 DSL은 다음을 거부합니다.
+
+- 임의의 문자열/만료된 token
+- 다른 DB/collection 또는 다른 filter/sort query에서 발급된 token
+- 발급 당시와 다른 page size로 재사용하는 token
+
+순수 keyset token은 page-number anchor와 달리 collection write마다 무효화하지 않습니다. token 자체가 특정 sort 위치를 가리키므로 데이터가 변경된 뒤에도 그 위치부터 **현재 데이터 기준으로** 계속 진행합니다. 따라서 이 API는 snapshot isolation을 제공하는 cursor가 아닙니다. 요청 사이에 이미 지나간 영역에 데이터가 추가/삭제되면 그 영역을 자동으로 다시 보여주지는 않는 일반적인 keyset pagination 의미를 가집니다.
+
+token id는 같은 query/같은 다음 위치에 대해 deterministic하게 생성되고 store에는 upsert됩니다. 따라서 같은 페이지를 반복 조회한다고 매번 새로운 token document가 추가되지는 않습니다. token document는 `tokenTtl` 이후 만료됩니다.
+
+높은 위치에서 발급된 token도 DB에서는 `sort tuple 이후 조건 + limit(pageSize + 1)`로 실행되므로 높은 page number에 비례하는 `skip` 비용이 생기지 않습니다. 다만 동일 token을 초당 수천 번 호출하는 **요청량 자체의 공격**은 계정/IP/API key 정보를 모르는 라이브러리가 완전히 해결할 수 없으므로 HTTP/API rate limiting은 사용하는 애플리케이션에서도 적용해야 합니다. 또한 keyset filter/sort가 효율적으로 동작하도록 cursor sort에 맞는 MongoDB index를 구성해야 합니다.
+
+---
+
 ### `PageStream<T>`
 
 data를 `List`로 먼저 모으지 않고 `Flux` 상태로 유지하고 싶으면 `executePageStream()`을 사용합니다.
@@ -1267,6 +1482,162 @@ History 저장은 save lifecycle hook을 호출하지 않습니다.
 
 ---
 
+## Embedded snapshot 동기화
+
+MongoDB 문서 안에 다른 엔티티의 스냅샷을 denormalize해서 저장하는 구조에서는 canonical source가 바뀔 때 embedded copy도 같이 갱신해야 할 수 있습니다. `EmbeddedSyncConfig<K>`는 이 관계를 DSL singleton 생성 시 등록하고, shared Change Stream을 기준으로 source 변경을 target 문서에 반영합니다.
+
+이 기능은 query builder에 `syncEmbedded(...)` 같은 상태ful API를 추가하지 않습니다. 관계 정의는 별도 configuration object로 구성해서 `ReactiveMongoDsl` 생성자에 주입합니다.
+
+### 기본 관계 정의
+
+```java
+EmbeddedSyncConfig<MongoTemplateName> embeddedSync =
+    new EmbeddedSyncConfig<MongoTemplateName>()
+        .forKeys(MongoTemplateName.FRONT)
+        .from(Order.class)
+        .into(User.class, "orders")
+        .linkBy()
+            .fromField("userId")
+            .intoField("id")
+            .end()
+        .build();
+
+ReactiveMongoDsl<MongoTemplateName> dsl =
+    new ReactiveMongoDsl<>(resolver, embeddedSync);
+```
+
+관계 방향은 다음 의미입니다.
+
+```text
+from(Order.class)       = canonical source
+into(User.class, ...)   = source snapshot을 보관하는 target
+```
+
+위 예에서는 `Order.userId`와 `User._id`를 연결하고, Order의 현재 BSON snapshot을 User의 `orders` 필드에 동기화합니다. `intoField("id")`처럼 `id` path를 사용하면 일반 DSL과 동일하게 `_id`로 정규화됩니다. id alias에 연결되는 source 값이 유효한 24자리 hex String이면 ObjectId 비교가 가능하도록 변환됩니다.
+
+한 관계에 link pair를 여러 개 둘 수도 있습니다.
+
+```java
+.linkBy()
+    .fromField("tenantId")
+    .intoField("tenantId")
+    .fromField("userId")
+    .intoField("id")
+    .end()
+```
+
+`linkBy()`를 생략할 수도 있지만 의미가 다릅니다. explicit link가 없으면 source `_id`를 이미 포함하고 있는 target embedded field를 찾아 **기존 참조의 update/delete**는 할 수 있지만, 새 source insert가 어느 target에 새로 연결되어야 하는지는 알 수 없습니다. 새로운 association을 insert 시점부터 자동 생성해야 한다면 `linkBy()`를 명시해야 합니다.
+
+### target field와 cardinality
+
+명시적으로 field를 지정할 수 있습니다.
+
+```java
+.from(Profile.class)
+.into(Account.class, "profile")
+.build();
+```
+
+또는 target 타입에 source를 담을 수 있는 field가 정확히 하나라면 field 이름을 생략할 수 있습니다.
+
+```java
+.from(Profile.class)
+.into(Account.class)
+.build();
+```
+
+field를 생략했는데 호환되는 후보가 없거나 여러 개라면 build 단계에서 실패하므로 애매한 관계를 임의로 선택하지 않습니다.
+
+cardinality는 target field의 Java metadata에서 추론합니다.
+
+| target field 형태 | cardinality | 동기화 방식 |
+| --- | --- | --- |
+| `SourceType field` | SINGLE | `$set` / `$unset` |
+| `Collection<SourceType> field` | COLLECTION | array upsert/update / `$pull` |
+| `Map<String, SourceType> field` 등 | MAP | map entry upsert/remove pipeline |
+
+MAP 관계는 source의 어느 값을 map key로 사용할지 반드시 지정해야 합니다.
+
+```java
+.from(Address.class)
+.into(User.class, "addresses")
+.mapKey("type")
+.linkBy()
+    .fromField("userId")
+    .intoField("id")
+    .end()
+.build();
+```
+
+실제 map key 값은 MongoDB field key로 사용할 수 있어야 하므로 blank, `.` 포함, `$`로 시작하는 값은 허용되지 않습니다.
+
+### INSERT / UPDATE / REPLACE / DELETE 처리
+
+Embedded sync는 source collection의 다음 Change Stream operation을 처리합니다.
+
+- `INSERT`
+- `UPDATE`
+- `REPLACE`
+- `DELETE`
+
+UPDATE/REPLACE에서는 현재 source 문서를 `_id`로 다시 읽어 최신 snapshot을 사용합니다. 같은 relation/source id의 짧은 연속 변경은 내부 coalesce window에서 합쳐집니다.
+
+Target 갱신은 target 엔티티 전체를 읽어서 `save()`하는 방식이 아니라 MongoDB atomic update/pipeline으로 수행합니다. 따라서 target의 unrelated field를 read-modify-write로 덮어쓰지 않습니다.
+
+link 값이 바뀌어 source가 target A에서 target B로 이동하는 경우에는 현재 target에 snapshot을 반영한 뒤 이전 target에 남아 있는 stale reference도 정리합니다.
+
+source delete의 기본 정책은 `EmbeddedDeletePolicy.REMOVE`입니다.
+
+```java
+.onDelete(EmbeddedDeletePolicy.REMOVE)
+```
+
+삭제 이벤트를 embedded snapshot에 반영하지 않으려면:
+
+```java
+.onDelete(EmbeddedDeletePolicy.IGNORE)
+```
+
+를 사용할 수 있습니다.
+
+### multi-hop과 관계 graph 검증
+
+예를 들어:
+
+```text
+C -> B.children
+B -> A.child
+```
+
+처럼 여러 관계를 등록하면 C 변경으로 B가 갱신되고, 그 B 변경이 다시 Change Stream에 나타나 downstream A 관계까지 이어질 수 있습니다.
+
+등록 시에는 resolver key별 directed graph를 검사합니다.
+
+- `A -> B -> C` 같은 DAG는 허용됩니다.
+- 실제 directed cycle (`A -> B -> A`, `A -> B -> C -> A`)은 거부됩니다.
+- 관계가 없는 별도 edge가 반대 방향을 가진다는 이유만으로 거부하지 않습니다.
+- 같은 target class + target field path에는 서로 다른 source owner를 동시에 등록할 수 없습니다.
+- 같은 resolver key에 등록한 관계는 그 key가 가리키는 Mongo execution context 안에서 동작하며 다른 DB로 자동 복사하는 기능이 아닙니다.
+
+### 기존 데이터와 startup 동작
+
+관계를 등록했다고 기존 collection 전체를 startup 시 자동 full-scan/reconciliation하지는 않습니다. 등록 이후 Change Stream으로 관측되는 변경을 기준으로 동기화합니다.
+
+이미 오래된 embedded snapshot이 존재하거나 신규 관계 도입 전에 생성된 데이터를 모두 맞춰야 한다면, 애플리케이션에서 별도의 명시적 backfill/reconciliation job을 실행해야 합니다. 라이브러리가 startup마다 대규모 collection scan을 숨겨서 실행하지 않습니다.
+
+### 멀티 인스턴스와 lease
+
+동일 relation을 여러 애플리케이션 인스턴스가 동시에 처리하지 않도록 embedded sync는 `EmbeddedSyncLeaseStore`를 사용합니다. `EmbeddedSyncConfig`에 별도 lease store를 주지 않으면 `ReactiveMongoDsl`의 unified state store가 lease에도 사용됩니다.
+
+```java
+EmbeddedSyncConfig<MongoTemplateName> embeddedSync =
+    new EmbeddedSyncConfig<>(customLeaseStore);
+```
+
+기본 in-memory state store는 process-local이므로 단일 프로세스에서는 충분하지만, load balancing / multi-instance 환경에서 노드 간 lease를 공유해야 하면 MongoDB-backed state store 또는 직접 구현한 distributed store를 사용해야 합니다. 이 경우 모든 노드가 같은 logical Mongo scope에 대해 동일한 `MongoExecutionContext#getDistributedStateScopeKey()`를 반환해야 합니다.
+
+---
+
 ## 트랜잭션: `getTxJob(...)`
 
 현재 버전은 Spring `TransactionalOperator`가 아니라 MongoDB `ClientSession` transaction을 직접 사용합니다.
@@ -1313,6 +1684,223 @@ Spring adapter를 사용해도 DSL transaction의 동작 방식은 바뀌지 않
 따라서 Spring `@Transactional` 블록 안에서 DSL을 호출했다고 해서 DSL operation이 Spring이 바인딩한 Mongo session에 자동 참여한다고 가정하면 안 됩니다. 반대로 `getTxJob(...)` 안에서 `ReactiveMongoTemplate`이나 Spring Data Repository를 호출한다고 해서 해당 Spring operation이 DSL session을 자동 사용한다고 가정해서도 안 됩니다.
 
 DSL operation끼리 transaction을 구성할 때는 `getTxJob(...)`을 사용하고, Spring Data Template/Repository operation끼리 transaction을 구성할 때는 Spring의 transaction infrastructure를 사용합니다. 두 방식을 하나의 transaction으로 혼합해야 하는 경우에는 session 연동을 애플리케이션에서 명시적으로 설계해야 합니다.
+
+---
+
+## 공통 상태 저장소: cursor / Change Stream / embedded lease
+
+Cursor anchor/namespace version, Change Stream resume checkpoint, embedded-sync lease는 서로 다른 기능이지만 운영 관점에서는 모두 DSL의 장기 상태입니다. 기본 생성자는 이 세 기능에 하나의 `InMemoryReactiveMongoDslStateStore`를 사용합니다.
+
+```java
+ReactiveMongoDsl<MongoTemplateName> dsl =
+    new ReactiveMongoDsl<>(resolver);
+```
+
+이 기본값은 **process-local**입니다. 단일 프로세스에서는 별도 인프라 없이 사용할 수 있지만, load balancer 뒤에 여러 인스턴스가 있는 환경에서 노드 간 cursor state/checkpoint/lease를 공유하지는 않습니다.
+
+### 하나의 unified state store 주입
+
+공유 backend를 사용할 때는 `ReactiveMongoDslStateStore` 하나를 주입할 수 있습니다.
+
+```java
+ReactiveMongoDslStateStore stateStore = ...;
+
+ReactiveMongoDsl<MongoTemplateName> dsl =
+    new ReactiveMongoDsl<>(resolver, stateStore);
+```
+
+Embedded sync도 함께 사용하면:
+
+```java
+ReactiveMongoDsl<MongoTemplateName> dsl =
+    new ReactiveMongoDsl<>(resolver, embeddedSync, stateStore);
+```
+
+기본적으로 이 state store 하나가 다음 역할을 모두 담당합니다.
+
+- cursor anchor 저장 / 조회
+- opaque cursor token 저장 / 조회 / TTL
+- collection namespace version 저장 / invalidation
+- Change Stream resume checkpoint 저장
+- embedded-sync distributed lease
+
+고급 사용자가 기능별 backend를 의도적으로 분리하고 싶다면 각 SPI 구현을 `ReactiveMongoDslStateStore.of(...)`로 합칠 수 있습니다.
+
+```java
+ReactiveMongoDslStateStore stateStore = ReactiveMongoDslStateStore.of(
+    cursorAnchorStore,
+    changeStreamCheckpointStore,
+    embeddedSyncLeaseStore
+);
+```
+
+즉 backend는 in-memory/MongoDB로 고정된 API가 아닙니다. `ReactiveMongoDslStateStore` 또는 개별 SPI를 구현하면 Redis나 별도 저장소 등 다른 backend도 연결할 수 있습니다. 현재 코어에 내장된 unified 구현은 in-memory와 MongoDB입니다. 직접 `CursorAnchorStore`를 구현하는 경우 page-number anchor 기능만 필요하면 기존 `floor/put` 계약으로 충분하지만, `paging().cursor(...)` opaque token 기능까지 사용하려면 `putToken(...)` / `resolveToken(...)`도 구현해야 합니다.
+
+### MongoDB-backed unified state store
+
+동일 MongoDB 또는 별도 state DB에 상태를 두려면 `MongoReactiveMongoDslStateStore`를 사용할 수 있습니다.
+
+```java
+MongoExecutionContext context = resolver.getTemplate(MongoTemplateName.FRONT);
+
+ReactiveMongoDslStateStore stateStore =
+    new MongoReactiveMongoDslStateStore(context);
+
+ReactiveMongoDsl<MongoTemplateName> dsl =
+    new ReactiveMongoDsl<>(resolver, stateStore);
+```
+
+기본 state collection 이름은:
+
+```text
+__reactive_mongo_dsl_state
+```
+
+이며 하나의 collection 안에서 cursor anchor, opaque cursor token, namespace version, Change Stream checkpoint, embedded-sync lease를 kind별 document로 저장합니다.
+
+기본적으로 다음 index를 보장합니다.
+
+- `expiresAt` TTL index (`expireAfter=0`)
+- cursor floor 조회용 `(kind, queryKey, pageNumber desc)` compound index
+
+옵션을 직접 지정할 수 있습니다.
+
+```java
+MongoReactiveMongoDslStateStoreOptions options =
+    new MongoReactiveMongoDslStateStoreOptions(
+        "__reactive_mongo_dsl_state",
+        CursorCacheOptions.defaults(),
+        true,
+        "front-consumer-a"
+    );
+
+ReactiveMongoDslStateStore stateStore =
+    new MongoReactiveMongoDslStateStore(context, options);
+```
+
+`changeStreamConsumerId`는 Change Stream resume token을 logical consumer별로 분리합니다. `null`이면 store instance마다 process-unique UUID를 사용하므로 동시에 실행 중인 여러 노드가 하나의 checkpoint id를 서로 덮어쓰지 않습니다. 특정 logical consumer가 process restart 후에도 이전 token에서 resume해야 한다면 **재시작 전후에는 안정적이면서 동시에 활성화된 다른 consumer와는 겹치지 않는 값**을 명시적으로 사용해야 합니다.
+
+Checkpoint document는 현재 7일 TTL을 사용합니다. cursor anchor는 `CursorCacheOptions.idleTtl()`을 기준으로 만료됩니다. namespace invalidation은 Change Stream `clusterTime`을 함께 저장해 동일하거나 더 오래된 이벤트가 재전달되어도 version을 다시 증가시키지 않도록 처리합니다.
+
+State store가 **실제로 같은 watched Mongo scope**에 있을 때는 내부 state collection을 database Change Stream pipeline에서 제외해 다음과 같은 feedback loop를 막습니다.
+
+```text
+state write
+ -> Change Stream event
+ -> state invalidation/checkpoint write
+ -> 다시 Change Stream event
+ -> ...
+```
+
+같은 DB에 둘 경우 `MongoExecutionContext`를 받는 `MongoReactiveMongoDslStateStore` 생성자를 사용하면 session scope까지 비교할 수 있어 이 판별이 가장 명확합니다.
+
+### `distributedStateScopeKey`
+
+Distributed state store는 프로세스 identity가 아니라 여러 노드에서 공유 가능한 stable namespace가 필요합니다. `MongoExecutionContext#getDistributedStateScopeKey()`가 그 역할을 합니다.
+
+같은 logical Mongo scope를 처리하는 모든 노드는 같은 값을 반환해야 하고, 서로 다른 cluster/tenant/logical DB가 우연히 같은 state를 공유하지 않도록 범위별로 다른 값을 사용해야 합니다.
+
+Custom `MongoExecutionContext`에서는 예를 들어:
+
+```java
+@Override
+public String getDistributedStateScopeKey() {
+    return "auction-front-prod";
+}
+```
+
+처럼 정의할 수 있습니다. `DriverMongoExecutionContext`도 explicit `distributedStateScopeKey`를 받는 생성자를 제공합니다.
+
+Distributed cursor/checkpoint/lease store를 사용하면서 이 값이 없으면 DSL은 조용히 process-local key로 추측하지 않고 해당 기능 초기화 시 오류를 발생시킵니다.
+
+---
+
+## 공유 Change Stream
+
+`ReactiveMongoDsl`은 cursor invalidation, embedded sync, query reservation, 직접 watch가 각각 MongoDB Change Stream을 따로 열지 않도록 `ChangeStreamHub`를 공유합니다.
+
+Public facade:
+
+```java
+Flux<ChangeStreamDocument<Document>> databaseChanges =
+    dsl.changeStreams().watch(MongoTemplateName.FRONT);
+
+Flux<ChangeStreamDocument<Document>> userChanges =
+    dsl.changeStreams().watch(MongoTemplateName.FRONT, User.class);
+
+Flux<ChangeStreamDocument<Document>> rawCollectionChanges =
+    dsl.changeStreams().watch(MongoTemplateName.FRONT, "user");
+```
+
+같은 session scope + database의 collection watch들은 하나의 database-wide physical stream을 공유하고 collection별 filtered view를 받습니다.
+
+### checkpoint와 최초 구독 경계
+
+Shared stream이 처음 준비될 때 MongoDB operation time을 기준점으로 확보합니다.
+
+- 저장된 checkpoint가 있으면 `resumeAfter(resumeToken)`을 사용합니다.
+- checkpoint가 없으면 `startAtOperationTime(initialOperationTime)`을 사용합니다.
+
+따라서 subscriber 등록과 실제 MongoDB server-side Change Stream cursor open 사이에 write가 발생하는 초기화 race에서 이벤트를 놓치지 않도록 합니다.
+
+내부 처리는 작은 batch로 묶습니다. 현재 구현은 최대 256 events 또는 10ms window를 사용하며, cursor namespace invalidation처럼 collection 단위로 합칠 수 있는 내부 작업은 batch observer에서 coalesce합니다. checkpoint도 event마다 쓰지 않고 batch에서 마지막으로 resume 가능한 token을 저장합니다.
+
+중요한 점은 **사용자에게 노출되는 Change Stream event 자체를 합치는 것이 아니라 내부 state side effect만 batch 처리한다는 것**입니다. `changeStreams().watch(...)` subscriber에는 원래 event가 다시 개별 순서대로 전달됩니다.
+
+Internal observer/batch observer가 실패하면 그 batch의 checkpoint를 먼저 앞으로 보내지 않습니다. 재연결 시 이미 checkpoint 뒤로 숨은 이벤트가 되지 않도록 observer 처리가 checkpoint보다 먼저 완료됩니다.
+
+### `reservationChangeStream()`: 변경 시 finite query 재실행
+
+`findAll()` query 결과를 변경 시점마다 다시 받고 싶으면 query reservation을 사용할 수 있습니다.
+
+```java
+Flux<List<User>> snapshots = dsl
+    .executeEntity(User.class, MongoTemplateName.FRONT)
+    .fields(pair("status", "ACTIVE"))
+    .end()
+    .findAll()
+    .sorts(sort -> sort.desc("createdAt"))
+    .reservationChangeStream()
+    .coalesce(Duration.ofMillis(100))
+    .execute();
+```
+
+이 stream은:
+
+1. 최초 finite query snapshot을 한 번 emit하고
+2. dependency collection의 Change Stream event를 기다린 뒤
+3. 변경이 발생하면 같은 finite query를 다시 실행해 새 snapshot을 emit합니다.
+
+기본 coalesce window는 50ms이며 `Duration.ZERO`로 비활성화할 수 있습니다.
+
+추가 dependency도 지정할 수 있습니다.
+
+```java
+.reservationChangeStream()
+.watch(Profile.class)
+.watch(MongoTemplateName.BACK, Audit.class)
+.watch(MongoTemplateName.FRONT, "external_status")
+.execute();
+```
+
+제공 terminal:
+
+- `.changes()` / `.invalidations()` : dependency Change Stream event 자체
+- `.execute()` : 일반 finite query 재실행
+- `.executeLookup(right, spec)` : lookup finite query 재실행
+
+Page-number cursor snapshot 재조회는 cursor 전략을 선택한 뒤 `.reservationChangeStream().execute()` 또는 `.executeLookup(right, spec)`를 사용합니다.
+
+```java
+.paging()
+.pageNumberCursor(20, 50)
+.reservationChangeStream()
+.execute();
+```
+
+Lookup reservation은 right collection과 `LookupSpec` 안의 nested `$lookup` dependency도 자동으로 watch 대상에 포함합니다.
+
+Reservation은 현재 query filter를 MongoDB Change Stream의 document-level `$match`로 자동 변환하는 기능이 아닙니다. **dependency collection에서 변경이 발생하면 query를 다시 실행하는 invalidation → pull 모델**입니다. 따라서 collection 변경 빈도가 높고 finite query가 무거운 경우에는 적절한 `coalesce(...)`, dependency 범위, query 비용을 함께 고려해야 합니다.
 
 ---
 
@@ -1403,6 +1991,57 @@ Mono<PageResult<ResultTuple<User, List<Order>>>> page =
 ```
 
 `$facet(data, count)` 형태로 data와 totalCount를 같이 반환합니다.
+
+---
+
+### lookup cursor 페이징
+
+Lookup도 left builder의 `paging()`에서 cursor 전략을 먼저 선택합니다.
+
+페이지 번호를 유지하는 lookup cursor:
+
+```java
+Flux<ResultTuple<User, List<Order>>> joined = left
+    .paging()
+    .pageNumberCursor(20, 50)
+    .executeLookup(right, spec);
+```
+
+`PageResult`와 total count가 같이 필요하면 같은 typed builder에서 `executeLookupAndCount(...)`를 사용합니다.
+
+```java
+Mono<PageResult<ResultTuple<User, List<Order>>>> page = left
+    .paging()
+    .pageNumberCursor(20, 50)
+    .executeLookupAndCount(right, spec);
+```
+
+anchor는 left builder의 `sorts(...)`와 선택한 `pageNumber/pageSize`를 기준으로 만들며, 기본 sort/tie-breaker/admission/skip policy 규칙은 일반 page-number cursor와 같습니다. `skipPolicy()`도 같은 builder에서 사용할 수 있습니다.
+
+Lookup cursor query signature에는 left filter/sort/page size뿐 아니라 right collection/criteria, `LookupSpec` pipeline/outer stage/unwind, nested `$lookup` dependency namespace version까지 포함됩니다. 따라서 join된 right collection 변경으로 left 결과 집합이나 lookup 결과가 달라져도 기존 page-number anchor를 stale 상태로 재사용하지 않습니다.
+
+page number가 필요 없는 lookup은 `cursor()` 전략에서 동일한 terminal 이름 `executeLookup(...)`을 사용합니다.
+
+```java
+CursorPage<ResultTuple<User, List<Order>>> first = left
+    .paging()
+    .cursor(50)
+    .executeLookup(right, spec)
+    .block();
+
+CursorPage<ResultTuple<User, List<Order>>> second = left
+    .paging()
+    .cursor(50)
+    .after(first.nextCursor())
+    .executeLookup(right, spec)
+    .block();
+```
+
+이 경로는 left sort tuple을 store-backed token으로 저장하며 `skip`을 사용하지 않습니다. token query fingerprint에는 right criteria, lookup pipeline 의미, left/right physical namespace identity도 포함되지만 page-number anchor처럼 Change Stream namespace version에는 묶지 않습니다.
+
+`customizeAggregation(...)`은 최종 lookup pipeline 의미를 DSL이 확정할 수 없으므로 lookup cursor와 함께 사용할 수 없습니다.
+
+내부 aggregation projection은 left/right class simple name을 BSON field alias로 직접 사용하지 않습니다. 따라서 left와 right가 동일한 class이거나 둘 다 `Document.class`인 lookup에서도 내부 projection key가 충돌하지 않으며, 최종 `ResultTuple`의 logical left/right name은 기존 방식대로 유지됩니다.
 
 ---
 
@@ -1810,6 +2449,23 @@ Spring Data MongoDB를 사용하는 경우에는 앞의 **Spring Data MongoDB �
 - `bindConditionFieldsLeftToObjectId(...)`는 left 값을 ObjectId로 변환합니다.
 - lookup `$expr` helper에서 `near`, `nearSphere`, `elemMatch`는 지원하지 않으며 `rawStage(Bson)`을 사용해야 합니다.
 
+### Cursor paging / state store / Change Stream
+
+- Page-number cursor의 상대 skip이 `maxRelativeSkip`을 넘으면 `skipExceededAction` 정책을 따릅니다. 기본값 `FAIL`은 business collection query 전에 차단하며, page-number cursor builder의 `skipPolicy()` 또는 global `CursorCacheOptions`로 `RETURN_EMPTY` / `EXECUTE_ANYWAY`를 선택할 수 있습니다. 페이지 번호 없는 opaque cursor는 `skip` 자체를 사용하지 않습니다.
+- Cursor sort는 deterministic한 numeric ascending/descending field로 구성해야 하며 `_id`가 없으면 tie-breaker로 `_id: -1`이 추가됩니다.
+- 기본 state store는 process-local입니다. multi-instance에서 cursor/checkpoint/embedded lease를 노드 간 공유하려면 distributed store와 stable `distributedStateScopeKey`를 사용해야 합니다.
+- MongoDB-backed state store의 `changeStreamConsumerId`를 여러 동시 consumer가 같은 값으로 공유하면 안 됩니다. 재시작 continuity가 필요한 consumer만 자신의 stable/unique id를 사용합니다.
+- `reservationChangeStream()`은 query filter를 Change Stream `$match`로 변환하지 않습니다. dependency collection 변경을 invalidation으로 보고 finite query를 다시 실행합니다.
+- Shared Change Stream 내부 state side effect는 batch 처리될 수 있지만 public watch event는 원래 event 단위로 전달됩니다.
+
+### Embedded snapshot sync
+
+- `from`이 canonical source이고 `into`가 snapshot target입니다. 방향을 반대로 등록하면 의미도 반대가 됩니다.
+- 신규 insert가 어느 target에 연결될지 알아야 하는 관계는 `linkBy()`를 명시해야 합니다.
+- relation graph의 directed cycle과 동일 target field의 multiple source owner는 등록 단계에서 거부됩니다.
+- registration은 startup full reconciliation이 아닙니다. 기존 데이터 backfill이 필요하면 별도 application job으로 명시적으로 수행해야 합니다.
+- multi-instance coordination은 lease store에 의존하며 기본 in-memory lease는 process-local입니다.
+
 ### Atlas Search
 
 - 실제 Atlas Search index가 먼저 구성되어 있어야 합니다.
@@ -1851,6 +2507,15 @@ Spring Data MongoDB를 사용하는 경우에는 앞의 **Spring Data MongoDB �
 - 업무키 기준 bulk upsert: `saveAllBulkUpsertByKey()`
 - 원자 update: `atomicUpdate()`
 - join: `executeLookup(...)`
+- 일반 page-number 페이징: 기존 `findAll().paging(pageNumber, pageSize)` 또는 `paging().pageNumber(...).pageSize(...).and()`
+- page-number cursor 페이징: `findAll().paging().pageNumberCursor(pageNumber, pageSize).execute()`
+- page number 없는 opaque cursor: `findAll().paging().cursor(pageSize).after(token).execute()`
+- lookup page-number cursor: `left.paging().pageNumberCursor(...).executeLookup(...)` / `executeLookupAndCount(...)`
+- lookup opaque cursor: `left.paging().cursor(...).after(token).executeLookup(...)`
+- 변경 시 finite query snapshot 재조회: `findAll().reservationChangeStream()`
+- 직접 Change Stream 구독: `changeStreams().watch(...)`
+- embedded snapshot 자동 동기화: `EmbeddedSyncConfig`
+- cursor/checkpoint/lease 공통 상태 backend: `ReactiveMongoDslStateStore`
 - 그룹 집계: `group(...)`
 - 실행 전 query/pipeline 확인: `preview()`
 - 실제 실행 계획 확인: `explain()`

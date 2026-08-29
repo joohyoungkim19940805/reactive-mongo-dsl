@@ -32,6 +32,8 @@ public class DriverMongoExecutionContext implements MongoExecutionContext {
 
 	private final Function<Object, Object> idResolver;
 
+	private final String distributedStateScopeKey;
+
 	public DriverMongoExecutionContext(
 										MongoClient mongoClient,
 										MongoDatabase mongoDatabase
@@ -68,11 +70,26 @@ public class DriverMongoExecutionContext implements MongoExecutionContext {
 										Function<Object, Object> idResolver
 	) {
 
+		this( mongoClient, mongoDatabase, collectionNameResolver, idResolver, null );
+
+	}
+
+	public DriverMongoExecutionContext(
+		MongoClient mongoClient,
+		MongoDatabase mongoDatabase,
+		Function<Class<?>, String> collectionNameResolver,
+		Function<Object, Object> idResolver,
+		String distributedStateScopeKey
+	) {
+
 		this.mongoClient = Objects.requireNonNull( mongoClient, "mongoClient must not be null" );
 		this.mongoDatabase = Objects.requireNonNull( mongoDatabase, "mongoDatabase must not be null" );
 		this.codecRegistry = MongoEntityCodecSupport.withPojoFallback( mongoDatabase.getCodecRegistry() );
 		this.collectionNameResolver = Objects.requireNonNull( collectionNameResolver, "collectionNameResolver must not be null" );
 		this.idResolver = Objects.requireNonNull( idResolver, "idResolver must not be null" );
+		this.distributedStateScopeKey = distributedStateScopeKey == null || distributedStateScopeKey.isBlank()
+			? null
+			: distributedStateScopeKey.trim();
 
 	}
 
@@ -179,6 +196,9 @@ public class DriverMongoExecutionContext implements MongoExecutionContext {
 
 	@Override
 	public Object getSessionScope() { return mongoClient; }
+
+	@Override
+	public String getDistributedStateScopeKey() { return distributedStateScopeKey; }
 
 	@Override
 	public Object getNative() { return mongoDatabase; }
