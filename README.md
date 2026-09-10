@@ -10,7 +10,7 @@ The `reactive-mongo-dsl` core does not directly depend on Spring Data MongoDB. M
 
 The current source version in `build.gradle` is:
 
-- `reactive-mongo-dsl`: `1.0.0`
+- `reactive-mongo-dsl`: `1.1.0-alpha.1`
 - Java: 21+
 - MongoDB Java Driver BOM: `5.10.0`
 - Reactor BOM: `2025.0.7`
