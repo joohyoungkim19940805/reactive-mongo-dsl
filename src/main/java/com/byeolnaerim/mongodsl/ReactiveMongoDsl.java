@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -71,7 +72,10 @@ import com.byeolnaerim.mongodsl.sync.EmbeddedSyncEngine;
 import com.byeolnaerim.mongodsl.sync.EmbeddedSyncLeaseStore;
 import com.byeolnaerim.mongodsl.sync.InMemoryEmbeddedSyncLeaseStore;
 import com.mongodb.ExplainVerbosity;
+import com.mongodb.ReadConcern;
 import com.mongodb.ReadPreference;
+import com.mongodb.TransactionOptions;
+import com.mongodb.WriteConcern;
 import com.mongodb.bulk.BulkWriteResult;
 import com.mongodb.client.model.Accumulators;
 import com.mongodb.client.model.Aggregates;
@@ -409,13 +413,40 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 		K key, Supplier<? extends Mono<? extends T>> supplier
 	) {
 
+		return getTxJob( key, null, supplier );
+
+	}
+
+	/**
+	 * Executes the supplied reactive job in a MongoDB client-session transaction
+	 * using the given transaction-level options.
+	 *
+	 * @param <T>
+	 *            the result type
+	 * @param key
+	 *            the logical Mongo execution-context key
+	 * @param transactionOptions
+	 *            transaction-level read concern, write concern, read preference, timeout, and related
+	 *            options
+	 * @param supplier
+	 *            the deferred reactive job to execute
+	 *
+	 * @return a transactional {@link Mono} wrapping the supplied job
+	 */
+	public <T> Mono<T> getTxJob(
+		K key, TransactionOptions transactionOptions, Supplier<? extends Mono<? extends T>> supplier
+	) {
+
 		MongoExecutionContext executionContext = resolver.getTemplate( key );
 
 		return Mono
 			.usingWhen(
 				executionContext.startSession(),
 				session -> {
-					session.startTransaction();
+					if (transactionOptions == null)
+						session.startTransaction();
+					else
+						session.startTransaction( transactionOptions );
 					return Mono
 						.defer( supplier )
 						.contextWrite( context -> context.put( CLIENT_SESSION_CONTEXT_KEY, new SessionBinding( executionContext.getSessionScope(), session ) ) )
@@ -595,6 +626,18 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 	}
 
+	private record OperationTimeout(long timeout, TimeUnit timeUnit) {
+
+		private OperationTimeout {
+
+			if (timeout < 0)
+				throw new IllegalArgumentException( "timeout must be greater than or equal to 0" );
+			Objects.requireNonNull( timeUnit, "timeUnit must not be null" );
+
+		}
+
+	}
+
 	private static final class FindSpec {
 
 		private Bson filter = new Document();
@@ -608,6 +651,10 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 		private int limit;
 
 		private ReadPreference readPreference;
+
+		private ReadConcern readConcern;
+
+		private OperationTimeout timeout;
 
 		private Boolean allowDiskUse;
 
@@ -667,6 +714,24 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 		}
 
+		FindSpec readConcern(
+			ReadConcern readConcern
+		) {
+
+			this.readConcern = readConcern;
+			return this;
+
+		}
+
+		FindSpec timeout(
+			OperationTimeout timeout
+		) {
+
+			this.timeout = timeout;
+			return this;
+
+		}
+
 		FindSpec allowDiskUse(
 			Boolean allowDiskUse
 		) {
@@ -695,6 +760,10 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 		private ReadPreference readPreference;
 
+		private ReadConcern readConcern;
+
+		private OperationTimeout timeout;
+
 		private Boolean allowDiskUse;
 
 		private Consumer<AggregatePublisher<Document>> customizer = ignored -> {};
@@ -712,6 +781,24 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 		) {
 
 			this.readPreference = readPreference;
+			return this;
+
+		}
+
+		AggregationSpec readConcern(
+			ReadConcern readConcern
+		) {
+
+			this.readConcern = readConcern;
+			return this;
+
+		}
+
+		AggregationSpec timeout(
+			OperationTimeout timeout
+		) {
+
+			this.timeout = timeout;
 			return this;
 
 		}
@@ -823,13 +910,39 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 	}
 
+	private MongoCollection<Document> applyReadOptions(
+		MongoCollection<Document> collection, ReadPreference readPreference, ReadConcern readConcern, OperationTimeout timeout
+	) {
+
+		MongoCollection<Document> target = collection;
+		if (readPreference != null)
+			target = target.withReadPreference( readPreference );
+		if (readConcern != null)
+			target = target.withReadConcern( readConcern );
+		if (timeout != null)
+			target = target.withTimeout( timeout.timeout(), timeout.timeUnit() );
+		return target;
+
+	}
+
+	private MongoCollection<Document> applyWriteOptions(
+		MongoCollection<Document> collection, WriteConcern writeConcern, OperationTimeout timeout
+	) {
+
+		MongoCollection<Document> target = collection;
+		if (writeConcern != null)
+			target = target.withWriteConcern( writeConcern );
+		if (timeout != null)
+			target = target.withTimeout( timeout.timeout(), timeout.timeUnit() );
+		return target;
+
+	}
+
 	private FindPublisher<Document> applyQuery(
 		MongoCollection<Document> collection, FindSpec query, ClientSession session
 	) {
 
-		MongoCollection<Document> target = query.readPreference == null
-			? collection
-			: collection.withReadPreference( query.readPreference );
+		MongoCollection<Document> target = applyReadOptions( collection, query.readPreference, query.readConcern, query.timeout );
 		FindPublisher<Document> publisher = session == null
 			? target.find( query.filter )
 			: target.find( session, query.filter );
@@ -893,9 +1006,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 		MongoCollection<Document> collection, AggregationSpec aggregation, ClientSession session
 	) {
 
-		MongoCollection<Document> target = aggregation.readPreference == null
-			? collection
-			: collection.withReadPreference( aggregation.readPreference );
+		MongoCollection<Document> target = applyReadOptions( collection, aggregation.readPreference, aggregation.readConcern, aggregation.timeout );
 		AggregatePublisher<Document> publisher = session == null
 			? target.aggregate( aggregation.pipeline )
 			: target.aggregate( session, aggregation.pipeline );
@@ -924,6 +1035,10 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			preview.append( "limit", query.limit );
 		if (query.readPreference != null)
 			preview.append( "readPreference", query.readPreference.toString() );
+		if (query.readConcern != null)
+			preview.append( "readConcern", query.readConcern.toString() );
+		if (query.timeout != null)
+			preview.append( "timeout", query.timeout.timeout() ).append( "timeoutUnit", query.timeout.timeUnit().name() );
 		if (query.allowDiskUse != null)
 			preview.append( "allowDiskUse", query.allowDiskUse );
 
@@ -945,6 +1060,10 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			preview.append( "limit", query.limit );
 		if (query.readPreference != null)
 			preview.append( "readPreference", query.readPreference.toString() );
+		if (query.readConcern != null)
+			preview.append( "readConcern", query.readConcern.toString() );
+		if (query.timeout != null)
+			preview.append( "timeout", query.timeout.timeout() ).append( "timeoutUnit", query.timeout.timeUnit().name() );
 
 		return preview;
 
@@ -960,6 +1079,10 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 		if (aggregation.readPreference != null)
 			preview.append( "readPreference", aggregation.readPreference.toString() );
+		if (aggregation.readConcern != null)
+			preview.append( "readConcern", aggregation.readConcern.toString() );
+		if (aggregation.timeout != null)
+			preview.append( "timeout", aggregation.timeout.timeout() ).append( "timeoutUnit", aggregation.timeout.timeUnit().name() );
 		if (aggregation.allowDiskUse != null)
 			preview.append( "allowDiskUse", aggregation.allowDiskUse );
 
@@ -1061,17 +1184,19 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 	}
 
 	private <T> Flux<T> distinct(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, String field, Bson filter, Class<T> resultClass
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, String field, Class<T> resultClass, FindSpec query
 	) {
 
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
-			.flatMapMany(
-				collection -> executeFluxWithSession(
+			.flatMapMany( collection -> {
+				MongoCollection<Document> target = applyReadOptions( collection, query.readPreference, query.readConcern, query.timeout );
+				return executeFluxWithSession(
 					executionContext,
-					session -> collection.distinct( session, field, filter, resultClass ),
-					() -> collection.distinct( field, filter, resultClass )
-				)
-			);
+					session -> target.distinct( session, field, query.filter, resultClass ),
+					() -> target.distinct( field, query.filter, resultClass )
+				);
+
+			} );
 
 	}
 
@@ -1108,7 +1233,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 	}
 
 	private <T> Mono<T> saveEntity(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, T entity
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, T entity, WriteConcern writeConcern, OperationTimeout timeout
 	) {
 
 		String collectionName = resolveCollectionName( executionContext, entityClass, explicitCollectionName );
@@ -1116,12 +1241,13 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			Document document = executionContext.write( preparedEntity );
 			Object id = executionContext.getId( preparedEntity );
 			return resolveCollection( executionContext, entityClass, collectionName ).flatMap( collection -> {
+				MongoCollection<Document> target = applyWriteOptions( collection, writeConcern, timeout );
 
 				if (id == null) {
 					return executeWithSession(
 						executionContext,
-						session -> collection.insertOne( session, document ),
-						() -> collection.insertOne( document )
+						session -> target.insertOne( session, document ),
+						() -> target.insertOne( document )
 					)
 						.doOnSuccess( ignored -> {
 							if (document.get( "_id" ) != null)
@@ -1134,8 +1260,8 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				return executeWithSession(
 					executionContext,
-					session -> collection.replaceOne( session, new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) ),
-					() -> collection.replaceOne( new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) )
+					session -> target.replaceOne( session, new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) ),
+					() -> target.replaceOne( new Document( "_id", id ), document, new ReplaceOptions().upsert( true ) )
 				).then( Mono.defer( () -> executionContext.afterPersist( preparedEntity, document, collectionName ) ) );
 
 			} );
@@ -1145,20 +1271,22 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 	}
 
 	private <T> Flux<T> insertEntities(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<T> entities
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<T> entities, WriteConcern writeConcern, OperationTimeout timeout
 	) {
 
 		if (entities.isEmpty())
 			return Flux.empty();
 		List<Document> documents = entities.stream().map( executionContext::write ).toList();
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
-			.flatMap(
-				collection -> executeWithSession(
+			.flatMap( collection -> {
+				MongoCollection<Document> target = applyWriteOptions( collection, writeConcern, timeout );
+				return executeWithSession(
 					executionContext,
-					session -> collection.insertMany( session, documents ),
-					() -> collection.insertMany( documents )
-				)
-			)
+					session -> target.insertMany( session, documents ),
+					() -> target.insertMany( documents )
+				);
+
+			} )
 			.doOnSuccess( ignored -> {
 
 				for (int i = 0; i < entities.size(); i++) {
@@ -1174,52 +1302,58 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 	}
 
 	private Mono<Void> insertDocuments(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<Document> documents
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<Document> documents, WriteConcern writeConcern, OperationTimeout timeout
 	) {
 
 		if (documents.isEmpty())
 			return Mono.empty();
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
-			.flatMap(
-				collection -> executeWithSession(
+			.flatMap( collection -> {
+				MongoCollection<Document> target = applyWriteOptions( collection, writeConcern, timeout );
+				return executeWithSession(
 					executionContext,
-					session -> collection.insertMany( session, documents ),
-					() -> collection.insertMany( documents )
-				)
-			)
+					session -> target.insertMany( session, documents ),
+					() -> target.insertMany( documents )
+				);
+
+			} )
 			.then();
 
 	}
 
 	private Mono<BulkWriteResult> bulkWrite(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<? extends WriteModel<Document>> writes
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, List<? extends WriteModel<Document>> writes, WriteConcern writeConcern, OperationTimeout timeout
 	) {
 
 		if (writes.isEmpty())
 			return Mono.empty();
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
-			.flatMap(
-				collection -> executeWithSession(
+			.flatMap( collection -> {
+				MongoCollection<Document> target = applyWriteOptions( collection, writeConcern, timeout );
+				return executeWithSession(
 					executionContext,
-					session -> collection.bulkWrite( session, writes, new BulkWriteOptions().ordered( false ) ),
-					() -> collection.bulkWrite( writes, new BulkWriteOptions().ordered( false ) )
-				)
-			);
+					session -> target.bulkWrite( session, writes, new BulkWriteOptions().ordered( false ) ),
+					() -> target.bulkWrite( writes, new BulkWriteOptions().ordered( false ) )
+				);
+
+			} );
 
 	}
 
 	private Mono<DeleteResult> deleteByFilter(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, Bson filter, boolean many
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, Bson filter, boolean many, WriteConcern writeConcern, OperationTimeout timeout
 	) {
 
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
-			.flatMap(
-				collection -> executeWithSession(
+			.flatMap( collection -> {
+				MongoCollection<Document> target = applyWriteOptions( collection, writeConcern, timeout );
+				return executeWithSession(
 					executionContext,
-					session -> many ? collection.deleteMany( session, filter ) : collection.deleteOne( session, filter ),
-					() -> many ? collection.deleteMany( filter ) : collection.deleteOne( filter )
-				)
-			);
+					session -> many ? target.deleteMany( session, filter ) : target.deleteOne( session, filter ),
+					() -> many ? target.deleteMany( filter ) : target.deleteOne( filter )
+				);
+
+			} );
 
 	}
 
@@ -1228,9 +1362,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 	) {
 
 		return resolveCollection( executionContext, entityClass, explicitCollectionName ).flatMap( collection -> {
-			MongoCollection<Document> target = query.readPreference == null
-				? collection
-				: collection.withReadPreference( query.readPreference );
+			MongoCollection<Document> target = applyReadOptions( collection, query.readPreference, query.readConcern, query.timeout );
 			CountOptions options = new CountOptions();
 			if (query.skip > 0)
 				options.skip( Math.toIntExact( query.skip ) );
@@ -1263,42 +1395,47 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 	}
 
 	private Mono<UpdateResult> update(
-		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, Bson filter, UpdateSpec updateSpec, boolean multi, boolean upsert
+		MongoExecutionContext executionContext, Class<?> entityClass, String explicitCollectionName, Bson filter, UpdateSpec updateSpec, boolean multi, boolean upsert, WriteConcern writeConcern, OperationTimeout timeout
 	) {
 
 		return resolveCollection( executionContext, entityClass, explicitCollectionName )
-			.flatMap(
-				collection -> executeWithSession(
+			.flatMap( collection -> {
+				MongoCollection<Document> target = applyWriteOptions( collection, writeConcern, timeout );
+				return executeWithSession(
 					executionContext,
 					session -> {
 						UpdateOptions options = new UpdateOptions().upsert( upsert );
 
 						if (updateSpec.isPipeline()) {
 							return multi
-								? collection.updateMany( session, filter, updateSpec.pipeline, options )
-								: collection.updateOne( session, filter, updateSpec.pipeline, options );
+								? target.updateMany( session, filter, updateSpec.pipeline, options )
+								: target.updateOne( session, filter, updateSpec.pipeline, options );
 
 						}
 
 						return multi
-							? collection.updateMany( session, filter, updateSpec.update, options )
-							: collection.updateOne( session, filter, updateSpec.update, options );
+							? target.updateMany( session, filter, updateSpec.update, options )
+							: target.updateOne( session, filter, updateSpec.update, options );
 
 					},
 					() -> {
 						UpdateOptions options = new UpdateOptions().upsert( upsert );
 
-						if (updateSpec.isPipeline()) { return multi
-							? collection.updateMany( filter, updateSpec.pipeline, options )
-							: collection.updateOne( filter, updateSpec.pipeline, options ); }
+						if (updateSpec.isPipeline()) {
+							return multi
+								? target.updateMany( filter, updateSpec.pipeline, options )
+								: target.updateOne( filter, updateSpec.pipeline, options );
+
+						}
 
 						return multi
-							? collection.updateMany( filter, updateSpec.update, options )
-							: collection.updateOne( filter, updateSpec.update, options );
+							? target.updateMany( filter, updateSpec.update, options )
+							: target.updateOne( filter, updateSpec.update, options );
 
 					}
-				)
-			);
+				);
+
+			} );
 
 	}
 
@@ -1324,15 +1461,12 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 	}
 
 	private CursorSkipResolution resolveCursorRelativeSkip(
-		int targetPageNumber,
-		int anchorPageNumber,
-		int pageSize,
-		long maxRelativeSkip,
-		CursorSkipExceededAction onExceeded
+		int targetPageNumber, int anchorPageNumber, int pageSize, long maxRelativeSkip, CursorSkipExceededAction onExceeded
 	) {
 
 		long pageDistance = Math.max( 0L, (long) targetPageNumber - anchorPageNumber );
 		long relativeSkip = Math.multiplyExact( pageDistance, (long) pageSize );
+
 		if (relativeSkip <= maxRelativeSkip) {
 			validateCursorDriverSkip( relativeSkip );
 			return new CursorSkipResolution( relativeSkip, false );
@@ -1341,7 +1475,11 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 		return switch (Objects.requireNonNull( onExceeded, "onExceeded must not be null" )) {
 			case FAIL -> throw new CursorSkipLimitExceededException(
-				targetPageNumber, anchorPageNumber, pageSize, relativeSkip, maxRelativeSkip
+				targetPageNumber,
+				anchorPageNumber,
+				pageSize,
+				relativeSkip,
+				maxRelativeSkip
 			);
 			case RETURN_EMPTY -> new CursorSkipResolution( 0L, true );
 			case EXECUTE_ANYWAY -> {
@@ -1349,6 +1487,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 				yield new CursorSkipResolution( relativeSkip, false );
 
 			}
+
 		};
 
 	}
@@ -1568,6 +1707,32 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 		protected AbstractQueryBuilder<E, T> executeBuilder;
 
+		protected WriteConcern writeConcern;
+
+		protected OperationTimeout operationTimeout;
+
+		/** Applies a write concern to write operations executed through this builder. */
+		@SuppressWarnings("unchecked")
+		public T writeConcern(
+			WriteConcern writeConcern
+		) {
+
+			this.writeConcern = Objects.requireNonNull( writeConcern, "writeConcern must not be null" );
+			return (T) this;
+
+		}
+
+		/** Applies a client-side operation timeout to operations executed through this builder. */
+		@SuppressWarnings("unchecked")
+		public T timeout(
+			long timeout, TimeUnit timeUnit
+		) {
+
+			this.operationTimeout = new OperationTimeout( timeout, timeUnit );
+			return (T) this;
+
+		}
+
 
 		/** Saves a single entity using the resolved Mongo execution context. */
 		public Mono<E> save(
@@ -1575,7 +1740,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 		) {
 
 			Objects.requireNonNull( e, "entity must not be null" );
-			return executeClassMono.flatMap( entityClass -> saveEntity( mongoExecutionContext, entityClass, collectionName, e ) );
+			return executeClassMono.flatMap( entityClass -> saveEntity( mongoExecutionContext, entityClass, collectionName, e, writeConcern, operationTimeout ) );
 
 		}
 
@@ -1637,7 +1802,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 				.flatMapMany(
 					entities -> entities.isEmpty()
 						? Flux.empty()
-						: executeClassMono.flatMapMany( entityClass -> insertEntities( mongoExecutionContext, entityClass, collectionName, entities ) )
+						: executeClassMono.flatMapMany( entityClass -> insertEntities( mongoExecutionContext, entityClass, collectionName, entities, writeConcern, operationTimeout ) )
 				);
 
 		}
@@ -1689,7 +1854,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				}
 
-				return bulkWrite( mongoExecutionContext, entityClass, collectionName, writes );
+				return bulkWrite( mongoExecutionContext, entityClass, collectionName, writes, writeConcern, operationTimeout );
 
 			} );
 
@@ -1778,7 +1943,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				}
 
-				return bulkWrite( mongoExecutionContext, entityClass, collectionName, writes );
+				return bulkWrite( mongoExecutionContext, entityClass, collectionName, writes, writeConcern, operationTimeout );
 
 			} );
 
@@ -1849,7 +2014,9 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 						mongoExecutionContext,
 						entityClass,
 						resolveRemoveCollectionName( entityClass ),
-						entities.stream().map( mongoExecutionContext::write ).toList()
+						entities.stream().map( mongoExecutionContext::write ).toList(),
+						writeConcern,
+						operationTimeout
 					)
 					: Mono.empty();
 				List<WriteModel<Document>> writes = entities
@@ -1859,7 +2026,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 					.map( id -> (WriteModel<Document>) new DeleteOneModel<Document>( new Document( "_id", id ) ) )
 					.toList();
 
-				return backup.then( bulkWrite( mongoExecutionContext, entityClass, collectionName, writes ) );
+				return backup.then( bulkWrite( mongoExecutionContext, entityClass, collectionName, writes, writeConcern, operationTimeout ) );
 
 			} );
 
@@ -1889,7 +2056,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			return executeClassMono.flatMap( entityClass -> {
 				Object id = mongoExecutionContext.getId( e );
 				Document filter = id == null ? mongoExecutionContext.write( e ) : new Document( "_id", id );
-				return deleteByFilter( mongoExecutionContext, entityClass, collectionName, filter, false )
+				return deleteByFilter( mongoExecutionContext, entityClass, collectionName, filter, false, writeConcern, operationTimeout )
 					.flatMap(
 						result -> ! isBackup
 							? Mono.just( result )
@@ -1897,7 +2064,9 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 								mongoExecutionContext,
 								entityClass,
 								resolveRemoveCollectionName( entityClass ),
-								List.of( mongoExecutionContext.write( e ) )
+								List.of( mongoExecutionContext.write( e ) ),
+								writeConcern,
+								operationTimeout
 							).thenReturn( result )
 					);
 
@@ -1956,7 +2125,9 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 				mongoExecutionContext,
 				entityClass,
 				sourceCollection + "_" + suffix,
-				List.of( snapshot )
+				List.of( snapshot ),
+				writeConcern,
+				operationTimeout
 			);
 
 		}
@@ -2526,6 +2697,10 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 			protected ReadPreference readPreference = null;
 
+			protected ReadConcern readConcern = null;
+
+			protected OperationTimeout operationTimeout = null;
+
 			protected Boolean isAllowDiskUse = null;
 
 			protected Consumer<FindPublisher<Document>> queryCustomizer = ignored -> {};
@@ -2579,6 +2754,24 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 			}
 
+			public QueryBuilderAccesser<Q, A> readConcern(
+				ReadConcern readConcern
+			) {
+
+				this.readConcern = Objects.requireNonNull( readConcern, "readConcern must not be null" );
+				return this;
+
+			}
+
+			public QueryBuilderAccesser<Q, A> timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				this.operationTimeout = new OperationTimeout( timeout, timeUnit );
+				return this;
+
+			}
+
 			public QueryBuilderAccesser<Q, A> isAllowDiskUse(
 				Boolean allow
 			) {
@@ -2594,6 +2787,8 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				return new AggregationSpec( pipeline )
 					.readPreference( readPreference )
+					.readConcern( readConcern )
+					.timeout( operationTimeout != null ? operationTimeout : AbstractQueryBuilder.this.operationTimeout )
 					.allowDiskUse( isAllowDiskUse )
 					.customize( aggregationCustomizer );
 
@@ -2605,6 +2800,8 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				return query
 					.readPreference( readPreference )
+					.readConcern( readConcern )
+					.timeout( operationTimeout != null ? operationTimeout : AbstractQueryBuilder.this.operationTimeout )
 					.allowDiskUse( isAllowDiskUse )
 					.customize( queryCustomizer );
 
@@ -3279,6 +3476,10 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 			private ReadPreference readPreference;
 
+			private ReadConcern readConcern;
+
+			private OperationTimeout operationTimeout;
+
 			private Boolean isAllowDiskUse;
 
 			private Consumer<AggregatePublisher<Document>> aggregationCustomizer = ignored -> {};
@@ -3290,6 +3491,24 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			) {
 
 				this.readPreference = rp;
+				return this;
+
+			}
+
+			public AggregationBuilder readConcern(
+				ReadConcern readConcern
+			) {
+
+				this.readConcern = Objects.requireNonNull( readConcern, "readConcern must not be null" );
+				return this;
+
+			}
+
+			public AggregationBuilder timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				this.operationTimeout = new OperationTimeout( timeout, timeUnit );
 				return this;
 
 			}
@@ -3347,6 +3566,8 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				return new AggregationSpec( this.stages )
 					.readPreference( this.readPreference )
+					.readConcern( this.readConcern )
+					.timeout( this.operationTimeout != null ? this.operationTimeout : AbstractQueryBuilder.this.operationTimeout )
 					.allowDiskUse( this.isAllowDiskUse )
 					.customize( this.aggregationCustomizer );
 
@@ -3494,6 +3715,26 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			) {
 
 				super.readPreference( rp );
+				return this;
+
+			}
+
+			@Override
+			public SearchBuilder<S> readConcern(
+				ReadConcern readConcern
+			) {
+
+				super.readConcern( readConcern );
+				return this;
+
+			}
+
+			@Override
+			public SearchBuilder<S> timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				super.timeout( timeout, timeUnit );
 				return this;
 
 			}
@@ -5347,6 +5588,26 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 			}
 
+			@Override
+			public VectorSearchBuilder<S> readConcern(
+				ReadConcern readConcern
+			) {
+
+				super.readConcern( readConcern );
+				return this;
+
+			}
+
+			@Override
+			public VectorSearchBuilder<S> timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				super.timeout( timeout, timeUnit );
+				return this;
+
+			}
+
 			/**
 			 * Returns this builder with the given disk-use option applied to the generated
 			 * aggregation query.
@@ -6466,6 +6727,26 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			}
 
 			@Override
+			public FindAllQueryBuilder<S> readConcern(
+				ReadConcern readConcern
+			) {
+
+				super.readConcern( readConcern );
+				return this;
+
+			}
+
+			@Override
+			public FindAllQueryBuilder<S> timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				super.timeout( timeout, timeUnit );
+				return this;
+
+			}
+
+			@Override
 			public FindAllQueryBuilder<S> isAllowDiskUse(
 				Boolean allow
 			) {
@@ -6667,11 +6948,12 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 					Mono<Void> preparation, Flux<ChangeStreamDocument<Document>> changes, Mono<List<V>> query
 				) {
 
-					return preparation.thenMany(
-						Flux
-							.concat( Mono.just( 0L ), changes.map( ignored -> 1L ) )
-							.switchMap( ignored -> Mono.defer( () -> query ) )
-					);
+					return preparation
+						.thenMany(
+							Flux
+								.concat( Mono.just( 0L ), changes.map( ignored -> 1L ) )
+								.switchMap( ignored -> Mono.defer( () -> query ) )
+						);
 
 				}
 
@@ -7026,11 +7308,12 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 					public Flux<List<E>> execute() {
 
-						return delegate.refreshSnapshots(
-							delegate.prepareChanges( List.of() ),
-							delegate.coalesce( delegate.rawChanges( List.of() ) ),
-							PageNumberCursorPagingBuilder.this.execute().collectList()
-						);
+						return delegate
+							.refreshSnapshots(
+								delegate.prepareChanges( List.of() ),
+								delegate.coalesce( delegate.rawChanges( List.of() ) ),
+								PageNumberCursorPagingBuilder.this.execute().collectList()
+							);
 
 					}
 
@@ -7038,11 +7321,12 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 						ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 					) {
 
-						return delegate.refreshSnapshots(
-							delegate.prepareLookupChanges( rightBuilder ),
-							delegate.coalesce( Flux.merge( delegate.rawChanges( List.of() ), delegate.lookupReservationChanges( rightBuilder, spec ) ) ),
-							PageNumberCursorPagingBuilder.this.executeLookup( rightBuilder, spec ).collectList()
-						);
+						return delegate
+							.refreshSnapshots(
+								delegate.prepareLookupChanges( rightBuilder ),
+								delegate.coalesce( Flux.merge( delegate.rawChanges( List.of() ), delegate.lookupReservationChanges( rightBuilder, spec ) ) ),
+								PageNumberCursorPagingBuilder.this.executeLookup( rightBuilder, spec ).collectList()
+							);
 
 					}
 
@@ -7206,6 +7490,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			private Flux<E> executePageNumberCursor(
 				Paging cursorPaging, long maxRelativeSkip, CursorSkipExceededAction skipExceededAction
 			) {
+
 				validateCursorPageSize( cursorPaging.pageSize );
 				if (queryCustomized)
 					return Flux.error( new IllegalStateException( "pageNumberCursor paging does not support customizeQuery because cursor sort/filter semantics would be opaque." ) );
@@ -7250,6 +7535,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 											);
 
 									}
+
 									CursorSkipResolution skipResolution = resolveCursorRelativeSkip(
 										cursorPaging.pageNumber,
 										anchorPageNumber,
@@ -7301,6 +7587,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 					return Mono.error( error );
 
 				}
+
 				if (queryCustomized)
 					return Mono.error( new IllegalStateException( "cursor paging does not support customizeQuery because cursor sort/filter semantics would be opaque." ) );
 
@@ -7328,10 +7615,11 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 					).flatMap( queryKey -> resolveCursorToken( queryKey, pageSize, cursor ).flatMap( tokenState -> {
 						Bson cursorCriteria = baseCriteria;
 						if (tokenState.isPresent())
-							cursorCriteria = CursorPaginationSupport.combine(
-								baseCriteria,
-								CursorPaginationSupport.atOrAfterAnchor( cursorSort, tokenState.orElseThrow().sortValues() )
-							);
+							cursorCriteria = CursorPaginationSupport
+								.combine(
+									baseCriteria,
+									CursorPaginationSupport.atOrAfterAnchor( cursorSort, tokenState.orElseThrow().sortValues() )
+								);
 
 						FindSpec query = new FindSpec()
 							.filter( cursorCriteria )
@@ -7615,8 +7903,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			 * @return a {@link Mono} emitting a paged lookup result
 			 */
 			private <R2> Flux<ResultTuple<E, List<R2>>> executeLookupPageNumberCursor(
-				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec,
-				Paging cursorPaging, long maxRelativeSkip, CursorSkipExceededAction skipExceededAction
+				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec, Paging cursorPaging, long maxRelativeSkip, CursorSkipExceededAction skipExceededAction
 			) {
 
 				Objects.requireNonNull( rightBuilder, "rightBuilder must not be null" );
@@ -7676,6 +7963,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 											operations.add( Aggregates.match( CursorPaginationSupport.atOrAfterAnchor( cursorSort, anchor.sortValues() ) ) );
 
 										}
+
 										CursorSkipResolution skipResolution = resolveCursorRelativeSkip(
 											cursorPaging.pageNumber,
 											anchorPageNumber,
@@ -7701,7 +7989,11 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 															.fromIterable( rows.stream().limit( cursorPaging.pageSize ).toList() )
 															.map( document -> {
 																E leftValue = mongoExecutionContext.read( leftClass, document.get( LOOKUP_LEFT_RESULT_FIELD, Document.class ) );
-																List<R2> rightValues = readLookupValues( rightBuilder.getMongoExecutionContext(), rightClass, document.get( LOOKUP_RIGHT_RESULT_FIELD ) );
+																List<R2> rightValues = readLookupValues(
+																	rightBuilder.getMongoExecutionContext(),
+																	rightClass,
+																	document.get( LOOKUP_RIGHT_RESULT_FIELD )
+																);
 																return new ResultTuple<>( leftKey, leftValue, rightKey, rightValues );
 
 															} )
@@ -7724,6 +8016,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				Objects.requireNonNull( rightBuilder, "rightBuilder must not be null" );
 				Objects.requireNonNull( spec, "spec must not be null" );
+
 				try {
 					validateCursorPageSize( pageSize );
 
@@ -7731,6 +8024,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 					return Mono.error( error );
 
 				}
+
 				if (aggregationCustomized)
 					return Mono.error( new IllegalStateException( "cursor lookup paging does not support customizeAggregation because cursor pipeline semantics would be opaque." ) );
 
@@ -7837,8 +8131,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			}
 
 			private <R2> Mono<PageResult<ResultTuple<E, List<R2>>>> executeLookupPageNumberCursorAndCount(
-				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec,
-				Paging cursorPaging, long maxRelativeSkip, CursorSkipExceededAction skipExceededAction
+				ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec, Paging cursorPaging, long maxRelativeSkip, CursorSkipExceededAction skipExceededAction
 			) {
 
 				Mono<Long> countMono = Mono
@@ -7964,6 +8257,26 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			) {
 
 				super.readPreference( rp );
+				return this;
+
+			}
+
+			@Override
+			public FindQueryBuilder<S> readConcern(
+				ReadConcern readConcern
+			) {
+
+				super.readConcern( readConcern );
+				return this;
+
+			}
+
+			@Override
+			public FindQueryBuilder<S> timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				super.timeout( timeout, timeUnit );
 				return this;
 
 			}
@@ -8195,6 +8508,26 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			}
 
 			@Override
+			public CountQueryBuilder readConcern(
+				ReadConcern readConcern
+			) {
+
+				super.readConcern( readConcern );
+				return this;
+
+			}
+
+			@Override
+			public CountQueryBuilder timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				super.timeout( timeout, timeUnit );
+				return this;
+
+			}
+
+			@Override
 			public CountQueryBuilder isAllowDiskUse(
 				Boolean allow
 			) {
@@ -8351,6 +8684,12 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 			private final Class<R> resultClass;
 
+			private ReadPreference readPreference;
+
+			private ReadConcern readConcern;
+
+			private OperationTimeout operationTimeout;
+
 			private DistinctQueryBuilder(
 											Object field,
 											Class<R> resultClass
@@ -8358,6 +8697,45 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				this.field = MongoFieldNameSupport.toMongoField( Objects.requireNonNull( field, "field" ) );
 				this.resultClass = Objects.requireNonNull( resultClass, "resultClass" );
+
+			}
+
+			public DistinctQueryBuilder<R> readPreference(
+				ReadPreference readPreference
+			) {
+
+				this.readPreference = readPreference;
+				return this;
+
+			}
+
+			public DistinctQueryBuilder<R> readConcern(
+				ReadConcern readConcern
+			) {
+
+				this.readConcern = Objects.requireNonNull( readConcern, "readConcern must not be null" );
+				return this;
+
+			}
+
+			public DistinctQueryBuilder<R> timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				this.operationTimeout = new OperationTimeout( timeout, timeUnit );
+				return this;
+
+			}
+
+			private FindSpec buildDistinctSpec(
+				Bson filter
+			) {
+
+				return new FindSpec()
+					.filter( filter )
+					.readPreference( readPreference )
+					.readConcern( readConcern )
+					.timeout( operationTimeout != null ? operationTimeout : AbstractQueryBuilder.this.operationTimeout );
 
 			}
 
@@ -8376,8 +8754,8 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 							tuple.getT1(),
 							collectionName,
 							field,
-							tuple.getT2().orElseGet( Document::new ),
-							resultClass
+							resultClass,
+							buildDistinctSpec( tuple.getT2().orElseGet( Document::new ) )
 						)
 					);
 
@@ -8392,13 +8770,22 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				return Mono
 					.zip( executeClassMono, fieldBuilder.buildCriteria() )
-					.map(
-						tuple -> new Document( "operation", "distinct" )
+					.map( tuple -> {
+						FindSpec query = buildDistinctSpec( tuple.getT2().orElseGet( Document::new ) );
+						Document preview = new Document( "operation", "distinct" )
 							.append( "collection", resolveCollectionName( mongoExecutionContext, tuple.getT1(), collectionName ) )
 							.append( "field", field )
-							.append( "filter", MongoBsonSupport.toDocument( tuple.getT2().orElseGet( Document::new ) ) )
-							.append( "resultClass", resultClass.getName() )
-					);
+							.append( "filter", MongoBsonSupport.toDocument( query.filter ) )
+							.append( "resultClass", resultClass.getName() );
+						if (query.readPreference != null)
+							preview.append( "readPreference", query.readPreference.toString() );
+						if (query.readConcern != null)
+							preview.append( "readConcern", query.readConcern.toString() );
+						if (query.timeout != null)
+							preview.append( "timeout", query.timeout.timeout() ).append( "timeoutUnit", query.timeout.timeUnit().name() );
+						return preview;
+
+					} );
 
 			}
 
@@ -8408,6 +8795,24 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 		 * Builder for criteria-based delete operations.
 		 */
 		public class DeleteQueryBuilder {
+
+			public DeleteQueryBuilder writeConcern(
+				WriteConcern writeConcern
+			) {
+
+				AbstractQueryBuilder.this.writeConcern( writeConcern );
+				return this;
+
+			}
+
+			public DeleteQueryBuilder timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				AbstractQueryBuilder.this.timeout( timeout, timeUnit );
+				return this;
+
+			}
 
 			/**
 			 * Deletes all documents matching the current criteria.
@@ -8424,7 +8829,9 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 							tuple.getT1(),
 							collectionName,
 							tuple.getT2().orElseGet( Document::new ),
-							true
+							true,
+							writeConcern,
+							operationTimeout
 						)
 					);
 
@@ -8443,6 +8850,26 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			) {
 
 				super.readPreference( rp );
+				return this;
+
+			}
+
+			@Override
+			public ExistsQueryBuilder readConcern(
+				ReadConcern readConcern
+			) {
+
+				super.readConcern( readConcern );
+				return this;
+
+			}
+
+			@Override
+			public ExistsQueryBuilder timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				super.timeout( timeout, timeUnit );
 				return this;
 
 			}
@@ -8583,6 +9010,24 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 		 * explicitly when needed.</p>
 		 */
 		public class AtomicUpdateQueryBuilder {
+
+			public AtomicUpdateQueryBuilder writeConcern(
+				WriteConcern writeConcern
+			) {
+
+				AbstractQueryBuilder.this.writeConcern( writeConcern );
+				return this;
+
+			}
+
+			public AtomicUpdateQueryBuilder timeout(
+				long timeout, TimeUnit timeUnit
+			) {
+
+				AbstractQueryBuilder.this.timeout( timeout, timeUnit );
+				return this;
+
+			}
 
 			private enum AtomicUpdateMode {
 				FIRST, MULTI, UPSERT_ONE
@@ -8909,9 +9354,9 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 				return Mono.zip( executeClassMono, fieldBuilder.buildCriteria() ).flatMap( tuple -> {
 					Bson filter = tuple.getT2().orElseGet( Document::new );
 					return switch (mode) {
-						case UPSERT_ONE -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, false, true );
-						case MULTI -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, true, false );
-						case FIRST -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, false, false );
+						case UPSERT_ONE -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, false, true, writeConcern, operationTimeout );
+						case MULTI -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, true, false, writeConcern, operationTimeout );
+						case FIRST -> update( mongoExecutionContext, tuple.getT1(), collectionName, filter, updateSpec, false, false, writeConcern, operationTimeout );
 
 					};
 

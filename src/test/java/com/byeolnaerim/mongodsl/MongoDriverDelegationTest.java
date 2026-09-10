@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.junit.jupiter.api.Test;
@@ -19,7 +20,10 @@ import com.byeolnaerim.mongodsl.search.SearchOperators;
 import com.byeolnaerim.mongodsl.search.SearchPaths;
 import com.byeolnaerim.mongodsl.search.SearchScoreSpec;
 import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
+import com.mongodb.ReadConcern;
 import com.mongodb.ReadPreference;
+import com.mongodb.TransactionOptions;
+import com.mongodb.WriteConcern;
 import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Sorts;
 import com.mongodb.client.model.search.FuzzySearchOptions;
@@ -397,6 +401,8 @@ class MongoDriverDelegationTest {
 			findAll,
 			findAll
 				.readPreference( ReadPreference.secondaryPreferred() )
+				.readConcern( ReadConcern.MAJORITY )
+				.timeout( 3, TimeUnit.SECONDS )
 				.isAllowDiskUse( true )
 				.sorts( spec -> spec.asc( "id" ) )
 		);
@@ -411,6 +417,8 @@ class MongoDriverDelegationTest {
 			find,
 			find
 				.readPreference( ReadPreference.secondaryPreferred() )
+				.readConcern( ReadConcern.MAJORITY )
+				.timeout( 3, TimeUnit.SECONDS )
 				.isAllowDiskUse( true )
 				.sorts( spec -> spec.desc( "id" ) )
 		);
@@ -425,6 +433,8 @@ class MongoDriverDelegationTest {
 			count,
 			count
 				.readPreference( ReadPreference.secondaryPreferred() )
+				.readConcern( ReadConcern.MAJORITY )
+				.timeout( 3, TimeUnit.SECONDS )
 				.isAllowDiskUse( true )
 		);
 
@@ -438,8 +448,95 @@ class MongoDriverDelegationTest {
 			exists,
 			exists
 				.readPreference( ReadPreference.secondaryPreferred() )
+				.readConcern( ReadConcern.MAJORITY )
+				.timeout( 3, TimeUnit.SECONDS )
 				.isAllowDiskUse( true )
 		);
+
+		var search = dsl.executeEntity( TestEntity.class, "test" ).search( "search-index" );
+		assertSame(
+			search,
+			search
+				.readPreference( ReadPreference.secondaryPreferred() )
+				.readConcern( ReadConcern.LOCAL )
+				.timeout( 3, TimeUnit.SECONDS )
+				.isAllowDiskUse( true )
+		);
+
+		var vectorSearch = dsl.executeEntity( TestEntity.class, "test" ).vectorSearch( "vector-index" );
+		assertSame(
+			vectorSearch,
+			vectorSearch
+				.readPreference( ReadPreference.secondaryPreferred() )
+				.readConcern( ReadConcern.LOCAL )
+				.timeout( 3, TimeUnit.SECONDS )
+				.isAllowDiskUse( true )
+		);
+
+	}
+
+	@Test
+	void distinctPreviewIncludesReadOptions() {
+
+		ReactiveMongoDsl<String> dsl = new ReactiveMongoDsl<>( ignored -> context() );
+		Document preview = dsl
+			.executeEntity( TestEntity.class, "test" )
+			.fields()
+			.end()
+			.distinct( "status", String.class )
+			.readPreference( ReadPreference.secondaryPreferred() )
+			.readConcern( ReadConcern.MAJORITY )
+			.timeout( 5, TimeUnit.SECONDS )
+			.preview()
+			.block();
+
+		assertEquals( ReadPreference.secondaryPreferred().toString(), preview.getString( "readPreference" ) );
+		assertEquals( ReadConcern.MAJORITY.toString(), preview.getString( "readConcern" ) );
+		assertEquals( 5L, preview.getLong( "timeout" ) );
+		assertEquals( TimeUnit.SECONDS.name(), preview.getString( "timeoutUnit" ) );
+
+	}
+
+	@Test
+	void aggregationPreviewIncludesReadConcernAndTimeout() {
+
+		ReactiveMongoDsl<String> dsl = new ReactiveMongoDsl<>( ignored -> context() );
+		Document preview = dsl
+			.executeEntity( TestEntity.class, "test" )
+			.aggregation()
+			.readConcern( ReadConcern.LOCAL )
+			.timeout( 2, TimeUnit.SECONDS )
+			.stage( Aggregates.match( new Document() ) )
+			.preview()
+			.block();
+
+		assertEquals( ReadConcern.LOCAL.toString(), preview.getString( "readConcern" ) );
+		assertEquals( 2L, preview.getLong( "timeout" ) );
+		assertEquals( TimeUnit.SECONDS.name(), preview.getString( "timeoutUnit" ) );
+
+	}
+
+	@Test
+	void writeOptionsAndTransactionOptionsApisRemainFluent() {
+
+		ReactiveMongoDsl<String> dsl = new ReactiveMongoDsl<>( ignored -> context() );
+		var execute = dsl.executeEntity( TestEntity.class, "test" );
+
+		assertSame(
+			execute,
+			execute
+				.writeConcern( WriteConcern.MAJORITY )
+				.timeout( 4, TimeUnit.SECONDS )
+		);
+
+		TransactionOptions transactionOptions = TransactionOptions
+			.builder()
+			.readConcern( ReadConcern.SNAPSHOT )
+			.writeConcern( WriteConcern.MAJORITY )
+			.timeout( 10L, TimeUnit.SECONDS )
+			.build();
+
+		dsl.getTxJob( "test", transactionOptions, () -> Mono.just( "ok" ) );
 
 	}
 
