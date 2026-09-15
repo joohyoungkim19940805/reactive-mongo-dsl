@@ -1849,7 +1849,7 @@ Shared stream이 처음 준비될 때 MongoDB operation time을 기준점으로 
 
 Internal observer/batch observer가 실패하면 그 batch의 checkpoint를 먼저 앞으로 보내지 않습니다. 재연결 시 이미 checkpoint 뒤로 숨은 이벤트가 되지 않도록 observer 처리가 checkpoint보다 먼저 완료됩니다.
 
-### `reservationChangeStream()`: 변경 시 finite query 재실행
+### `reservationChangeStream()`: 공유 incremental snapshot과 안전한 재조회
 
 `findAll()` query 결과를 변경 시점마다 다시 받고 싶으면 query reservation을 사용할 수 있습니다.
 
@@ -1869,7 +1869,7 @@ Flux<List<User>> snapshots = dsl
 
 1. 최초 finite query snapshot을 한 번 emit하고
 2. dependency collection의 Change Stream event를 기다린 뒤
-3. 변경이 발생하면 같은 finite query를 다시 실행해 새 snapshot을 emit합니다.
+3. AUTO에서는 지원되는 일반 query를 메모리에서 갱신하고, 서버 평가가 필요한 경우에만 재조회합니다.
 
 기본 coalesce window는 50ms이며 `Duration.ZERO`로 비활성화할 수 있습니다.
 
@@ -1886,8 +1886,9 @@ Flux<List<User>> snapshots = dsl
 제공 terminal:
 
 - `.changes()` / `.invalidations()` : dependency Change Stream event 자체
-- `.execute()` : 일반 finite query 재실행
-- `.executeLookup(right, spec)` : lookup finite query 재실행
+- `.execute()` : 현재 전체 snapshot
+- `.deltas()` : INITIAL, 순서가 포함된 item delta, 필요 시 REFRESHED
+- `.executeLookup(right, spec)` : 동일 lookup 공유 + single-flight 재조회
 
 Page-number cursor snapshot 재조회는 cursor 전략을 선택한 뒤 `.reservationChangeStream().execute()` 또는 `.executeLookup(right, spec)`를 사용합니다.
 
@@ -1900,7 +1901,7 @@ Page-number cursor snapshot 재조회는 cursor 전략을 선택한 뒤 `.reserv
 
 Lookup reservation은 right collection과 `LookupSpec` 안의 nested `$lookup` dependency도 자동으로 watch 대상에 포함합니다.
 
-Reservation은 현재 query filter를 MongoDB Change Stream의 document-level `$match`로 자동 변환하는 기능이 아닙니다. **dependency collection에서 변경이 발생하면 query를 다시 실행하는 invalidation → pull 모델**입니다. 따라서 collection 변경 빈도가 높고 finite query가 무거운 경우에는 적절한 `coalesce(...)`, dependency 범위, query 비용을 함께 고려해야 합니다.
+AUTO의 primary/majority 읽기, simple collation 확인, 유한 buffer, 공유 범위와 fallback 규칙은 [RESERVATION_CHANGE_STREAM.md](RESERVATION_CHANGE_STREAM.md)를 참고하세요. 테스트 실행은 [RESERVATION_TESTING.md](RESERVATION_TESTING.md)에 정리되어 있습니다.
 
 ---
 
@@ -2455,7 +2456,7 @@ Spring Data MongoDB를 사용하는 경우에는 앞의 **Spring Data MongoDB �
 - Cursor sort는 deterministic한 numeric ascending/descending field로 구성해야 하며 `_id`가 없으면 tie-breaker로 `_id: -1`이 추가됩니다.
 - 기본 state store는 process-local입니다. multi-instance에서 cursor/checkpoint/embedded lease를 노드 간 공유하려면 distributed store와 stable `distributedStateScopeKey`를 사용해야 합니다.
 - MongoDB-backed state store의 `changeStreamConsumerId`를 여러 동시 consumer가 같은 값으로 공유하면 안 됩니다. 재시작 continuity가 필요한 consumer만 자신의 stable/unique id를 사용합니다.
-- `reservationChangeStream()`은 query filter를 Change Stream `$match`로 변환하지 않습니다. dependency collection 변경을 invalidation으로 보고 finite query를 다시 실행합니다.
+- `reservationChangeStream()`의 AUTO는 지원되는 query를 로컬에서 갱신하며, dependency/미지원 의미론은 안전하게 재조회합니다. 자세한 규칙은 `RESERVATION_CHANGE_STREAM.md`를 참고하세요.
 - Shared Change Stream 내부 state side effect는 batch 처리될 수 있지만 public watch event는 원래 event 단위로 전달됩니다.
 
 ### Embedded snapshot sync

@@ -33,12 +33,23 @@ import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuild
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindAllExecute;
 import com.byeolnaerim.mongodsl.ReactiveMongoDsl.AbstractQueryBuilder.QueryBuilderAccesser.FindExecute;
 import com.byeolnaerim.mongodsl.change.ChangeStreamCheckpointStore;
+import com.byeolnaerim.mongodsl.change.ChangeStreamDocumentMode;
 import com.byeolnaerim.mongodsl.change.ChangeStreamHub;
+import com.byeolnaerim.mongodsl.change.ReservationMode;
 import com.byeolnaerim.mongodsl.criteria.FieldsPair;
 import com.byeolnaerim.mongodsl.criteria.FieldsPairBsonSupport;
 import com.byeolnaerim.mongodsl.internal.CursorNamespaceCoordinator;
 import com.byeolnaerim.mongodsl.internal.MongoBsonSupport;
 import com.byeolnaerim.mongodsl.internal.MongoFieldNameSupport;
+import com.byeolnaerim.mongodsl.internal.MongoDocumentComparator;
+import com.byeolnaerim.mongodsl.internal.MongoDocumentSupport;
+import com.byeolnaerim.mongodsl.internal.MongoDocumentMatcher;
+import com.byeolnaerim.mongodsl.internal.MongoDocumentUpdateApplier;
+import com.byeolnaerim.mongodsl.internal.ReservationRegistry;
+import com.byeolnaerim.mongodsl.internal.BoundedInvalidationQueue;
+import com.byeolnaerim.mongodsl.internal.MemoizedSupplier;
+import com.byeolnaerim.mongodsl.internal.ReservationReadSupport;
+import com.byeolnaerim.mongodsl.internal.ReservationRefreshSupport;
 import com.byeolnaerim.mongodsl.lookup.LookupSpec;
 import com.byeolnaerim.mongodsl.paging.CursorAnchor;
 import com.byeolnaerim.mongodsl.paging.CursorAnchorStore;
@@ -50,6 +61,7 @@ import com.byeolnaerim.mongodsl.result.CursorPage;
 import com.byeolnaerim.mongodsl.result.PageResult;
 import com.byeolnaerim.mongodsl.result.PageStream;
 import com.byeolnaerim.mongodsl.result.ResultTuple;
+import com.byeolnaerim.mongodsl.result.ReservationDelta;
 import com.byeolnaerim.mongodsl.search.AtlasSearchOperator;
 import com.byeolnaerim.mongodsl.search.AutocompleteClause;
 import com.byeolnaerim.mongodsl.search.EqualsClause;
@@ -96,6 +108,7 @@ import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.Variable;
 import com.mongodb.client.model.WriteModel;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
+import com.mongodb.client.model.changestream.OperationType;
 import com.mongodb.client.model.search.CompoundSearchOperator;
 import com.mongodb.client.model.search.FieldSearchPath;
 import com.mongodb.client.model.search.SearchHighlight;
@@ -114,8 +127,10 @@ import com.mongodb.reactivestreams.client.AggregatePublisher;
 import com.mongodb.reactivestreams.client.ClientSession;
 import com.mongodb.reactivestreams.client.FindPublisher;
 import com.mongodb.reactivestreams.client.MongoCollection;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -146,6 +161,8 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 	private final ChangeStreamHub changeStreamHub;
 
+	private final ReservationRegistry reservationRegistry = new ReservationRegistry();
+
 	private final EmbeddedSyncEngine embeddedSyncEngine;
 
 	private final EmbeddedSyncLeaseStore embeddedSyncLeaseStore;
@@ -164,6 +181,72 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 	private record CursorSkipResolution(long relativeSkip, boolean returnEmpty) {}
 
+	private static final class ReservationRegistryKey {
+
+		private final Object reservationScope;
+		private final String databaseName;
+		private final String fingerprint;
+
+		private ReservationRegistryKey(
+			Object reservationScope, String databaseName, String fingerprint
+		) {
+			this.reservationScope = Objects.requireNonNull( reservationScope, "reservationScope must not be null" );
+			this.databaseName = Objects.requireNonNull( databaseName, "databaseName must not be null" );
+			this.fingerprint = Objects.requireNonNull( fingerprint, "fingerprint must not be null" );
+		}
+
+		@Override
+		public boolean equals(
+			Object other
+		) {
+			return this == other
+				|| other instanceof ReservationRegistryKey key
+					&& reservationScope == key.reservationScope
+					&& databaseName.equals( key.databaseName )
+					&& fingerprint.equals( key.fingerprint );
+		}
+
+		@Override
+		public int hashCode() {
+			int result = System.identityHashCode( reservationScope );
+			result = 31 * result + databaseName.hashCode();
+			return 31 * result + fingerprint.hashCode();
+		}
+
+	}
+
+	private record ReservationEmission<T>(Supplier<List<T>> snapshotSupplier, List<ReservationDelta<T>> deltas, long revision) {
+
+		private ReservationEmission {
+			snapshotSupplier = new MemoizedSupplier<>( snapshotSupplier );
+			deltas = List.copyOf( deltas );
+		}
+
+		private ReservationEmission(
+			List<T> snapshot, List<ReservationDelta<T>> deltas
+		) {
+			this( () -> snapshot, deltas, 0L );
+		}
+
+		private ReservationEmission(
+			Supplier<List<T>> snapshotSupplier, List<ReservationDelta<T>> deltas
+		) {
+			this( snapshotSupplier, deltas, 0L );
+		}
+
+		private List<T> snapshot() { return snapshotSupplier.get(); }
+
+	}
+
+	private static final class ReservationRefreshRequired extends RuntimeException {
+
+		private static final long serialVersionUID = 1L;
+
+		@Override
+		public synchronized Throwable fillInStackTrace() { return this; }
+
+	}
+
 	/**
 	 * Creates a new DSL instance using the given resolver and the default process-local unified
 	 * state store.
@@ -173,6 +256,22 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 	) {
 
 		this( resolver, JsonMapper.builder().build(), (EmbeddedSyncConfig<K>) null, new InMemoryReactiveMongoDslStateStore() );
+
+	}
+
+	/** Creates a DSL instance with the requested shared Change Stream document policy. */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							ChangeStreamDocumentMode changeStreamDocumentMode
+	) {
+
+		this(
+			resolver,
+			JsonMapper.builder().build(),
+			(EmbeddedSyncConfig<K>) null,
+			new InMemoryReactiveMongoDslStateStore(),
+			changeStreamDocumentMode
+		);
 
 	}
 
@@ -193,6 +292,17 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 	) {
 
 		this( resolver, JsonMapper.builder().build(), (EmbeddedSyncConfig<K>) null, stateStore );
+
+	}
+
+	/** Uses one state store and an explicit shared Change Stream document policy. */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							ReactiveMongoDslStateStore stateStore,
+							ChangeStreamDocumentMode changeStreamDocumentMode
+	) {
+
+		this( resolver, JsonMapper.builder().build(), (EmbeddedSyncConfig<K>) null, stateStore, changeStreamDocumentMode );
 
 	}
 
@@ -228,6 +338,18 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 	}
 
+	/** Creates a DSL instance with an explicit mapper, unified state store, and Change Stream policy. */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							ObjectMapper objectMapper,
+							ReactiveMongoDslStateStore stateStore,
+							ChangeStreamDocumentMode changeStreamDocumentMode
+	) {
+
+		this( resolver, objectMapper, (EmbeddedSyncConfig<K>) null, stateStore, changeStreamDocumentMode );
+
+	}
+
 	/**
 	 * Primary constructor. The supplied state store is used by cursor anchors, namespace versions,
 	 * Change Stream checkpoints, and embedded-sync leases unless EmbeddedSyncConfig explicitly
@@ -240,12 +362,36 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 							ReactiveMongoDslStateStore stateStore
 	) {
 
+		this( resolver, objectMapper, embeddedSyncConfig, stateStore, ChangeStreamDocumentMode.AUTO );
+
+	}
+
+	/**
+	 * Primary constructor with an explicit shared Change Stream document policy.
+	 * <p>{@link ChangeStreamDocumentMode#AUTO} is the default. It requests MongoDB 6.0+ post
+	 * images when the server supports that change-stream contract and falls back to the legacy
+	 * delta-only payload on older servers. Reservation maintenance still has local update-description
+	 * and targeted-_id lookup fallbacks when images are unavailable.</p>
+	 */
+	public ReactiveMongoDsl(
+							MongoTemplateResolver<K> resolver,
+							ObjectMapper objectMapper,
+							EmbeddedSyncConfig<K> embeddedSyncConfig,
+							ReactiveMongoDslStateStore stateStore,
+							ChangeStreamDocumentMode changeStreamDocumentMode
+	) {
+
 		this.resolver = Objects.requireNonNull( resolver, "resolver must not be null" );
 		this.objectMapper = Objects.requireNonNull( objectMapper, "objectMapper must not be null" );
 		this.stateStore = Objects.requireNonNull( stateStore, "stateStore must not be null" );
 		this.cursorAnchorStore = this.stateStore;
 		this.embeddedSyncLeaseStore = embeddedSyncConfig == null ? this.stateStore : embeddedSyncConfig.leaseStoreOr( this.stateStore );
-		this.changeStreamHub = new ChangeStreamHub( this.stateStore, this.stateStore, this.embeddedSyncLeaseStore );
+		this.changeStreamHub = new ChangeStreamHub(
+			this.stateStore,
+			Objects.requireNonNull( changeStreamDocumentMode, "changeStreamDocumentMode must not be null" ),
+			this.stateStore,
+			this.embeddedSyncLeaseStore
+		);
 		this.cursorNamespaceCoordinator = new CursorNamespaceCoordinator( this.changeStreamHub, this.cursorAnchorStore );
 
 		if (embeddedSyncConfig == null) {
@@ -479,76 +625,6 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 	}
 
-
-	private static Document copyDocument(
-		Document source
-	) {
-
-		Document copy = new Document();
-		source.forEach( (key, value) -> copy.put( key, copyDocumentValue( value ) ) );
-		return copy;
-
-	}
-
-	private static Object copyDocumentValue(
-		Object value
-	) {
-
-		if (value instanceof Document document)
-			return copyDocument( document );
-
-		if (value instanceof Map<?, ?> map) {
-			Document copy = new Document();
-			map.forEach( (key, nestedValue) -> copy.put( String.valueOf( key ), copyDocumentValue( nestedValue ) ) );
-			return copy;
-
-		}
-
-		if (value instanceof Collection<?> collection)
-			return collection.stream().map( ReactiveMongoDsl::copyDocumentValue ).toList();
-		if (value instanceof byte[] bytes)
-			return bytes.clone();
-		if (value instanceof java.util.Date date)
-			return new java.util.Date( date.getTime() );
-		return value;
-
-	}
-
-	private static Object readDocumentPath(
-		Document document, String path
-	) {
-
-		Object current = document;
-
-		for (String segment : path.split( "\\." )) {
-			if (! (current instanceof Document currentDocument))
-				return null;
-			current = currentDocument.get( segment );
-
-		}
-
-		return current;
-
-	}
-
-	private static void removeDocumentPath(
-		Document document, String path
-	) {
-
-		String[] segments = path.split( "\\." );
-		Document current = document;
-
-		for (int i = 0; i < segments.length - 1; i++) {
-			Object nested = current.get( segments[i] );
-			if (! (nested instanceof Document nestedDocument))
-				return;
-			current = nestedDocument;
-
-		}
-
-		current.remove( segments[segments.length - 1] );
-
-	}
 
 	private static <T> List<T> readLookupValues(
 		MongoExecutionContext executionContext, Class<T> targetClass, Object rawValue
@@ -1906,7 +1982,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 					boolean missingKey = false;
 
 					for (String key : keys) {
-						Object value = readDocumentPath( document, key );
+						Object value = MongoDocumentSupport.readPath( document, key );
 
 						if (value == null) {
 							missingKey = true;
@@ -1926,7 +2002,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 					document.remove( "_id" );
 					for (String key : keys)
-						removeDocumentPath( document, key );
+						MongoDocumentSupport.removePath( document, key );
 
 					Document updateDocument = new Document( "$setOnInsert", new Document( keyDocument ) );
 					if (! document.isEmpty())
@@ -2116,7 +2192,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 				? "history"
 				: (prefix.charAt( 0 ) == '_' ? prefix.substring( 1 ) : prefix);
 			Class<?> entityClass = e.getClass();
-			Document snapshot = copyDocument( mongoExecutionContext.write( e ) );
+			Document snapshot = MongoDocumentSupport.copy( mongoExecutionContext.write( e ) );
 			snapshot.remove( "_id" );
 			String sourceCollection = collectionName != null && ! collectionName.isBlank()
 				? collectionName
@@ -6856,8 +6932,9 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 			}
 
 			/**
-			 * Reserves shared change-stream invalidation for this query. The returned builder emits an
-			 * initial snapshot and re-runs the finite query whenever a dependency namespace changes.
+			 * Reserves a shared live result for this finite query. AUTO mode materializes the initial
+			 * snapshot and incrementally applies ordinary insert/update/delete/replace events when that is
+			 * provably safe; opaque semantics fall back to the legacy finite-query refresh path.
 			 */
 			public FindAllChangeStreamReservation reservationChangeStream() {
 
@@ -6870,6 +6947,20 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 				private final List<ReservationDependency> dependencies = new ArrayList<>();
 
 				private Duration coalesce = Duration.ofMillis( 50 );
+
+				private ReservationMode mode = ReservationMode.AUTO;
+
+				private int bufferCapacity = 1024;
+
+				/** Bounds pending events; overflow requests one correctness refresh instead of dropping deltas. */
+				public FindAllChangeStreamReservation bufferCapacity(
+					int capacity
+				) {
+					if (capacity < 1)
+						throw new IllegalArgumentException( "bufferCapacity must be >= 1" );
+					this.bufferCapacity = capacity;
+					return this;
+				}
 
 				public FindAllChangeStreamReservation watch(
 					Class<?> entityClass
@@ -6910,6 +7001,16 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				}
 
+				/** Selects incremental maintenance, legacy re-query behavior, or automatic fallback. */
+				public FindAllChangeStreamReservation mode(
+					ReservationMode mode
+				) {
+
+					this.mode = Objects.requireNonNull( mode, "mode must not be null" );
+					return this;
+
+				}
+
 				public Flux<ChangeStreamDocument<Document>> changes() {
 
 					return prepareChanges( List.of() ).thenMany( coalesce( rawChanges( List.of() ) ) );
@@ -6922,13 +7023,35 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 				}
 
+				/**
+				 * Emits the complete query result. In AUTO mode ordinary find queries are materialized once and
+				 * maintained from change events; unsupported semantics transparently retain legacy re-query
+				 * behavior.
+				 */
 				public Flux<List<E>> execute() {
 
-					return refreshSnapshots(
-						prepareChanges( List.of() ),
-						coalesce( rawChanges( List.of() ) ),
-						FindAllQueryBuilder.this.execute().collectList()
-					);
+					return emissions().map( ReservationEmission::snapshot );
+
+				}
+
+				/**
+				 * Emits an initial/refreshed snapshot and item-level deltas suitable for PRP/SSE/WebSocket
+				 * consumers that do not want to retransmit the complete result list after every change.
+				 */
+				public Flux<ReservationDelta<E>> deltas() {
+
+					return Flux.defer( () -> {
+						long[] previousRevision = { -1L };
+						return emissions().concatMap( emission -> {
+							long previous = previousRevision[0];
+							previousRevision[0] = emission.revision();
+							if (previous < 0L)
+								return Flux.just( ReservationDelta.initial( emission.snapshot() ) );
+							if (emission.revision() != previous + 1L)
+								return Flux.just( ReservationDelta.refreshed( emission.snapshot() ) );
+							return Flux.fromIterable( emission.deltas() );
+						}, 0 );
+					} );
 
 				}
 
@@ -6936,11 +7059,278 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 				) {
 
-					return refreshSnapshots(
+					if (mode == ReservationMode.INCREMENTAL_ONLY)
+						return Flux.error( new IllegalStateException( "lookup reservations are not incrementally materialized yet" ) );
+					return shareLookupSnapshots( rightBuilder, spec, "find-all", () -> refreshSnapshots(
 						prepareLookupChanges( rightBuilder ),
 						coalesce( Flux.merge( rawChanges( List.of() ), lookupReservationChanges( rightBuilder, spec ) ) ),
 						FindAllQueryBuilder.this.executeLookup( rightBuilder, spec ).collectList()
-					);
+					) );
+
+				}
+
+				private <R2> Flux<List<ResultTuple<E, List<R2>>>> shareLookupSnapshots(
+					ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder,
+					LookupSpec spec, String extraFingerprint,
+					Supplier<Flux<List<ResultTuple<E, List<R2>>>>> sourceFactory
+				) {
+
+					if (queryCustomized || aggregationCustomized || rightBuilder.queryCustomized || rightBuilder.aggregationCustomized)
+						return Flux.defer( sourceFactory ).onBackpressureLatest();
+					return Mono.zip(
+						executeClassMono, fieldBuilder.buildCriteria(), mongoExecutionContext.getDatabase(),
+						rightBuilder.getExecuteClassMono(), rightBuilder.getFieldBuilderCriteria(), rightBuilder.getMongoExecutionContext().getDatabase()
+					).flatMapMany( tuple -> {
+						String ownCollection = ReactiveMongoDsl.this.resolveCollectionName( mongoExecutionContext, tuple.getT1(), collectionName );
+						String rightCollection = rightBuilder.getCollectionName() != null && ! rightBuilder.getCollectionName().isBlank()
+							? rightBuilder.getCollectionName() : rightBuilder.resolveCollectionName( tuple.getT4() );
+						String fingerprint = CursorPaginationSupport.fingerprint(
+							"lookup-reservation-v1", extraFingerprint,
+							reservationFingerprint( tuple.getT1(), ownCollection, tuple.getT2().orElseGet( Document::new ), false ),
+							lookupFingerprint( spec, tuple.getT5().orElseGet( Document::new ), rightCollection ),
+							tuple.getT4().getName(), tuple.getT3().getReadPreference(), tuple.getT3().getReadConcern()
+						);
+						// Include BOTH mapping scopes. Sharing a right-side POJO with a different
+						// converter would otherwise return the first subscriber's representation.
+						Object key = List.of(
+							new ReservationRegistryKey( mongoExecutionContext.getReservationScope(), tuple.getT3().getName(), fingerprint ),
+							new ReservationRegistryKey( rightBuilder.getMongoExecutionContext().getReservationScope(), tuple.getT6().getName(), fingerprint )
+						);
+						return reservationRegistry.share( key, sourceFactory ).onBackpressureLatest();
+					} );
+
+				}
+
+				private Flux<ReservationEmission<E>> emissions() {
+
+					return Mono
+						.zip( executeClassMono, fieldBuilder.buildCriteria(), mongoExecutionContext.getDatabase() )
+						.flatMapMany( tuple -> {
+							Class<E> entityClass = tuple.getT1();
+							Bson criteria = tuple.getT2().orElseGet( Document::new );
+							String ownCollection = ReactiveMongoDsl.this.resolveCollectionName( mongoExecutionContext, entityClass, collectionName );
+							MongoDocumentMatcher.Analysis analysis = MongoDocumentMatcher.analyze( criteria );
+							Optional<java.util.Comparator<Document>> comparator = MongoDocumentComparator.from( sort );
+							boolean sortSupported = sort == null || comparator.isPresent();
+							boolean projectionSupported = excludes == null || Arrays.stream( excludes ).noneMatch( exclude -> exclude != null && exclude.contains( "." ) );
+							Optional<String> readPolicyReason = ReservationReadSupport.unsupportedReason( tuple.getT3(), readPreference, readConcern );
+							boolean incrementallySupported = ! queryCustomized && analysis.locallyEvaluable() && sortSupported && projectionSupported && readPolicyReason.isEmpty();
+
+							if (mode == ReservationMode.INCREMENTAL_ONLY && ! incrementallySupported)
+								return Flux.error(
+									new IllegalStateException(
+										"reservation query cannot be maintained incrementally: " + readPolicyReason.orElseGet( () -> incrementalUnsupportedReason( analysis, sortSupported, projectionSupported ) )
+									)
+								);
+							if (mode == ReservationMode.INCREMENTAL_ONLY && paging != null)
+								return Flux.error( new IllegalStateException( "offset paging reservations require hybrid refreshes when page boundaries move" ) );
+							if (mode == ReservationMode.INCREMENTAL_ONLY && ! dependencies.isEmpty())
+								return Flux.error( new IllegalStateException( "explicit reservation dependencies require refresh invalidation" ) );
+
+							boolean useIncremental = mode != ReservationMode.REQUERY && incrementallySupported;
+							String fingerprint = CursorPaginationSupport.fingerprint(
+								reservationFingerprint( entityClass, ownCollection, criteria, useIncremental ),
+								tuple.getT3().getReadPreference(), tuple.getT3().getReadConcern()
+							);
+							ReservationRegistryKey key = new ReservationRegistryKey( mongoExecutionContext.getReservationScope(), tuple.getT3().getName(), fingerprint );
+							java.util.function.Supplier<Flux<ReservationEmission<E>>> sourceFactory = () -> useIncremental
+								? incrementalEmissions( entityClass, criteria, ownCollection, analysis, comparator )
+									.onErrorResume( ReservationReadSupport.UnsafeSessionException.class, error -> mode == ReservationMode.INCREMENTAL_ONLY
+										? Flux.error( error ) : requeryEmissions() )
+								: requeryEmissions();
+
+							Supplier<Flux<ReservationEmission<E>>> versionedSource = () -> sourceFactory.get().index()
+								.map( indexed -> new ReservationEmission<>( indexed.getT2().snapshotSupplier(), indexed.getT2().deltas(), indexed.getT1() ) );
+							// Drain the shared replay immediately, retaining at most one pending snapshot
+							// per slow subscriber. deltas() detects revision gaps and sends REFRESHED.
+							return (queryCustomized ? versionedSource.get() : reservationRegistry.share( key, versionedSource ))
+								.onBackpressureLatest();
+
+						} );
+
+				}
+
+				private String incrementalUnsupportedReason(
+					MongoDocumentMatcher.Analysis analysis, boolean sortSupported, boolean projectionSupported
+				) {
+
+					if (queryCustomized)
+						return "customizeQuery makes filter/sort/page semantics opaque";
+					if (! analysis.locallyEvaluable())
+						return "the BSON filter contains an operator that the local matcher intentionally treats as UNKNOWN";
+					if (! sortSupported)
+						return "the sort is not an ordinary numeric ascending/descending BSON sort";
+					if (! projectionSupported)
+						return "nested exclusion projection is delegated to MongoDB because local array projection semantics are intentionally not guessed";
+					return "unknown reason";
+
+				}
+
+				private String reservationFingerprint(
+					Class<E> entityClass, String ownCollection, Bson criteria, boolean incremental
+				) {
+
+					List<String> dependencyFingerprint = dependencies
+						.stream()
+						.map(
+							dependency -> System.identityHashCode( dependency.context() ) + ":"
+								+ System.identityHashCode( dependency.context().getReservationScope() ) + ":" + dependency.collectionName()
+						)
+						.sorted()
+						.toList();
+					String pagingFingerprint = paging == null ? "" : paging.pageNumber + ":" + paging.pageSize;
+					return CursorPaginationSupport
+						.fingerprint(
+							"reservation-v3",
+							entityClass.getName(),
+							mode.name(),
+							incremental,
+							ownCollection,
+							MongoBsonSupport.toDocument( criteria ),
+							sort == null ? new Document() : MongoBsonSupport.toDocument( sort ),
+							pagingFingerprint,
+							excludes == null ? "" : Arrays.toString( excludes ),
+							dependencyFingerprint,
+							coalesce,
+							bufferCapacity,
+							readPreference,
+							readConcern,
+							operationTimeout != null ? operationTimeout : AbstractQueryBuilder.this.operationTimeout,
+							isAllowDiskUse
+						);
+
+				}
+
+				private Flux<ReservationEmission<E>> requeryEmissions() {
+
+					return refreshSnapshots(
+						prepareChanges( List.of() ),
+						coalesce( rawChanges( List.of() ) ),
+						FindAllQueryBuilder.this.execute().collectList()
+					)
+						.index()
+						.map( indexed -> {
+							List<E> snapshot = indexed.getT2();
+							ReservationDelta<E> delta = indexed.getT1() == 0L
+								? ReservationDelta.initial( snapshot )
+								: ReservationDelta.refreshed( snapshot );
+							return new ReservationEmission<>( snapshot, List.of( delta ) );
+						} );
+
+				}
+
+				private Flux<ReservationEmission<E>> incrementalEmissions(
+					Class<E> entityClass,
+					Bson criteria,
+					String ownCollection,
+					MongoDocumentMatcher.Analysis analysis,
+					Optional<java.util.Comparator<Document>> comparator
+				) {
+
+					return Flux.defer( () -> prepareChanges( List.of() ).thenMany( Flux.defer( () -> {
+						Sinks.Many<ReservationChange> bufferedChanges = Sinks.many().unicast().onBackpressureBuffer(
+							new BoundedInvalidationQueue<>( bufferCapacity, change -> new ReservationChange( change.ownCollection(), change.event(), true ) )
+						);
+						// Attach first, then capture a lower read fence. A causal majority read observes
+						// every event <= that fence; later events remain queued and are never discarded.
+						Disposable bridge = rawReservationChanges( ownCollection ).subscribe(
+							change -> {
+								Sinks.EmitResult result = bufferedChanges.tryEmitNext( change );
+								if (result.isFailure() && result != Sinks.EmitResult.FAIL_CANCELLED && result != Sinks.EmitResult.FAIL_TERMINATED)
+									bufferedChanges.tryEmitError( new IllegalStateException( "reservation change buffer rejected event: " + result ) );
+							}, bufferedChanges::tryEmitError, bufferedChanges::tryEmitComplete
+						);
+						// Probe AFTER attaching: otherwise a drop/recreate between the probe and
+						// subscription could silently replace a simple-collation collection.
+						return mongoExecutionContext.getDatabase()
+							.flatMap( database -> ReservationReadSupport.hasSimpleCollation( database, ownCollection ) )
+							.flatMapMany( simple -> {
+								if (! simple) {
+									bridge.dispose();
+									return mode == ReservationMode.INCREMENTAL_ONLY
+										? Flux.error( new IllegalStateException( "incremental reservation requires a verified simple-collation collection; listCollections metadata is unavailable or incompatible" ) )
+										: requeryEmissions();
+								}
+								return changeStreamHub.captureOperationTime( mongoExecutionContext )
+									.flatMap( boundary -> executeSnapshotDocuments( entityClass, criteria, boundary ).collectList()
+										.map( documents -> new MaterializedReservationState( entityClass, criteria, analysis, comparator, boundary, documents ) ) )
+									.flatMapMany( state -> Flux.concat(
+										Mono.fromSupplier( state::initialEmission ),
+										coalesceReservationChanges( bufferedChanges.asFlux() ).concatMap( state::applyBatch, 0 )
+									) );
+							} )
+							.doFinally( ignored -> bridge.dispose() );
+					} ) ) );
+
+				}
+
+				private Flux<Document> executeSnapshotDocuments(
+					Class<E> entityClass, Bson criteria, org.bson.BsonTimestamp boundary
+				) {
+
+					FindSpec query = new FindSpec().filter( criteria );
+					if (paging != null)
+						query.skip( (long) paging.pageNumber * paging.pageSize ).limit( paging.pageSize );
+					if (sort != null)
+						query.sort( sort );
+					applyQueryOptions( query ).readPreference( ReadPreference.primary() ).readConcern( ReadConcern.MAJORITY );
+					return resolveCollection( mongoExecutionContext, entityClass, collectionName )
+						.flatMapMany( collection -> ReservationReadSupport.causalRead(
+							mongoExecutionContext, boundary, session -> applyQuery( collection, query, session )
+						) );
+
+				}
+
+				private Mono<Document> lookupDocumentById(
+					Class<E> entityClass, Object id, org.bson.BsonTimestamp boundary
+				) {
+
+					if (id == null)
+						return Mono.empty();
+					FindSpec query = new FindSpec().filter( Filters.eq( "_id", id ) ).limit( 1 );
+					applyQueryOptions( query ).readPreference( ReadPreference.primary() ).readConcern( ReadConcern.MAJORITY );
+					return resolveCollection( mongoExecutionContext, entityClass, collectionName )
+						.flatMapMany( collection -> ReservationReadSupport.causalRead(
+							mongoExecutionContext, boundary, session -> applyQuery( collection, query, session )
+						) ).next();
+
+				}
+
+				private Flux<ReservationChange> rawReservationChanges(
+					String ownCollection
+				) {
+
+					List<Flux<ReservationChange>> streams = new ArrayList<>();
+					streams
+						.add(
+							changeStreamHub
+								.watchCollection( mongoExecutionContext, ownCollection )
+								.map( event -> new ReservationChange( true, event ) )
+						);
+					for (ReservationDependency dependency : dependencies) {
+						if (dependency.context() == mongoExecutionContext && dependency.collectionName().equals( ownCollection ))
+							continue;
+						streams
+							.add(
+								changeStreamHub
+									.watchCollection( dependency.context(), dependency.collectionName() )
+									.map( event -> new ReservationChange( false, event ) )
+							);
+					}
+					return Flux.merge( streams );
+
+				}
+
+				private Flux<List<ReservationChange>> coalesceReservationChanges(
+					Flux<ReservationChange> source
+				) {
+
+					if (coalesce.isZero())
+						return source.map( List::of );
+					return source
+						.bufferTimeout( Math.min( 256, bufferCapacity ), coalesce, true )
+						.filter( values -> ! values.isEmpty() )
+						.map( List::copyOf );
 
 				}
 
@@ -6948,12 +7338,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 					Mono<Void> preparation, Flux<ChangeStreamDocument<Document>> changes, Mono<List<V>> query
 				) {
 
-					return preparation
-						.thenMany(
-							Flux
-								.concat( Mono.just( 0L ), changes.map( ignored -> 1L ) )
-								.switchMap( ignored -> Mono.defer( () -> query ) )
-						);
+					return ReservationRefreshSupport.refresh( preparation, changes, () -> query );
 
 				}
 
@@ -7033,6 +7418,435 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 						.filter( values -> ! values.isEmpty() )
 						.map( values -> values.get( values.size() - 1 ) );
 
+				}
+
+				private boolean isIncrementalOnly() {
+					return mode == ReservationMode.INCREMENTAL_ONLY;
+				}
+
+				private final class MaterializedReservationState {
+
+					private final Class<E> entityClass;
+					private final Bson criteria;
+					private final MongoDocumentMatcher.Analysis analysis;
+					private final Optional<java.util.Comparator<Document>> comparator;
+					private final Set<String> sortFields;
+					private org.bson.BsonTimestamp catchupBoundary;
+					private org.bson.BsonTimestamp requiredReadTime;
+					private final LinkedHashMap<Object, Document> documents = new LinkedHashMap<>();
+					private final List<Document> orderedRows = new ArrayList<>();
+					private final Set<Object> lookedUpInBatch = new HashSet<>();
+					private boolean refreshOnly;
+					private boolean metadataInvalidated;
+
+					private MaterializedReservationState(
+						Class<E> entityClass,
+						Bson criteria,
+						MongoDocumentMatcher.Analysis analysis,
+						Optional<java.util.Comparator<Document>> comparator,
+						org.bson.BsonTimestamp catchupBoundary,
+						List<Document> initialDocuments
+					) {
+
+						this.entityClass = entityClass;
+						this.criteria = criteria;
+						this.analysis = analysis;
+						this.comparator = comparator;
+						this.sortFields = MongoDocumentComparator.fields( sort );
+						this.catchupBoundary = catchupBoundary;
+						this.requiredReadTime = catchupBoundary;
+						replaceDocuments( initialDocuments );
+						if (refreshOnly && mode == ReservationMode.INCREMENTAL_ONLY)
+							throw new IllegalStateException( "reservation sort values cannot be reproduced safely in memory" );
+
+					}
+
+					private ReservationEmission<E> initialEmission() {
+
+						List<E> snapshot = snapshot();
+						return new ReservationEmission<>( snapshot, List.of( ReservationDelta.initial( snapshot ) ) );
+
+					}
+
+					private Mono<ReservationEmission<E>> applyBatch(
+						List<ReservationChange> batch
+					) {
+
+						if (batch.isEmpty())
+							return Mono.empty();
+						lookedUpInBatch.clear();
+						for (ReservationChange change : batch) {
+							if (change.ownCollection() && change.event().getClusterTime() != null
+								&& compareTimestamp( change.event().getClusterTime(), requiredReadTime ) > 0)
+								requiredReadTime = change.event().getClusterTime();
+						}
+						if (batch.stream().anyMatch( ReservationChange::overflow )) {
+							if (mode == ReservationMode.INCREMENTAL_ONLY)
+								return Mono.error( new IllegalStateException( "bounded reservation event buffer overflowed; a correctness refresh is required" ) );
+							// The discarded backlog may include drop/recreate/rename. Recheck metadata,
+							// not just data, before resuming local matching after an overflow.
+							return mongoExecutionContext.getDatabase()
+								.flatMap( database -> ReservationReadSupport.hasSimpleCollation( database,
+									ReactiveMongoDsl.this.resolveCollectionName( mongoExecutionContext, entityClass, collectionName ) ) )
+								.doOnNext( simple -> metadataInvalidated |= ! simple )
+								.then( Mono.defer( this::refresh ) );
+						}
+						if (batch.stream().anyMatch( change -> ! change.ownCollection() ))
+							return refreshOrFail( "an explicit reservation dependency changed" );
+						// A missing timestamp is not evidence that an event is old. Re-read every time,
+						// including after a previous catch-up/refresh, instead of silently dropping it.
+						if (batch.stream().anyMatch( change -> change.event().getClusterTime() == null ))
+							return refreshOrFail( "a change event did not include clusterTime" );
+						if (batch.stream().anyMatch( change -> change.event().getOperationType() == null
+							|| ! Set.of( OperationType.INSERT, OperationType.UPDATE, OperationType.REPLACE, OperationType.DELETE ).contains( change.event().getOperationType() ) )) {
+							metadataInvalidated = true;
+							return refreshOrFail( "collection metadata may have changed" );
+						}
+						List<ReservationChange> effectiveBatch = batch.stream()
+							.filter( change -> ! isCatchup( change.event() ) ).toList();
+						if (effectiveBatch.isEmpty())
+							return Mono.empty();
+						if (refreshOnly)
+							return refreshOrFail( "the materialized query can no longer be reproduced safely" );
+						return applyEffectiveBatch( effectiveBatch, List.of() );
+
+					}
+
+					private Mono<ReservationEmission<E>> applyEffectiveBatch(
+						List<ReservationChange> effectiveBatch, List<ReservationDelta<E>> prefixDeltas
+					) {
+
+						if (effectiveBatch.isEmpty())
+							return prefixDeltas.isEmpty()
+								? Mono.empty()
+								: Mono.just( new ReservationEmission<>( snapshotSupplier(), List.copyOf( prefixDeltas ) ) );
+						if (paging != null && pageBoundaryMayChange( effectiveBatch ))
+							return refreshOrFail( "an offset-paging boundary may have changed" );
+
+						List<ReservationDelta<E>> deltas = new ArrayList<>( prefixDeltas );
+						return Flux
+							.fromIterable( effectiveBatch )
+							.concatMap( this::applyChange )
+							.doOnNext( deltas::add )
+							.then(
+								Mono.defer( () -> deltas.isEmpty() ? Mono.empty() : Mono.just( new ReservationEmission<>( snapshotSupplier(), List.copyOf( deltas ) ) ) )
+							)
+							.onErrorResume( ReservationRefreshRequired.class, ignored -> {
+								if (mode == ReservationMode.INCREMENTAL_ONLY)
+									return Mono.error( new IllegalStateException( "change event could not be applied incrementally" ) );
+								return refresh();
+							} );
+
+					}
+
+					private boolean pageBoundaryMayChange(
+						List<ReservationChange> batch
+					) {
+
+						for (ReservationChange change : batch) {
+							ChangeStreamDocument<Document> event = change.event();
+							if (event.getOperationType() != OperationType.UPDATE)
+								return true;
+							Set<String> changed = MongoDocumentUpdateApplier.changedFields( event.getUpdateDescription() );
+							if (event.getUpdateDescription() == null
+								|| MongoDocumentMatcher.touches( analysis.referencedFields(), changed )
+								|| MongoDocumentMatcher.touches( sortFields, changed ))
+								return true;
+						}
+						return false;
+
+					}
+
+					private Mono<ReservationDelta<E>> applyChange(
+						ReservationChange change
+					) {
+
+						ChangeStreamDocument<Document> event = change.event();
+						OperationType operationType = event.getOperationType();
+						if (operationType == null)
+							return Mono.error( new ReservationRefreshRequired() );
+						Object id = documentId( event );
+						if (id == null)
+							return Mono.error( new ReservationRefreshRequired() );
+						if (lookedUpInBatch.contains( id ))
+							return Mono.empty();
+
+						return switch (operationType) {
+							case INSERT, REPLACE -> reconcileOrLookup( id, event.getFullDocument() );
+							case UPDATE -> applyUpdate( id, event );
+							case DELETE -> removeExisting( id );
+							default -> {
+								// Drop/recreate/DDL may change collection collation. Stay on server-side
+								// maintenance until this reservation is disconnected and checked again.
+								metadataInvalidated = true;
+								yield Mono.error( new ReservationRefreshRequired() );
+							}
+						};
+
+					}
+
+					private Mono<ReservationDelta<E>> applyUpdate(
+						Object id, ChangeStreamDocument<Document> event
+					) {
+
+						if (id == null)
+							return Mono.error( new ReservationRefreshRequired() );
+
+						Document current = documents.get( id );
+						/*
+						 * A paged materialization only contains the current window. pageBoundaryMayChange()
+						 * already refreshes when membership/sort can move the boundary. Therefore an
+						 * UPDATE for an id outside this page, whose membership/order fields did not
+						 * change, must stay outside even if the shared hub supplied fullDocument.
+						 */
+						if (paging != null && current == null)
+							return Mono.empty();
+
+						if (event.getFullDocument() != null)
+							return reconcile( id, event.getFullDocument() );
+
+						if (current != null) {
+							MongoDocumentUpdateApplier.ApplyResult applied = MongoDocumentUpdateApplier.apply( current, event.getUpdateDescription() );
+							if (applied.applied())
+								return reconcile( id, applied.document() );
+							return lookupAndReconcile( id );
+						}
+
+						if (event.getUpdateDescription() == null)
+							return lookupAndReconcile( id );
+						Set<String> changed = MongoDocumentUpdateApplier.changedFields( event.getUpdateDescription() );
+						if (! MongoDocumentMatcher.touches( analysis.referencedFields(), changed ))
+							return Mono.empty();
+						return lookupAndReconcile( id );
+
+					}
+
+					private Mono<ReservationDelta<E>> reconcileOrLookup(
+						Object id, Document fullDocument
+					) {
+
+						if (id == null)
+							return Mono.error( new ReservationRefreshRequired() );
+						return fullDocument != null ? reconcile( id, fullDocument ) : lookupAndReconcile( id );
+
+					}
+
+					private Mono<ReservationDelta<E>> lookupAndReconcile(
+						Object id
+					) {
+
+						return lookupDocumentById( entityClass, id, requiredReadTime )
+							.map( Optional::of )
+							.defaultIfEmpty( Optional.empty() )
+							.flatMap( found -> {
+								// This read includes the whole current batch, not merely this event.
+								lookedUpInBatch.add( id );
+								// An unchanged document produces Mono.empty() too. Only a missing DB
+								// document may remove the row; never switchIfEmpty after reconcile().
+								return found.isPresent() ? reconcile( id, found.get() ) : removeExisting( id );
+							} );
+
+					}
+
+					private Mono<ReservationDelta<E>> reconcile(
+						Object id, Document candidate
+					) {
+
+						if (comparator.isPresent() && ! MongoDocumentComparator.canEvaluate( sort, candidate ))
+							return Mono.error( new ReservationRefreshRequired() );
+						MongoDocumentMatcher.MatchResult match = MongoDocumentMatcher.matches( analysis, candidate );
+						if (match == MongoDocumentMatcher.MatchResult.UNKNOWN)
+							return Mono.error( new ReservationRefreshRequired() );
+						Document before = documents.get( id );
+						if (match == MongoDocumentMatcher.MatchResult.NO_MATCH)
+							return before == null ? Mono.empty() : removeExisting( id );
+
+						Integer beforeIndex = before == null ? null : indexOfDocument( id );
+						Document copy = MongoDocumentSupport.copy( candidate );
+						if (before == null) {
+							int afterIndex = insertionIndex( copy );
+							documents.put( id, copy );
+							orderedRows.add( afterIndex, copy );
+							return Mono.just( ReservationDelta.inserted( id, readOutput( copy ), afterIndex ) );
+						}
+						if (before.equals( copy ))
+							return Mono.empty();
+						int afterIndex = beforeIndex;
+						if (comparator.isPresent() && comparator.get().compare( before, copy ) != 0) {
+							orderedRows.remove( beforeIndex.intValue() );
+							afterIndex = insertionIndex( copy );
+							orderedRows.add( afterIndex, copy );
+						} else {
+							orderedRows.set( beforeIndex, copy );
+						}
+						documents.put( id, copy );
+						return Mono.just(
+							ReservationDelta.updated( id, readOutput( before ), readOutput( copy ), beforeIndex, afterIndex )
+						);
+
+					}
+
+					private Mono<ReservationDelta<E>> removeExisting(
+						Object id
+					) {
+
+						if (id == null)
+							return Mono.empty();
+						Document before = documents.get( id );
+						if (before == null)
+							return Mono.empty();
+						Integer beforeIndex = indexOfDocument( id );
+						documents.remove( id );
+						orderedRows.remove( beforeIndex.intValue() );
+						return Mono.just( ReservationDelta.removed( id, readOutput( before ), beforeIndex ) );
+
+					}
+
+					private Mono<ReservationEmission<E>> refreshOrFail(
+						String reason
+					) {
+
+						if (mode == ReservationMode.INCREMENTAL_ONLY)
+							return Mono.error( new IllegalStateException( "incremental-only reservation requires a refresh: " + reason ) );
+						return refresh();
+
+					}
+
+					private Mono<ReservationEmission<E>> refresh() {
+
+						return changeStreamHub.captureOperationTime( mongoExecutionContext )
+							.map( time -> compareTimestamp( time, requiredReadTime ) < 0 ? requiredReadTime : time )
+							.flatMap( boundary -> executeSnapshotDocuments( entityClass, criteria, boundary ).collectList().map( rows -> {
+								replaceDocuments( rows );
+								catchupBoundary = boundary;
+								requiredReadTime = boundary;
+								List<E> snapshot = snapshot();
+								return new ReservationEmission<>( snapshot, List.of( ReservationDelta.refreshed( snapshot ) ) );
+							} ) );
+
+					}
+
+					private void replaceDocuments(
+						List<Document> rows
+					) {
+
+						documents.clear();
+						orderedRows.clear();
+						for (Document row : rows) {
+							Object id = row.get( "_id" );
+							if (id == null)
+								throw new IllegalStateException( "incremental reservation requires MongoDB _id in the internal snapshot" );
+							Document copy = MongoDocumentSupport.copy( row );
+							documents.put( id, copy );
+							orderedRows.add( copy );
+						}
+						refreshOnly = metadataInvalidated || ! canSortCurrentDocuments();
+						// The DB already sorted this snapshot. No second sort is necessary here.
+
+					}
+
+					private List<E> snapshot() {
+
+						return snapshotSupplier().get();
+
+					}
+
+					private Supplier<List<E>> snapshotSupplier() {
+
+						// Capture immutable row references NOW, not mutable state in a future callback.
+						// Mapping is lazy and memoized by ReservationEmission. Delta-only subscribers
+						// therefore map only the changed rows after their INITIAL snapshot.
+						List<Document> rows = orderedDocuments();
+						return () -> rows.stream().map( this::readOutput ).toList();
+
+					}
+
+					private List<Document> orderedDocuments() {
+
+						return List.copyOf( orderedRows );
+
+					}
+
+					private Integer indexOfDocument(
+						Object id
+					) {
+
+						if (id != null)
+							for (int index = 0; index < orderedRows.size(); index++)
+								if (Objects.equals( id, orderedRows.get( index ).get( "_id" ) ))
+									return index;
+						return null;
+
+					}
+
+					private int insertionIndex(
+						Document document
+					) {
+
+						if (comparator.isEmpty())
+							return orderedRows.size();
+						int low = 0;
+						int high = orderedRows.size();
+						while (low < high) {
+							int middle = (low + high) >>> 1;
+							if (comparator.get().compare( orderedRows.get( middle ), document ) <= 0)
+								low = middle + 1;
+							else
+								high = middle;
+						}
+						return low;
+
+					}
+
+					private boolean canSortCurrentDocuments() {
+
+						return comparator.isEmpty() || documents.values().stream().allMatch( document -> MongoDocumentComparator.canEvaluate( sort, document ) );
+
+					}
+
+					private E readOutput(
+						Document source
+					) {
+
+						Document projected = MongoDocumentSupport.copy( source );
+						if (excludes != null)
+							for (String exclude : excludes)
+								MongoDocumentSupport.removePath( projected, exclude );
+						return mongoExecutionContext.read( entityClass, projected );
+
+					}
+
+					private boolean isCatchup(
+						ChangeStreamDocument<Document> event
+					) {
+
+						return event.getClusterTime() != null && compareTimestamp( event.getClusterTime(), catchupBoundary ) <= 0;
+
+					}
+
+					private Object documentId(
+						ChangeStreamDocument<Document> event
+					) {
+
+						return event.getDocumentKey() == null ? null : MongoBsonSupport.toDocument( event.getDocumentKey() ).get( "_id" );
+
+					}
+
+				}
+
+				private int compareTimestamp(
+					org.bson.BsonTimestamp left, org.bson.BsonTimestamp right
+				) {
+
+					int time = Integer.compareUnsigned( left.getTime(), right.getTime() );
+					return time != 0 ? time : Integer.compareUnsigned( left.getInc(), right.getInc() );
+
+				}
+
+				private record ReservationChange(boolean ownCollection, ChangeStreamDocument<Document> event, boolean overflow) {
+					private ReservationChange(boolean ownCollection, ChangeStreamDocument<Document> event) {
+						this( ownCollection, event, false );
+					}
 				}
 
 				private record ReservationDependency(MongoExecutionContext context, String collectionName) {}
@@ -7294,6 +8108,15 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 					}
 
+					public PageNumberCursorChangeStreamReservation mode(
+						ReservationMode mode
+					) {
+
+						delegate.mode( mode );
+						return this;
+
+					}
+
 					public Flux<ChangeStreamDocument<Document>> changes() {
 
 						return delegate.changes();
@@ -7308,6 +8131,8 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 					public Flux<List<E>> execute() {
 
+						if (delegate.isIncrementalOnly())
+							return Flux.error( new IllegalStateException( "page-number cursor reservations currently use safe re-query invalidation" ) );
 						return delegate
 							.refreshSnapshots(
 								delegate.prepareChanges( List.of() ),
@@ -7317,16 +8142,31 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 
 					}
 
+					public Flux<ReservationDelta<E>> deltas() {
+
+						return execute()
+							.index()
+							.map( indexed -> indexed.getT1() == 0L
+								? ReservationDelta.initial( indexed.getT2() )
+								: ReservationDelta.refreshed( indexed.getT2() ) );
+
+					}
+
 					public <R2> Flux<List<ResultTuple<E, List<R2>>>> executeLookup(
 						ReactiveMongoDsl<?>.AbstractQueryBuilder<R2, ?>.FindAllQueryBuilder<R2> rightBuilder, LookupSpec spec
 					) {
 
-						return delegate
-							.refreshSnapshots(
+						if (delegate.isIncrementalOnly())
+							return Flux.error( new IllegalStateException( "lookup cursor reservations are not incrementally materialized yet" ) );
+						return delegate.shareLookupSnapshots(
+							rightBuilder, spec,
+							CursorPaginationSupport.fingerprint( "page-number-cursor", pageNumber, pageSize, maxRelativeSkip, skipExceededAction ),
+							() -> delegate.refreshSnapshots(
 								delegate.prepareLookupChanges( rightBuilder ),
 								delegate.coalesce( Flux.merge( delegate.rawChanges( List.of() ), delegate.lookupReservationChanges( rightBuilder, spec ) ) ),
 								PageNumberCursorPagingBuilder.this.executeLookup( rightBuilder, spec ).collectList()
-							);
+							)
+						);
 
 					}
 
@@ -9592,6 +10432,7 @@ public class ReactiveMongoDsl<K> implements AutoCloseable {
 	public void close() {
 
 		cursorNamespaceCoordinator.close();
+		reservationRegistry.clear();
 		if (embeddedSyncEngine != null)
 			embeddedSyncEngine.close();
 		changeStreamHub.close();

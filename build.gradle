@@ -5,7 +5,7 @@ plugins {
 }
 
 group = 'com.byeolnaerim'
-version = '1.1.0-alpha.1'
+version = '1.1.0-alpha.2'
 jar {
     archiveBaseName = 'reactive-mongo-dsl'
 }
@@ -144,4 +144,16 @@ import org.gradle.api.publish.tasks.GenerateModuleMetadata
 tasks.withType(GenerateModuleMetadata).configureEach {
     // publication 메타데이터 생성 전에 emptyJavadocJar 산출물을 확실히 만들게 함
     dependsOn(tasks.named("emptyJavadocJar"))
+}
+// Isolated reservation correctness/differential gate. Never reuses the TEST_* migration database.
+tasks.register('mongoReservationTest', Test) {
+    group = 'verification'
+    description = 'Runs reservation differential/change-stream tests on MONGO_RESERVATION_TEST_URI (replica set).'
+    dependsOn tasks.named('testClasses')
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform()
+    include '**/ReactiveMongoDslReservationMigrationSafetyIntegrationTest.class'
+    systemProperty 'mongo.reservation.required', 'true'
+    outputs.upToDateWhen { false }
 }

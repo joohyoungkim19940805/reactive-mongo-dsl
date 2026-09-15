@@ -26,6 +26,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
+import com.byeolnaerim.mongodsl.change.ReservationMode;
 import com.byeolnaerim.mongodsl.criteria.FieldsPair.Condition;
 import com.byeolnaerim.mongodsl.lookup.LookupSpec;
 import com.byeolnaerim.mongodsl.paging.CursorCacheOptions;
@@ -35,6 +36,8 @@ import com.byeolnaerim.mongodsl.paging.CursorTokenState;
 import com.byeolnaerim.mongodsl.result.CursorPage;
 import com.byeolnaerim.mongodsl.result.PageResult;
 import com.byeolnaerim.mongodsl.result.ResultTuple;
+import com.byeolnaerim.mongodsl.result.ReservationDelta;
+import com.byeolnaerim.mongodsl.result.ReservationDeltaType;
 import com.byeolnaerim.mongodsl.spi.DriverMongoExecutionContext;
 import com.byeolnaerim.mongodsl.state.InMemoryReactiveMongoDslStateStore;
 import com.byeolnaerim.mongodsl.state.MongoReactiveMongoDslStateStore;
@@ -782,6 +785,7 @@ class ReactiveMongoDslThreeFeaturesMigrationSafetyIntegrationTest {
 			.findAll()
 			.sorts( sort -> sort.driver( Sorts.ascending( "rank" ) ) )
 			.reservationChangeStream()
+			.mode( ReservationMode.REQUERY )
 			.coalesce( Duration.ofMillis( 20 ) )
 			.execute()
 			.take( 2 )
@@ -819,6 +823,133 @@ class ReactiveMongoDslThreeFeaturesMigrationSafetyIntegrationTest {
 		}
 
 	}
+
+	// AUTO reservation은 initial snapshot 이후 ordinary insert/update/delete를 item delta로 유지한다.
+	@Test
+	void reservationChangeStreamAutoEmitsIncrementalDeltas() throws Exception {
+
+		List<ReservationDelta<Document>> deltas = new CopyOnWriteArrayList<>();
+		CountDownLatch initial = new CountDownLatch( 1 );
+		CountDownLatch inserted = new CountDownLatch( 1 );
+		CountDownLatch updated = new CountDownLatch( 1 );
+		CountDownLatch removed = new CountDownLatch( 1 );
+		ObjectId id = new ObjectId();
+		ObjectId anchorId = new ObjectId();
+		Mono.from( collection( CURSOR ).insertOne(
+			new Document( "_id", anchorId ).append( "kind", "reservation-auto" ).append( "rank", 10 ).append( "content", "anchor" )
+		) ).block( TIMEOUT );
+
+		var subscription = cursorDsl
+			.executeEntity( Document.class, TestMongo.MAIN )
+			.fields( pair( "kind", "reservation-auto" ) )
+			.end()
+			.findAll()
+			.sorts( sort -> sort.driver( Sorts.ascending( "rank" ) ) )
+			.reservationChangeStream()
+			.coalesce( Duration.ZERO )
+			.deltas()
+			.subscribe( delta -> {
+				deltas.add( delta );
+				switch (delta.type()) {
+					case INITIAL -> initial.countDown();
+					case INSERTED -> inserted.countDown();
+					case UPDATED -> updated.countDown();
+					case REMOVED -> removed.countDown();
+					case REFRESHED -> {}
+				}
+			} );
+
+		try {
+			assertTrue( initial.await( TIMEOUT.toMillis(), TimeUnit.MILLISECONDS ), "initial delta was not emitted" );
+
+			Mono.from( collection( CURSOR ).insertOne(
+				new Document( "_id", id ).append( "kind", "reservation-auto" ).append( "rank", 1 ).append( "content", "before" )
+			) ).block( TIMEOUT );
+			assertTrue( inserted.await( TIMEOUT.toMillis(), TimeUnit.MILLISECONDS ), "insert delta was not emitted" );
+
+			Mono.from( collection( CURSOR ).updateOne(
+				Filters.eq( "_id", id ),
+				Updates.combine( Updates.set( "content", "after" ), Updates.set( "rank", 20 ) )
+			) ).block( TIMEOUT );
+			assertTrue( updated.await( TIMEOUT.toMillis(), TimeUnit.MILLISECONDS ), "update delta was not emitted" );
+
+			Mono.from( collection( CURSOR ).deleteOne( Filters.eq( "_id", id ) ) ).block( TIMEOUT );
+			assertTrue( removed.await( TIMEOUT.toMillis(), TimeUnit.MILLISECONDS ), "remove delta was not emitted" );
+
+			assertEquals( ReservationDeltaType.INITIAL, deltas.get( 0 ).type() );
+			assertEquals( 1, deltas.get( 0 ).snapshot().size() );
+
+			ReservationDelta<Document> insertDelta = deltas.stream()
+				.filter( delta -> delta.type() == ReservationDeltaType.INSERTED && id.equals( delta.documentId() ) )
+				.findFirst()
+				.orElseThrow();
+			assertEquals( 0, insertDelta.afterIndex() );
+
+			ReservationDelta<Document> updateDelta = deltas.stream()
+				.filter( delta -> delta.type() == ReservationDeltaType.UPDATED && "after".equals( delta.after().getString( "content" ) ) )
+				.findFirst()
+				.orElseThrow();
+			assertEquals( 0, updateDelta.beforeIndex() );
+			assertEquals( 1, updateDelta.afterIndex() );
+
+			ReservationDelta<Document> removeDelta = deltas.stream()
+				.filter( delta -> delta.type() == ReservationDeltaType.REMOVED && id.equals( delta.documentId() ) )
+				.findFirst()
+				.orElseThrow();
+			assertEquals( 1, removeDelta.beforeIndex() );
+
+		} finally {
+			subscription.dispose();
+		}
+
+	}
+
+
+	// UPDATE로 기존 결과 밖 문서가 query membership에 진입/이탈하는 경우도 AUTO가 안전하게 reconcile한다.
+	@Test
+	void reservationChangeStreamAutoTracksFilterMembershipTransitions() throws Exception {
+
+		ObjectId id = new ObjectId();
+		Mono.from( collection( CURSOR ).insertOne(
+			new Document( "_id", id ).append( "kind", "other" ).append( "rank", 1 ).append( "content", "value" )
+		) ).block( TIMEOUT );
+
+		List<ReservationDelta<Document>> deltas = new CopyOnWriteArrayList<>();
+		CountDownLatch initial = new CountDownLatch( 1 );
+		CountDownLatch inserted = new CountDownLatch( 1 );
+		CountDownLatch removed = new CountDownLatch( 1 );
+		var subscription = cursorDsl
+			.executeEntity( Document.class, TestMongo.MAIN )
+			.fields( pair( "kind", "reservation-enter" ) )
+			.end()
+			.findAll()
+			.reservationChangeStream()
+			.coalesce( Duration.ZERO )
+			.deltas()
+			.subscribe( delta -> {
+				deltas.add( delta );
+				if (delta.type() == ReservationDeltaType.INITIAL) initial.countDown();
+				if (delta.type() == ReservationDeltaType.INSERTED) inserted.countDown();
+				if (delta.type() == ReservationDeltaType.REMOVED) removed.countDown();
+			} );
+
+		try {
+			assertTrue( initial.await( TIMEOUT.toMillis(), TimeUnit.MILLISECONDS ), "initial delta was not emitted" );
+			Mono.from( collection( CURSOR ).updateOne( Filters.eq( "_id", id ), Updates.set( "kind", "reservation-enter" ) ) ).block( TIMEOUT );
+			assertTrue( inserted.await( TIMEOUT.toMillis(), TimeUnit.MILLISECONDS ), "membership entry delta was not emitted" );
+
+			Mono.from( collection( CURSOR ).updateOne( Filters.eq( "_id", id ), Updates.set( "kind", "other" ) ) ).block( TIMEOUT );
+			assertTrue( removed.await( TIMEOUT.toMillis(), TimeUnit.MILLISECONDS ), "membership exit delta was not emitted" );
+
+			assertTrue( deltas.stream().anyMatch( delta -> delta.type() == ReservationDeltaType.INSERTED && id.equals( delta.documentId() ) ) );
+			assertTrue( deltas.stream().anyMatch( delta -> delta.type() == ReservationDeltaType.REMOVED && id.equals( delta.documentId() ) ) );
+
+		} finally {
+			subscription.dispose();
+		}
+
+	}
+
 
 	// 동일 watched MongoDB의 단일 Mongo state store로 cursor/checkpoint/embedded lease를 함께 사용해도 내부 state
 	// write가 Change Stream self-feedback을 만들지 않는지 검증한다.

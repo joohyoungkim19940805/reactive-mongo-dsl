@@ -198,6 +198,9 @@ public class DriverMongoExecutionContext implements MongoExecutionContext {
 	public Object getSessionScope() { return mongoClient; }
 
 	@Override
+	public Object getReservationScope() { return mongoDatabase; }
+
+	@Override
 	public String getDistributedStateScopeKey() { return distributedStateScopeKey; }
 
 	@Override

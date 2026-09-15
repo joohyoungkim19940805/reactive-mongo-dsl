@@ -21,6 +21,8 @@ import com.byeolnaerim.mongodsl.state.ReactiveMongoDslStateStoreMetadata;
 import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
+import com.mongodb.client.model.changestream.FullDocument;
+import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
 import com.mongodb.client.model.changestream.OperationType;
 import com.mongodb.reactivestreams.client.ChangeStreamPublisher;
 import com.mongodb.reactivestreams.client.MongoDatabase;
@@ -58,6 +60,8 @@ public final class ChangeStreamHub implements AutoCloseable {
 
 	private final ChangeStreamCheckpointStore checkpointStore;
 
+	private final ChangeStreamDocumentMode documentMode;
+
 	private final List<ReactiveMongoDslStateStoreMetadata> stateStoreMetadata;
 
 	private final ConcurrentHashMap<ChangeStreamScope, ScopeState> scopes = new ConcurrentHashMap<>();
@@ -72,7 +76,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 
 	public ChangeStreamHub() {
 
-		this( new InMemoryChangeStreamCheckpointStore() );
+		this( new InMemoryChangeStreamCheckpointStore(), ChangeStreamDocumentMode.AUTO );
 
 	}
 
@@ -81,7 +85,18 @@ public final class ChangeStreamHub implements AutoCloseable {
 		ReactiveMongoDslStateStoreMetadata... stateStoreMetadata
 	) {
 
+		this( checkpointStore, ChangeStreamDocumentMode.AUTO, stateStoreMetadata );
+
+	}
+
+	public ChangeStreamHub(
+		ChangeStreamCheckpointStore checkpointStore,
+		ChangeStreamDocumentMode documentMode,
+		ReactiveMongoDslStateStoreMetadata... stateStoreMetadata
+	) {
+
 		this.checkpointStore = Objects.requireNonNull( checkpointStore, "checkpointStore must not be null" );
+		this.documentMode = Objects.requireNonNull( documentMode, "documentMode must not be null" );
 		Set<ReactiveMongoDslStateStoreMetadata> unique = Collections.newSetFromMap( new IdentityHashMap<>() );
 		unique.add( this.checkpointStore );
 		if (stateStoreMetadata != null) {
@@ -114,8 +129,9 @@ public final class ChangeStreamHub implements AutoCloseable {
 		Objects.requireNonNull( collectionName, "collectionName must not be null" );
 		return watch( executionContext )
 			.filter(
-				event -> event.getNamespace() != null
-					&& collectionName.equals( event.getNamespace().getCollectionName() )
+				event -> event.getOperationType() == OperationType.DROP_DATABASE || event.getOperationType() == OperationType.INVALIDATE
+					|| (event.getNamespace() != null && collectionName.equals( event.getNamespace().getCollectionName() ))
+					|| (event.getDestinationNamespace() != null && collectionName.equals( event.getDestinationNamespace().getCollectionName() ))
 			);
 
 	}
@@ -133,6 +149,19 @@ public final class ChangeStreamHub implements AutoCloseable {
 			.getDatabase()
 			.flatMap( database -> state( executionContext, database ).initialOperationTime )
 			.then();
+
+	}
+
+	/** Captures the database operation time used to distinguish reservation catch-up events. */
+	public Mono<BsonTimestamp> captureOperationTime(
+		MongoExecutionContext executionContext
+	) {
+
+		Objects.requireNonNull( executionContext, "executionContext must not be null" );
+		return executionContext
+			.getDatabase()
+			.flatMap( this::currentOperationTime )
+			.switchIfEmpty( Mono.error( new IllegalStateException( "MongoDB did not expose an operation time." ) ) );
 
 	}
 
@@ -327,6 +356,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 		Mono<BsonTimestamp> initialOperationTime = currentOperationTime( database )
 			.switchIfEmpty( Mono.error( new IllegalStateException( "MongoDB did not expose an operation time required to initialize the Change Stream safely." ) ) )
 			.cache();
+		Mono<ChangeStreamDocumentMode> effectiveDocumentMode = resolveDocumentMode( database ).cache();
 
 		Flux<ChangeStreamDocument<Document>> source = Flux
 			.defer(
@@ -336,7 +366,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 						excludedCollections( executionContext, database ),
 						initialOperationTime
 					)
-					.flatMapMany( tuple -> createPublisher( database, tuple.getT1(), tuple.getT2(), tuple.getT3() ) )
+					.flatMapMany( tuple -> effectiveDocumentMode.flatMapMany( mode -> createPublisher( database, tuple.getT1(), tuple.getT2(), tuple.getT3(), mode ) ) )
 			)
 			.bufferTimeout( INTERNAL_BATCH_SIZE, INTERNAL_BATCH_WINDOW )
 			.filter( events -> ! events.isEmpty() )
@@ -400,17 +430,54 @@ public final class ChangeStreamHub implements AutoCloseable {
 
 	}
 
+	private Mono<ChangeStreamDocumentMode> resolveDocumentMode(
+		MongoDatabase database
+	) {
+
+		if (documentMode != ChangeStreamDocumentMode.AUTO)
+			return Mono.just( documentMode );
+
+		/*
+		 * fullDocument/fullDocumentBeforeChange WHEN_AVAILABLE are server 6.0+ features.
+		 * The hello command is safe for ordinary clients and exposes maxWireVersion; 17 is
+		 * MongoDB 6.0's wire version. If capability probing itself fails, preserve the old
+		 * delta-only stream instead of turning an optional optimization into an outage.
+		 */
+		return Mono
+			.from( database.runCommand( new Document( "hello", 1 ) ) )
+			.map( hello -> {
+				Object value = hello.get( "maxWireVersion" );
+				return value instanceof Number number && number.intValue() >= 17
+					? ChangeStreamDocumentMode.POST_IMAGE_WHEN_AVAILABLE
+					: ChangeStreamDocumentMode.DELTA;
+			} )
+			.defaultIfEmpty( ChangeStreamDocumentMode.DELTA )
+			.onErrorReturn( ChangeStreamDocumentMode.DELTA );
+
+	}
+
 	private Flux<ChangeStreamDocument<Document>> createPublisher(
 		MongoDatabase database,
 		BsonDocument resumeToken,
 		Set<String> excludedCollections,
-		BsonTimestamp initialOperationTime
+		BsonTimestamp initialOperationTime,
+		ChangeStreamDocumentMode effectiveDocumentMode
 	) {
 
 		List<Bson> pipeline = new ArrayList<>();
 		if (excludedCollections != null && ! excludedCollections.isEmpty())
 			pipeline.add( Aggregates.match( Filters.nin( "ns.coll", excludedCollections ) ) );
 		ChangeStreamPublisher<Document> publisher = pipeline.isEmpty() ? database.watch() : database.watch( pipeline );
+		publisher = switch (effectiveDocumentMode) {
+			case AUTO -> throw new IllegalStateException( "AUTO change-stream document mode must be resolved before publisher creation" );
+			case DELTA -> publisher;
+			case POST_IMAGE_WHEN_AVAILABLE -> publisher.fullDocument( FullDocument.WHEN_AVAILABLE );
+			case PRE_POST_WHEN_AVAILABLE -> publisher
+				.fullDocument( FullDocument.WHEN_AVAILABLE )
+				.fullDocumentBeforeChange( FullDocumentBeforeChange.WHEN_AVAILABLE );
+			case UPDATE_LOOKUP -> publisher
+				.fullDocument( FullDocument.UPDATE_LOOKUP );
+		};
 		if (resumeToken != null && ! resumeToken.isEmpty())
 			publisher = publisher.resumeAfter( resumeToken );
 		else if (initialOperationTime != null)

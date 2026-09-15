@@ -105,6 +105,15 @@ public interface MongoExecutionContext {
 	default Object getSessionScope() { return this; }
 
 	/**
+	 * Returns a stable process-local identity for sharing materialized reservation queries.
+	 * <p>The default is this context instance because custom contexts may expose different
+	 * entity-conversion semantics even when they share the same MongoClient/session scope.
+	 * Adapters that know multiple context instances are mapping-equivalent may return a common
+	 * identity token to enable reservation sharing across those instances.</p>
+	 */
+	default Object getReservationScope() { return this; }
+
+	/**
 	 * Returns a stable application-defined scope key for state shared across load-balanced
 	 * application instances. The same physical MongoDB cluster/tenant should return the same value
 	 * on every instance. Process-local stores do not require this value.

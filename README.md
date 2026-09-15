@@ -1843,7 +1843,7 @@ This batching does **not** collapse the public Change Stream event sequence. Aft
 
 Internal observers execute before the batch checkpoint advances. If an observer fails, the checkpoint is not moved past that work first, allowing the event to be replayed after reconnection instead of being hidden behind a newer resume token.
 
-### `reservationChangeStream()`: re-run a finite query on invalidation
+### `reservationChangeStream()`: shared incremental snapshots and safe refresh
 
 Use a query reservation when you want a fresh snapshot whenever a dependency collection changes:
 
@@ -1863,7 +1863,7 @@ The stream:
 
 1. emits one initial finite-query snapshot,
 2. waits for Change Stream events from dependency collections,
-3. re-executes the same finite query and emits a new snapshot after an invalidation.
+3. maintains supported ordinary queries locally in `AUTO`, or refreshes when server semantics are required.
 
 The default coalescing window is 50ms and can be disabled with `Duration.ZERO`.
 
@@ -1880,8 +1880,9 @@ Additional dependencies can be declared explicitly:
 Available terminals:
 
 - `.changes()` / `.invalidations()` - dependency Change Stream events themselves
-- `.execute()` - re-run the ordinary finite query
-- `.executeLookup(right, spec)` - re-run a lookup finite query
+- `.execute()` - emit the current full query snapshot (incremental in supported `AUTO` cases)
+- `.deltas()` - initial state and ordered item changes; lagging consumers receive a safe `REFRESHED` state
+- `.executeLookup(right, spec)` - shared, single-flight lookup re-query stream
 
 For page-number cursor snapshot refreshes, select the strategy first and then use `.reservationChangeStream().execute()` or `.executeLookup(right, spec)`.
 
@@ -1894,7 +1895,7 @@ For page-number cursor snapshot refreshes, select the strategy first and then us
 
 Lookup reservations automatically include the right collection and nested `$lookup` dependencies found in the `LookupSpec`.
 
-A reservation does not translate the query filter into a document-level MongoDB Change Stream `$match`. It intentionally uses an **invalidation -> pull** model: any observed change in a dependency collection can cause the finite query to be run again. For high-change collections or expensive queries, choose `coalesce(...)`, dependency scope, and query cost accordingly.
+A reservation does not translate the query filter into a Change Stream `$match`. Supported `AUTO` queries evaluate the saved BSON against materialized documents and event data. Incompatible semantics, dependencies and page boundaries use safe server refreshes. Read consistency, simple-collation verification, bounded buffering, modes and sharing limitations are documented in [RESERVATION_CHANGE_STREAM.md](RESERVATION_CHANGE_STREAM.md). Reproducible tests are in [RESERVATION_TESTING.md](RESERVATION_TESTING.md).
 
 ---
 
@@ -2445,7 +2446,7 @@ Representative escape hatches:
 - Cursor sorts must use deterministic numeric ascending/descending fields. `_id: -1` is appended as a tie-breaker when `_id` is absent.
 - The default state store is process-local. Use a distributed store plus a stable `distributedStateScopeKey` when cursor/checkpoint/embedded lease state must be shared across application instances.
 - Do not share one `changeStreamConsumerId` across concurrently active Mongo-backed consumers. Use a stable/unique id only for a logical consumer that needs checkpoint continuity across restarts.
-- `reservationChangeStream()` does not translate the query filter into a Change Stream `$match`; it treats dependency writes as invalidations and re-runs the finite query.
+- `reservationChangeStream()` uses local maintenance for supported `AUTO` queries; dependencies/unsupported semantics require safe refresh. See `RESERVATION_CHANGE_STREAM.md` for consistency and fallback contracts.
 - Shared Change Stream internal state side effects can be batched, while public watch events are still delivered as the original individual events.
 
 ### Embedded snapshot sync
