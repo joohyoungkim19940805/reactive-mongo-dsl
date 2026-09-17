@@ -7,6 +7,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.math.BigDecimal;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -82,12 +84,12 @@ class ReactiveMongoDslReservationMigrationSafetyIntegrationTest {
 	@BeforeAll
 	void connectToDedicatedTestServer() {
 
-		String uri = System.getenv( "MONGO_RESERVATION_TEST_URI" );
+		TestEnvironment environment = TestEnvironment.load();
 
-		if (uri == null || uri.isBlank()) {
-			if (Boolean.getBoolean( "mongo.reservation.required" ))
-				throw new IllegalStateException( "MONGO_RESERVATION_TEST_URI must point to a dedicated replica-set test server" );
-			org.junit.jupiter.api.Assumptions.assumeTrue( false, "MONGO_RESERVATION_TEST_URI is not configured" );
+		if (! environment.isComplete()) {
+			if (Boolean.getBoolean( "mongo.integration.required" ))
+				throw new IllegalStateException( "TEST_CLUSTER_NAME, TEST_USERNAME, TEST_PASSWORD, and TEST_URL are required for mongoMigrationTest" );
+			org.junit.jupiter.api.Assumptions.assumeTrue( false, "MongoDB TEST_* environment variables are not configured" );
 
 		}
 
@@ -95,7 +97,7 @@ class ReactiveMongoDslReservationMigrationSafetyIntegrationTest {
 			.create(
 				MongoClientSettings
 					.builder()
-					.applyConnectionString( new ConnectionString( uri ) )
+					.applyConnectionString( new ConnectionString( environment.connectionString() ) )
 					.addCommandListener( new CommandListener() {
 
 						@Override
@@ -506,6 +508,45 @@ class ReactiveMongoDslReservationMigrationSafetyIntegrationTest {
 		assertNotNull( value, "missing " + expected + " emission" );
 		assertEquals( expected, value.type() );
 		return value;
+
+	}
+
+	private record TestEnvironment(String clusterName, String username, String password, String url) {
+
+		static TestEnvironment load() {
+
+			return new TestEnvironment(
+				System.getenv( "TEST_CLUSTER_NAME" ),
+				System.getenv( "TEST_USERNAME" ),
+				System.getenv( "TEST_PASSWORD" ),
+				System.getenv( "TEST_URL" )
+			);
+
+		}
+
+		boolean isComplete() {
+
+			return clusterName != null && ! clusterName.isBlank() && username != null && ! username.isBlank() && password != null && ! password.isBlank() && url != null && ! url.isBlank();
+
+		}
+
+		String connectionString() {
+
+			String value = url.trim();
+			if (value.startsWith( "mongodb://" ) || value.startsWith( "mongodb+srv://" ))
+				return value;
+			String suffix = value.startsWith( "@" ) ? value : "@" + value;
+			return "mongodb+srv://" + encode( username ) + ":" + encode( password ) + suffix;
+
+		}
+
+		private static String encode(
+			String value
+		) {
+
+			return URLEncoder.encode( value, StandardCharsets.UTF_8 ).replace( "+", "%20" );
+
+		}
 
 	}
 
