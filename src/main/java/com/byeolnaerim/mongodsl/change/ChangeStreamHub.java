@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import org.bson.BsonDocument;
 import org.bson.BsonTimestamp;
+import org.bson.BsonValue;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import com.byeolnaerim.mongodsl.spi.MongoExecutionContext;
@@ -47,8 +48,8 @@ public final class ChangeStreamHub implements AutoCloseable {
 		private final AtomicReference<Disposable> keeper = new AtomicReference<>();
 
 		private ScopeState(
-			Flux<ChangeStreamDocument<Document>> stream,
-			Mono<BsonTimestamp> initialOperationTime
+							Flux<ChangeStreamDocument<Document>> stream,
+							Mono<BsonTimestamp> initialOperationTime
 		) {
 
 			this.stream = stream;
@@ -81,8 +82,8 @@ public final class ChangeStreamHub implements AutoCloseable {
 	}
 
 	public ChangeStreamHub(
-		ChangeStreamCheckpointStore checkpointStore,
-		ReactiveMongoDslStateStoreMetadata... stateStoreMetadata
+							ChangeStreamCheckpointStore checkpointStore,
+							ReactiveMongoDslStateStoreMetadata... stateStoreMetadata
 	) {
 
 		this( checkpointStore, ChangeStreamDocumentMode.AUTO, stateStoreMetadata );
@@ -90,16 +91,18 @@ public final class ChangeStreamHub implements AutoCloseable {
 	}
 
 	public ChangeStreamHub(
-		ChangeStreamCheckpointStore checkpointStore,
-		ChangeStreamDocumentMode documentMode,
-		ReactiveMongoDslStateStoreMetadata... stateStoreMetadata
+							ChangeStreamCheckpointStore checkpointStore,
+							ChangeStreamDocumentMode documentMode,
+							ReactiveMongoDslStateStoreMetadata... stateStoreMetadata
 	) {
 
 		this.checkpointStore = Objects.requireNonNull( checkpointStore, "checkpointStore must not be null" );
 		this.documentMode = Objects.requireNonNull( documentMode, "documentMode must not be null" );
 		Set<ReactiveMongoDslStateStoreMetadata> unique = Collections.newSetFromMap( new IdentityHashMap<>() );
 		unique.add( this.checkpointStore );
+
 		if (stateStoreMetadata != null) {
+
 			for (ReactiveMongoDslStateStoreMetadata metadata : stateStoreMetadata) {
 				if (metadata != null)
 					unique.add( metadata );
@@ -107,6 +110,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 			}
 
 		}
+
 		this.stateStoreMetadata = List.copyOf( unique );
 
 	}
@@ -129,9 +133,8 @@ public final class ChangeStreamHub implements AutoCloseable {
 		Objects.requireNonNull( collectionName, "collectionName must not be null" );
 		return watch( executionContext )
 			.filter(
-				event -> event.getOperationType() == OperationType.DROP_DATABASE || event.getOperationType() == OperationType.INVALIDATE
-					|| (event.getNamespace() != null && collectionName.equals( event.getNamespace().getCollectionName() ))
-					|| (event.getDestinationNamespace() != null && collectionName.equals( event.getDestinationNamespace().getCollectionName() ))
+				event -> event.getOperationType() == OperationType.DROP_DATABASE || event.getOperationType() == OperationType.INVALIDATE || (event.getNamespace() != null && collectionName
+					.equals( event.getNamespace().getCollectionName() )) || (event.getDestinationNamespace() != null && collectionName.equals( event.getDestinationNamespace().getCollectionName() ))
 			);
 
 	}
@@ -160,7 +163,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 		Objects.requireNonNull( executionContext, "executionContext must not be null" );
 		return executionContext
 			.getDatabase()
-			.flatMap( this::currentOperationTime )
+			.flatMap( database -> currentOperationTime( executionContext, database ) )
 			.switchIfEmpty( Mono.error( new IllegalStateException( "MongoDB did not expose an operation time." ) ) );
 
 	}
@@ -174,17 +177,20 @@ public final class ChangeStreamHub implements AutoCloseable {
 		return executionContext.getDatabase().flatMap( database -> {
 			ScopeState state = state( executionContext, database );
 			return state.initialOperationTime.then( Mono.fromRunnable( () -> {
+
 				for (;;) {
 					Disposable current = state.keeper.get();
 					if (current != null && ! current.isDisposed())
 						return;
 					Disposable candidate = state.stream.subscribe( ignored -> {}, ignored -> {} );
+
 					if (state.keeper.compareAndSet( current, candidate )) {
 						if (current != null)
 							current.dispose();
 						return;
 
 					}
+
 					candidate.dispose();
 
 				}
@@ -211,9 +217,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 	 * disappear behind an already-saved resume token.
 	 */
 	public void registerObserver(
-		ChangeStreamScope scope,
-		Object observerKey,
-		Function<ChangeStreamDocument<Document>, Mono<Void>> observer
+		ChangeStreamScope scope, Object observerKey, Function<ChangeStreamDocument<Document>, Mono<Void>> observer
 	) {
 
 		Objects.requireNonNull( scope, "scope must not be null" );
@@ -228,9 +232,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 	 * normal observers, but can coalesce namespace-level work before the checkpoint advances.
 	 */
 	public void registerBatchObserver(
-		ChangeStreamScope scope,
-		Object observerKey,
-		Function<List<ChangeStreamDocument<Document>>, Mono<Void>> observer
+		ChangeStreamScope scope, Object observerKey, Function<List<ChangeStreamDocument<Document>>, Mono<Void>> observer
 	) {
 
 		Objects.requireNonNull( scope, "scope must not be null" );
@@ -304,6 +306,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 
 		if (events.isEmpty())
 			return Mono.empty();
+
 		for (int i = events.size() - 1; i >= 0; i--) {
 			ChangeStreamDocument<Document> event = events.get( i );
 			if (event.getOperationType() == OperationType.INVALIDATE)
@@ -312,6 +315,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 				return checkpointStore.save( scope, event.getResumeToken() );
 
 		}
+
 		return Mono.empty();
 
 	}
@@ -324,7 +328,8 @@ public final class ChangeStreamHub implements AutoCloseable {
 			return Flux.empty();
 		return notifyBatchObservers( scope, events )
 			.thenMany(
-				Flux.fromIterable( events )
+				Flux
+					.fromIterable( events )
 					.concatMap( event -> notifyObservers( scope, event ) )
 			)
 			.then( saveBatchCheckpoint( scope, events ) )
@@ -353,8 +358,15 @@ public final class ChangeStreamHub implements AutoCloseable {
 				"Distributed ChangeStreamCheckpointStore requires MongoExecutionContext#getDistributedStateScopeKey()."
 			);
 
-		Mono<BsonTimestamp> initialOperationTime = currentOperationTime( database )
-			.switchIfEmpty( Mono.error( new IllegalStateException( "MongoDB did not expose an operation time required to initialize the Change Stream safely." ) ) )
+		Mono<BsonTimestamp> initialOperationTime = currentOperationTime( executionContext, database )
+			.switchIfEmpty(
+				Mono
+					.error(
+						new IllegalStateException(
+							"MongoDB did not expose an operation time required to initialize the Change Stream safely."
+						)
+					)
+			)
 			.cache();
 		Mono<ChangeStreamDocumentMode> effectiveDocumentMode = resolveDocumentMode( database ).cache();
 
@@ -394,12 +406,33 @@ public final class ChangeStreamHub implements AutoCloseable {
 	}
 
 	private Mono<BsonTimestamp> currentOperationTime(
-		MongoDatabase database
+		MongoExecutionContext executionContext, MongoDatabase database
 	) {
 
 		return Mono
-			.from( database.runCommand( new Document( "ping", 1 ) ) )
-			.flatMap( result -> Mono.justOrEmpty( extractOperationTime( result ) ) );
+			.usingWhen(
+				executionContext.startSession(),
+				session -> Mono
+					.from( database.runCommand( session, new Document( "ping", 1 ) ) )
+					.flatMap( result -> {
+						BsonTimestamp operationTime = session.getOperationTime();
+
+						if (operationTime != null) { return Mono.just( operationTime ); }
+
+						BsonDocument clusterTime = session.getClusterTime();
+
+						if (clusterTime != null) {
+							BsonValue value = clusterTime.get( "clusterTime" );
+
+							if (value != null && value.isTimestamp()) { return Mono.just( value.asTimestamp() ); }
+
+						}
+
+						return Mono.justOrEmpty( extractOperationTime( result ) );
+
+					} ),
+				session -> Mono.fromRunnable( session::close )
+			);
 
 	}
 
@@ -414,18 +447,21 @@ public final class ChangeStreamHub implements AutoCloseable {
 			return timestamp;
 
 		Object clusterTime = commandResult.get( "$clusterTime" );
+
 		if (clusterTime instanceof Document clusterTimeDocument) {
 			Object timestamp = clusterTimeDocument.get( "clusterTime" );
 			if (timestamp instanceof BsonTimestamp bsonTimestamp)
 				return bsonTimestamp;
 
 		}
+
 		if (clusterTime instanceof BsonDocument clusterTimeDocument) {
 			var timestamp = clusterTimeDocument.get( "clusterTime" );
 			if (timestamp instanceof BsonTimestamp bsonTimestamp)
 				return bsonTimestamp;
 
 		}
+
 		return null;
 
 	}
@@ -437,12 +473,10 @@ public final class ChangeStreamHub implements AutoCloseable {
 		if (documentMode != ChangeStreamDocumentMode.AUTO)
 			return Mono.just( documentMode );
 
-		/*
-		 * fullDocument/fullDocumentBeforeChange WHEN_AVAILABLE are server 6.0+ features.
+		/* fullDocument/fullDocumentBeforeChange WHEN_AVAILABLE are server 6.0+ features.
 		 * The hello command is safe for ordinary clients and exposes maxWireVersion; 17 is
 		 * MongoDB 6.0's wire version. If capability probing itself fails, preserve the old
-		 * delta-only stream instead of turning an optional optimization into an outage.
-		 */
+		 * delta-only stream instead of turning an optional optimization into an outage. */
 		return Mono
 			.from( database.runCommand( new Document( "hello", 1 ) ) )
 			.map( hello -> {
@@ -450,6 +484,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 				return value instanceof Number number && number.intValue() >= 17
 					? ChangeStreamDocumentMode.POST_IMAGE_WHEN_AVAILABLE
 					: ChangeStreamDocumentMode.DELTA;
+
 			} )
 			.defaultIfEmpty( ChangeStreamDocumentMode.DELTA )
 			.onErrorReturn( ChangeStreamDocumentMode.DELTA );
@@ -457,11 +492,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 	}
 
 	private Flux<ChangeStreamDocument<Document>> createPublisher(
-		MongoDatabase database,
-		BsonDocument resumeToken,
-		Set<String> excludedCollections,
-		BsonTimestamp initialOperationTime,
-		ChangeStreamDocumentMode effectiveDocumentMode
+		MongoDatabase database, BsonDocument resumeToken, Set<String> excludedCollections, BsonTimestamp initialOperationTime, ChangeStreamDocumentMode effectiveDocumentMode
 	) {
 
 		List<Bson> pipeline = new ArrayList<>();
@@ -477,6 +508,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 				.fullDocumentBeforeChange( FullDocumentBeforeChange.WHEN_AVAILABLE );
 			case UPDATE_LOOKUP -> publisher
 				.fullDocument( FullDocument.UPDATE_LOOKUP );
+
 		};
 		if (resumeToken != null && ! resumeToken.isEmpty())
 			publisher = publisher.resumeAfter( resumeToken );
@@ -495,6 +527,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 				disposable.dispose();
 
 		}
+
 		scopes.clear();
 		observers.clear();
 		batchObservers.clear();
