@@ -357,7 +357,6 @@ public final class ChangeStreamHub implements AutoCloseable {
 			throw new IllegalStateException(
 				"Distributed ChangeStreamCheckpointStore requires MongoExecutionContext#getDistributedStateScopeKey()."
 			);
-
 		Mono<BsonTimestamp> initialOperationTime = currentOperationTime( executionContext, database )
 			.map( operationTime -> new BsonTimestamp( operationTime.getValue() + 1L ) )
 			.switchIfEmpty(
@@ -412,32 +411,110 @@ public final class ChangeStreamHub implements AutoCloseable {
 
 		return Mono
 			.usingWhen(
-				executionContext.startSession(),
+				executionContext
+					.startSession()
+					.switchIfEmpty(
+						Mono
+							.error(
+								new IllegalStateException(
+									"MongoExecutionContext.startSession() returned empty."
+								)
+							)
+					),
 				session -> Mono
 					.from( database.runCommand( session, new Document( "ping", 1 ) ) )
 					.flatMap( result -> {
 						BsonTimestamp operationTime = session.getOperationTime();
-
-						if (operationTime != null) { return Mono.just( operationTime ); }
+						if (operationTime != null)
+							return Mono.just( operationTime );
 
 						operationTime = extractOperationTime( result );
+						if (operationTime != null)
+							return Mono.just( operationTime );
 
-						if (operationTime != null) { return Mono.just( operationTime ); }
-
-						BsonDocument clusterTime = session.getClusterTime();
-
-						if (clusterTime != null) {
-							BsonValue value = clusterTime.get( "clusterTime" );
-
-							if (value != null && value.isTimestamp()) { return Mono.just( value.asTimestamp() ); }
-
+						try {
+							BsonDocument clusterTime = session.getClusterTime();
+							if (clusterTime != null) {
+								BsonValue value = clusterTime.get( "clusterTime" );
+								if (value != null && value.isTimestamp())
+									return Mono.just( value.asTimestamp() );
+							}
+						} catch (UnsupportedOperationException ignored) {
+							// Test doubles or Mongo-compatible implementations may not expose session cluster time.
 						}
 
 						return Mono.empty();
-
-					} ),
+					} )
+					.switchIfEmpty( currentOperationTimeFromHello( database ) ),
 				session -> Mono.fromRunnable( session::close )
 			);
+
+	}
+
+	private Mono<BsonTimestamp> currentOperationTimeFromHello(
+		MongoDatabase database
+	) {
+
+		return Mono
+			.from( database.runCommand( new Document( "hello", 1 ) ) )
+			.flatMap( hello -> {
+				BsonTimestamp operationTime = extractOperationTime( hello );
+				if (operationTime != null)
+					return Mono.just( operationTime );
+
+				operationTime = extractHelloLastWriteTime( hello, "majorityOpTime" );
+				if (operationTime != null)
+					return Mono.just( operationTime );
+
+				operationTime = extractHelloLastWriteTime( hello, "opTime" );
+				if (operationTime != null)
+					return Mono.just( operationTime );
+
+				boolean replicaSet = hello.get( "setName" ) != null;
+				boolean sharded = "isdbgrid".equals( hello.getString( "msg" ) );
+				if (! replicaSet && ! sharded)
+					return Mono
+						.error(
+							new IllegalStateException(
+								"MongoDB deployment does not appear to be a replica set or sharded cluster; Change Streams are not available. hello=" + hello
+							)
+						);
+
+				return Mono
+					.error(
+						new IllegalStateException(
+							"MongoDB topology supports Change Streams but did not expose a usable logical operation time. hello=" + hello
+						)
+					);
+			} );
+
+	}
+
+	private BsonTimestamp extractHelloLastWriteTime(
+		Document hello, String field
+	) {
+
+		if (hello == null)
+			return null;
+
+		Object lastWriteValue = hello.get( "lastWrite" );
+		if (!(lastWriteValue instanceof Document lastWrite))
+			return null;
+
+		Object opTimeValue = lastWrite.get( field );
+		if (opTimeValue instanceof Document opTime) {
+			Object timestamp = opTime.get( "ts" );
+			if (timestamp instanceof BsonTimestamp bsonTimestamp)
+				return bsonTimestamp;
+		}
+
+		if (opTimeValue instanceof BsonDocument opTime) {
+			BsonValue timestamp = opTime.get( "ts" );
+			if (timestamp != null && timestamp.isTimestamp())
+				return timestamp.asTimestamp();
+		}
+
+		return null;
 
 	}
 
