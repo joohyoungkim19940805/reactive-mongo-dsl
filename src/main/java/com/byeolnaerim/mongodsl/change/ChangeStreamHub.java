@@ -359,6 +359,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 			);
 
 		Mono<BsonTimestamp> initialOperationTime = currentOperationTime( executionContext, database )
+			.map( operationTime -> new BsonTimestamp( operationTime.getValue() + 1L ) )
 			.switchIfEmpty(
 				Mono
 					.error(
@@ -419,6 +420,10 @@ public final class ChangeStreamHub implements AutoCloseable {
 
 						if (operationTime != null) { return Mono.just( operationTime ); }
 
+						operationTime = extractOperationTime( result );
+
+						if (operationTime != null) { return Mono.just( operationTime ); }
+
 						BsonDocument clusterTime = session.getClusterTime();
 
 						if (clusterTime != null) {
@@ -428,7 +433,7 @@ public final class ChangeStreamHub implements AutoCloseable {
 
 						}
 
-						return Mono.justOrEmpty( extractOperationTime( result ) );
+						return Mono.empty();
 
 					} ),
 				session -> Mono.fromRunnable( session::close )
