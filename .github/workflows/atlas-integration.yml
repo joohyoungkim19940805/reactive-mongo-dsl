@@ -1,0 +1,70 @@
+name: Atlas integration tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atlas-integration
+  cancel-in-progress: false
+
+jobs:
+  atlas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TEST_CLUSTER_NAME: ${{ secrets.TEST_CLUSTER_NAME }}
+      TEST_USERNAME: ${{ secrets.TEST_USERNAME }}
+      TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
+      TEST_URL: ${{ secrets.TEST_URL }}
+      TEST_SEARCH_VECTOR_DATABASE: rmdsl_ci_search_vector
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - name: Check required secrets
+        id: secrets
+        shell: bash
+        run: |
+          for variableName in TEST_CLUSTER_NAME TEST_USERNAME TEST_PASSWORD TEST_URL; do
+            if [[ -z "${!variableName}" ]]; then
+              echo "::error::Missing GitHub Actions secret: $variableName"
+              exit 1
+            fi
+          done
+      - name: Register the existing Atlas Search and Vector test
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/atlas-ci.init.gradle" <<'GRADLE'
+          allprojects {
+              tasks.register('mongoSearchVectorTest', org.gradle.api.tasks.testing.Test) {
+                  group = 'verification'
+                  dependsOn tasks.named('testClasses')
+                  testClassesDirs = sourceSets.test.output.classesDirs
+                  classpath = sourceSets.test.runtimeClasspath
+                  useJUnitPlatform()
+                  include '**/ReactiveMongoDslSearchVectorMigrationSafetyIntegrationTest.class'
+                  systemProperty 'mongo.integration.required', 'true'
+                  outputs.upToDateWhen { false }
+              }
+          }
+          GRADLE
+      - name: Run Atlas Search and Vector Search tests
+        run: bash gradlew mongoSearchVectorTest --init-script "$RUNNER_TEMP/atlas-ci.init.gradle" --no-daemon --max-workers=2
+      - name: Run migration and reservation tests
+        if: ${{ !cancelled() && steps.secrets.outcome == 'success' }}
+        run: bash gradlew mongoMigrationTest mongoReservationTest --continue --no-daemon --max-workers=2
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reactive-mongo-dsl-atlas-reports
+          path: |
+            build/reports/tests/
+            build/test-results/
+          if-no-files-found: warn
