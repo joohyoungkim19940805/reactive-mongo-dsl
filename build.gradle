@@ -157,3 +157,18 @@ tasks.register('mongoReservationTest', Test) {
     systemProperty 'mongo.reservation.required', 'true'
     outputs.upToDateWhen { false }
 }
+
+tasks.register('mongoEmbeddedSyncTest', Test) {
+    group = 'verification'
+    description = 'Runs embedded snapshot synchronization against MongoDB using TEST_CLUSTER_NAME, TEST_USERNAME, TEST_PASSWORD and TEST_URL.'
+    dependsOn tasks.named('testClasses')
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform()
+    include '**/ReactiveMongoDslThreeFeaturesMigrationSafetyIntegrationTest.class'
+    filter {
+        includeTestsMatching 'com.byeolnaerim.mongodsl.ReactiveMongoDslThreeFeaturesMigrationSafetyIntegrationTest.embeddedSynchronizationConvergesAcrossCollectionMapSingleMoveDeleteAndMultiHopRelations'
+    }
+    systemProperty 'mongo.integration.required', 'true'
+    outputs.upToDateWhen { false }
+}

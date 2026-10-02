@@ -350,15 +350,14 @@ public final class EmbeddedSyncEngine implements AutoCloseable {
 	) {
 
 		Optional<Bson> linkedTargets = buildLinkFilter( relation.definition().links(), source );
-		Document snapshot = snapshotSource( relation.definition(), source );
 		if (relation.definition().links().isEmpty())
-			return updateCurrentTargets( relation, sourceId, snapshot, linkedTargets );
+			return updateCurrentTargets( relation, sourceId, source, linkedTargets );
 
 		Mono<Void> cleanup = cleanupMovedReference( relation, sourceId, linkedTargets );
 		if (linkedTargets.isEmpty())
 			return cleanup;
 
-		return updateCurrentTargets( relation, sourceId, snapshot, linkedTargets ).then( cleanup );
+		return updateCurrentTargets( relation, sourceId, source, linkedTargets ).then( cleanup );
 
 	}
 
@@ -400,20 +399,21 @@ public final class EmbeddedSyncEngine implements AutoCloseable {
 	) {
 
 		String field = relation.definition().targetField();
+		Document snapshot = snapshotSource( relation.definition(), source );
 		return collection( relation.context(), relation.targetCollection() ).flatMap( target -> switch (relation.definition().cardinality()) {
 			case SINGLE -> {
 				Bson filter = linkedTargets.orElseGet( () -> Filters.eq( field + "._id", sourceId ) );
-				yield Mono.from( target.updateMany( filter, Updates.set( field, source ) ) ).then();
+				yield Mono.from( target.updateMany( filter, Updates.set( field, snapshot ) ) ).then();
 
 			}
 			case COLLECTION -> {
 				if (linkedTargets.isPresent())
-					yield Mono.from( target.updateMany( linkedTargets.get(), collectionUpsertPipeline( field, sourceId, source ) ) ).then();
+					yield Mono.from( target.updateMany( linkedTargets.get(), collectionUpsertPipeline( field, sourceId, snapshot ) ) ).then();
 				UpdateOptions options = new UpdateOptions().arrayFilters( List.of( Filters.eq( "embedded._id", sourceId ) ) );
 				yield Mono.from(
 					target.updateMany(
 						Filters.eq( field + "._id", sourceId ),
-						Updates.set( field + ".$[embedded]", source ),
+						Updates.set( field + ".$[embedded]", snapshot ),
 						options
 					)
 				).then();
@@ -426,7 +426,7 @@ public final class EmbeddedSyncEngine implements AutoCloseable {
 				String mapKey = String.valueOf( mapKeyValue );
 				validateMapKey( mapKey );
 				Bson filter = linkedTargets.orElseGet( () -> mapContainsSourceId( field, sourceId ) );
-				yield Mono.from( target.updateMany( filter, mapUpsertPipeline( field, sourceId, mapKey, source ) ) ).then();
+				yield Mono.from( target.updateMany( filter, mapUpsertPipeline( field, sourceId, mapKey, snapshot ) ) ).then();
 
 			}
 		} );

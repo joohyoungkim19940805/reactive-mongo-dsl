@@ -36,7 +36,8 @@ class ReservationRefreshSupportTest {
                 second.tryEmitValue(2);
             })
             .expectNext(2)
-            .thenCancel().verify(Duration.ofSeconds(5));
+            .then(() -> assertEquals(Sinks.EmitResult.OK, changes.tryEmitComplete()))
+            .expectComplete().verify(Duration.ofSeconds(5));
         assertEquals(2, subscriptions.get());
         assertEquals(0, cancellations.get());
         assertEquals(0, changes.currentSubscriberCount());
@@ -57,9 +58,17 @@ class ReservationRefreshSupportTest {
     @Test
     void cancellationClosesBothInflightQueryAndChangeBridge() {
         var changes = Sinks.many().multicast().<Integer>directBestEffort();
+        AtomicInteger subscriptions = new AtomicInteger();
         AtomicInteger cancellations = new AtomicInteger();
         StepVerifier.create(ReservationRefreshSupport.refresh(Mono.empty(), changes.asFlux(),
-            () -> Mono.<Integer>never().doOnCancel(cancellations::incrementAndGet)))
+            () -> Mono.<Integer>never()
+                .doOnSubscribe(ignored -> subscriptions.incrementAndGet())
+                .doOnCancel(cancellations::incrementAndGet)))
+            .then(() -> {
+                assertEquals(1, subscriptions.get());
+                assertEquals(1, changes.currentSubscriberCount());
+                assertEquals(0, cancellations.get());
+            })
             .thenCancel().verify(Duration.ofSeconds(5));
         assertEquals(1, cancellations.get());
         assertEquals(0, changes.currentSubscriberCount());

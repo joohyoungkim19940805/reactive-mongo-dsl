@@ -2,6 +2,7 @@ package com.byeolnaerim.mongodsl.internal;
 
 import static org.junit.jupiter.api.Assertions.*;
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.bson.BsonTimestamp;
 import org.junit.jupiter.api.Test;
 import com.byeolnaerim.mongodsl.support.ReservationTestContext;
@@ -63,8 +64,17 @@ class ReservationReadSupportTest {
         StepVerifier.create(ReservationReadSupport.causalRead(context, fence, session -> Mono.empty())).verifyComplete();
         StepVerifier.create(ReservationReadSupport.causalRead(context, fence, session -> Mono.error(new IllegalStateException("read"))))
             .expectErrorMessage("read").verify();
-        StepVerifier.create(ReservationReadSupport.causalRead(context, fence, session -> Mono.never()))
+        AtomicInteger readSubscriptions = new AtomicInteger();
+        AtomicInteger readCancellations = new AtomicInteger();
+        StepVerifier.create(ReservationReadSupport.causalRead(context, fence, session -> Mono.never()
+                .doOnSubscribe(ignored -> readSubscriptions.incrementAndGet())
+                .doOnCancel(readCancellations::incrementAndGet)))
+            .then(() -> {
+                assertEquals(1, readSubscriptions.get());
+                assertEquals(2, context.sessionsClosed.get());
+            })
             .thenCancel().verify(Duration.ofSeconds(3));
+        assertEquals(1, readCancellations.get());
         assertEquals(3, context.sessionsClosed.get());
     }
 }

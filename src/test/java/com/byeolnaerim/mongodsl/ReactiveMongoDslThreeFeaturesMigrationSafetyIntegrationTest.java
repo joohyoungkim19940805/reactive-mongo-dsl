@@ -167,6 +167,7 @@ class ReactiveMongoDslThreeFeaturesMigrationSafetyIntegrationTest {
 			.intoField( "id" )
 			.end()
 			.mapKey( "code" )
+			.excludeSourceFields( "code", "parentId" )
 			.build();
 
 		mongoDsl = new ReactiveMongoDsl<>( ignored -> context, embeddedSync );
@@ -322,6 +323,8 @@ class ReactiveMongoDslThreeFeaturesMigrationSafetyIntegrationTest {
 
 		} );
 		assertEquals( 2, p1.get( "tagsByCode", Document.class ).size() );
+		assertFalse( p1.get( "tagsByCode", Document.class ).get( "one", Document.class ).containsKey( "code" ) );
+		assertFalse( p1.get( "tagsByCode", Document.class ).get( "one", Document.class ).containsKey( "parentId" ) );
 
 		Mono.from( tags.updateOne( Filters.eq( "_id", tag1 ), Updates.combine( Updates.set( "code", "uno" ), Updates.set( "value", 10 ) ) ) ).block( TIMEOUT );
 		p1 = awaitDocument( PARENT, parent1, document -> {
@@ -330,6 +333,8 @@ class ReactiveMongoDslThreeFeaturesMigrationSafetyIntegrationTest {
 
 		} );
 		assertEquals( 10, p1.get( "tagsByCode", Document.class ).get( "uno", Document.class ).getInteger( "value" ) );
+		assertFalse( p1.get( "tagsByCode", Document.class ).get( "uno", Document.class ).containsKey( "code" ) );
+		assertFalse( p1.get( "tagsByCode", Document.class ).get( "uno", Document.class ).containsKey( "parentId" ) );
 
 		Mono.from( tags.deleteOne( Filters.eq( "_id", tag2 ) ) ).block( TIMEOUT );
 		p1 = awaitDocument( PARENT, parent1, document -> {
