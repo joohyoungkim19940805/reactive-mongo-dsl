@@ -156,6 +156,8 @@ public final class EmbeddedSyncConfig<K> {
 
 		private final List<LinkFieldPair> links = new ArrayList<>();
 
+		private final List<String> excludedSourceFields = new ArrayList<>();
+
 		private String mapKeyField;
 
 		private EmbeddedDeletePolicy deletePolicy = EmbeddedDeletePolicy.REMOVE;
@@ -186,6 +188,30 @@ public final class EmbeddedSyncConfig<K> {
 
 		}
 
+		/**
+		 * Excludes source BSON fields from the snapshot written into the target while keeping the
+		 * original source document available for linkBy() evaluation.
+		 */
+		public RelationBuilder<S, T> excludeSourceFields(
+			String... sourceFields
+		) {
+
+			if (sourceFields == null)
+				throw new IllegalArgumentException( "excludeSourceFields sourceFields must not be null" );
+			for (String sourceField : sourceFields) {
+				String normalized = MongoFieldNameSupport.toMongoField( Objects.requireNonNull( sourceField, "Excluded source field must not be null" ) );
+				if (normalized.isBlank())
+					throw new IllegalArgumentException( "Excluded source field must not be blank" );
+				if ("_id".equals( normalized ))
+					throw new IllegalArgumentException( "Embedded synchronization snapshot cannot exclude the source id field." );
+				if (! excludedSourceFields.contains( normalized ))
+					excludedSourceFields.add( normalized );
+
+			}
+			return this;
+
+		}
+
 		public RelationBuilder<S, T> onDelete(
 			EmbeddedDeletePolicy deletePolicy
 		) {
@@ -202,6 +228,7 @@ public final class EmbeddedSyncConfig<K> {
 				targetClass,
 				targetField,
 				links,
+				excludedSourceFields,
 				mapKeyField,
 				deletePolicy
 			);

@@ -99,6 +99,25 @@ class EmbeddedSyncConfigTest {
 
 	}
 
+
+	// 상속된 제네릭 컬렉션 필드(List<T>)의 T를 concrete subclass 타입으로 해석하는지 검증한다.
+	@Test
+	void inheritedGenericCollectionCardinalityIsResolved() {
+
+		EmbeddedSyncConfig<String> sync = new EmbeddedSyncConfig<>();
+		assertDoesNotThrow( () -> sync
+			.forKeys( "db" )
+			.from( Child.class )
+			.into( ConcreteGenericParent.class, "children" )
+			.linkBy()
+				.fromField( "parentId" )
+				.intoField( "id" )
+				.end()
+			.build()
+		);
+
+	}
+
 	private static final class A {
 		private B b;
 		private D d;
@@ -115,6 +134,13 @@ class EmbeddedSyncConfigTest {
 	}
 
 	private static final class D {}
+
+
+	private static class GenericParent<T> {
+		private List<T> children;
+	}
+
+	private static final class ConcreteGenericParent extends GenericParent<Child> {}
 
 	private static final class Parent {
 		private List<Child> children;

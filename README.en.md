@@ -1569,6 +1569,21 @@ MAP relations must specify which source field supplies the map key:
 
 The runtime map key must be usable as a MongoDB field key; blank values, values containing `.`, and values beginning with `$` are rejected.
 
+If the source contains legacy back-references or other fields that must not be copied into the target snapshot, exclude them per relation:
+
+```java
+.from(PropertyDetail.class)
+.into(Auction.class, "propertyDetail")
+.excludeSourceFields("auction", "auctionId")
+.linkBy()
+    .fromField("id")
+    .intoField("propertyId")
+    .end()
+.build();
+```
+
+Excluded fields remain available while evaluating `linkBy()` and are removed only from the BSON snapshot written to the target. `_id` cannot be excluded because embedded synchronization uses it to identify references.
+
 ### INSERT / UPDATE / REPLACE / DELETE handling
 
 Embedded sync handles these source Change Stream operations:

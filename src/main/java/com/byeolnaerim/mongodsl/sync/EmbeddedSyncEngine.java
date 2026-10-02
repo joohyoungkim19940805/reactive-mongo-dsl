@@ -350,14 +350,48 @@ public final class EmbeddedSyncEngine implements AutoCloseable {
 	) {
 
 		Optional<Bson> linkedTargets = buildLinkFilter( relation.definition().links(), source );
+		Document snapshot = snapshotSource( relation.definition(), source );
 		if (relation.definition().links().isEmpty())
-			return updateCurrentTargets( relation, sourceId, source, linkedTargets );
+			return updateCurrentTargets( relation, sourceId, snapshot, linkedTargets );
 
 		Mono<Void> cleanup = cleanupMovedReference( relation, sourceId, linkedTargets );
 		if (linkedTargets.isEmpty())
 			return cleanup;
 
-		return updateCurrentTargets( relation, sourceId, source, linkedTargets ).then( cleanup );
+		return updateCurrentTargets( relation, sourceId, snapshot, linkedTargets ).then( cleanup );
+
+	}
+
+	private Document snapshotSource(
+		EmbeddedSyncDefinition definition, Document source
+	) {
+
+		if (definition.excludedSourceFields().isEmpty())
+			return source;
+
+		Document snapshot = new Document( source );
+		for (String excludedSourceField : definition.excludedSourceFields())
+			removeSnapshotPath( snapshot, excludedSourceField );
+		return snapshot;
+
+	}
+
+	private void removeSnapshotPath(
+		Document source, String path
+	) {
+
+		String[] segments = path.split( "\\." );
+		Document current = source;
+		for (int i = 0; i < segments.length - 1; i++) {
+			Object value = current.get( segments[i] );
+			if (! (value instanceof Document child))
+				return;
+			Document childCopy = new Document( child );
+			current.put( segments[i], childCopy );
+			current = childCopy;
+
+		}
+		current.remove( segments[segments.length - 1] );
 
 	}
 

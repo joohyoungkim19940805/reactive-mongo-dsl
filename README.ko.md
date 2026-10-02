@@ -1571,6 +1571,21 @@ MAP 관계는 source의 어느 값을 map key로 사용할지 반드시 지정�
 
 실제 map key 값은 MongoDB field key로 사용할 수 있어야 하므로 blank, `.` 포함, `$`로 시작하는 값은 허용되지 않습니다.
 
+source 문서에 레거시 back-reference처럼 target snapshot에 다시 넣으면 안 되는 필드가 있으면 relation별로 제외할 수 있습니다.
+
+```java
+.from(PropertyDetail.class)
+.into(Auction.class, "propertyDetail")
+.excludeSourceFields("auction", "auctionId")
+.linkBy()
+    .fromField("id")
+    .intoField("propertyId")
+    .end()
+.build();
+```
+
+제외 필드는 `linkBy()` 평가에는 영향을 주지 않고 target에 기록되는 BSON snapshot에서만 제거됩니다. `_id`는 embedded reference의 식별에 사용되므로 제외할 수 없습니다.
+
 ### INSERT / UPDATE / REPLACE / DELETE 처리
 
 Embedded sync는 source collection의 다음 Change Stream operation을 처리합니다.

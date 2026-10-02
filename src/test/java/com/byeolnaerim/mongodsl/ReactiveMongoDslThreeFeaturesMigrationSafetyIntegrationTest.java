@@ -137,6 +137,7 @@ class ReactiveMongoDslThreeFeaturesMigrationSafetyIntegrationTest {
 			.forKeys( TestMongo.MAIN )
 			.from( ChildEntity.class )
 			.into( ParentEntity.class, "children" )
+			.excludeSourceFields( "legacySnapshot" )
 			.linkBy()
 			.fromField( "parentId" )
 			.intoField( "id" )
@@ -250,7 +251,7 @@ class ReactiveMongoDslThreeFeaturesMigrationSafetyIntegrationTest {
 			.saveAllBulk(
 				List
 					.of(
-						new Document( "_id", child1 ).append( "parentId", parent1 ).append( "name", "c1" ),
+						new Document( "_id", child1 ).append( "parentId", parent1 ).append( "name", "c1" ).append( "legacySnapshot", "must-not-embed" ),
 						new Document( "_id", child2 ).append( "parentId", parent1 ).append( "name", "c2" ),
 						new Document( "_id", child3 ).append( "parentId", parent1 ).append( "name", "c3" )
 					)
@@ -260,6 +261,7 @@ class ReactiveMongoDslThreeFeaturesMigrationSafetyIntegrationTest {
 
 		Document p1 = awaitDocument( PARENT, parent1, document -> embeddedList( document, "children" ).size() == 3 );
 		assertEquals( 3, embeddedList( p1, "children" ).size() );
+		assertTrue( embeddedList( p1, "children" ).stream().noneMatch( child -> child.containsKey( "legacySnapshot" ) ) );
 
 		Mono.from( children.updateOne( Filters.eq( "_id", child1 ), Updates.set( "name", "c1-updated" ) ) ).block( TIMEOUT );
 		p1 = awaitDocument( PARENT, parent1, document -> {

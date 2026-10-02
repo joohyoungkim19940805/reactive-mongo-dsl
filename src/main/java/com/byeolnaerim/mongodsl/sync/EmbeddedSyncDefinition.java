@@ -11,6 +11,7 @@ public record EmbeddedSyncDefinition(
 	String targetField,
 	EmbeddedSyncCardinality cardinality,
 	List<LinkFieldPair> links,
+	List<String> excludedSourceFields,
 	String mapKeyField,
 	EmbeddedDeletePolicy deletePolicy
 ) {
@@ -32,6 +33,7 @@ public record EmbeddedSyncDefinition(
 		Objects.requireNonNull( targetField, "targetField" );
 		Objects.requireNonNull( cardinality, "cardinality" );
 		links = links == null ? List.of() : List.copyOf( links );
+		excludedSourceFields = excludedSourceFields == null ? List.of() : List.copyOf( excludedSourceFields );
 		deletePolicy = deletePolicy == null ? EmbeddedDeletePolicy.REMOVE : deletePolicy;
 		if (cardinality == EmbeddedSyncCardinality.MAP && (mapKeyField == null || mapKeyField.isBlank()))
 			throw new IllegalArgumentException( "Map embedded synchronization requires mapKey(field)." );
@@ -43,6 +45,7 @@ public record EmbeddedSyncDefinition(
 		Class<?> targetClass,
 		String explicitTargetField,
 		List<LinkFieldPair> links,
+		List<String> excludedSourceFields,
 		String mapKeyField,
 		EmbeddedDeletePolicy deletePolicy
 	) {
@@ -54,6 +57,7 @@ public record EmbeddedSyncDefinition(
 			metadata.mongoPath(),
 			metadata.cardinality(),
 			links,
+			excludedSourceFields,
 			mapKeyField,
 			deletePolicy
 		);
